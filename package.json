@@ -1,0 +1,28 @@
+{
+  "name": "mailroom",
+  "version": "2.1.0",
+  "description": "Self-hosted bulk mail sender for your own SMTP account",
+  "type": "module",
+  "bin": {
+    "mailroom": "bin/mailroom.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "public",
+    "templates",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node src/gui.mjs",
+    "gui": "node src/gui.mjs",
+    "send": "node src/send.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20.6"
+  },
+  "dependencies": {
+    "nodemailer": "^10.1.0"
+  }
+}

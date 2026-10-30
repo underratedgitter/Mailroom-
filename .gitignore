@@ -1,0 +1,20 @@
+node_modules/
+.env
+*.log
+.DS_Store
+
+# Send log and recipient lists contain personal data — never commit them.
+# data/ holds pasted lists, saved CSVs and exports, so ignore the whole folder.
+logs/*
+!logs/.gitkeep
+data/*
+!data/recipients.example.csv
+
+
+# Settings written by the setup screen (may contain a password)
+.env.tmp
+.env.*
+!.env.example
+graphify-out/
+*.pem
+*.key

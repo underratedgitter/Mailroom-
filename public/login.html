@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in — Mailroom</title>
+<meta name="theme-color" content="#1c1b16">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<style>
+  :root {
+    --paper: #fbf8f0;
+    --desk: #ded9cb;
+    --ink: #1c1b16;
+    --ink-soft: #5f5b4e;
+    --rule: #c7c0ad;
+    --red: #a62b20;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: "Avenir Next", "Segoe UI", system-ui, -apple-system, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    font-family: var(--sans);
+    font-size: 14px;
+    color: var(--ink);
+    background-color: var(--desk);
+    background-image:
+      linear-gradient(rgba(28, 27, 22, 0.045) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(28, 27, 22, 0.045) 1px, transparent 1px);
+    background-size: 22px 22px;
+  }
+  .card {
+    width: min(380px, 100%);
+    background: var(--paper);
+    border: 1px solid rgba(28, 27, 22, 0.85);
+    box-shadow: 6px 6px 0 rgba(28, 27, 22, 0.1);
+    padding: 22px;
+  }
+  .mark { display: flex; align-items: center; gap: 9px; margin-bottom: 18px; }
+  .mark svg { width: 26px; height: 26px; }
+  .mark strong { font-size: 17px; font-weight: 600; letter-spacing: -0.01em; }
+  .mark span {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    margin-left: auto;
+  }
+  h1 { font-size: 15px; margin: 0 0 14px; font-weight: 600; }
+  label { display: block; font-family: var(--mono); font-size: 10.5px; color: var(--ink-soft); margin-bottom: 5px; }
+  input {
+    width: 100%;
+    font: inherit;
+    padding: 9px 10px;
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    background: #fffdf7;
+    color: var(--ink);
+  }
+  input:focus-visible, button:focus-visible { outline: 2px solid #1f3f9e; outline-offset: 1px; border-color: #1f3f9e; }
+  button {
+    width: 100%;
+    margin-top: 14px;
+    padding: 10px 12px;
+    font: inherit;
+    font-weight: 500;
+    color: var(--paper);
+    background: var(--ink);
+    border: 1px solid rgba(28, 27, 22, 0.85);
+    border-radius: 2px;
+    box-shadow: 2px 2px 0 rgba(28, 27, 22, 0.85);
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.5; cursor: progress; }
+  .error {
+    margin: 12px 0 0;
+    font-size: 12.5px;
+    color: var(--red);
+    min-height: 1.2em;
+  }
+  .foot { margin: 16px 0 0; font-size: 11.5px; color: var(--ink-soft); line-height: 1.4; }
+</style>
+</head>
+<body>
+  <form class="card" id="form">
+    <div class="mark">
+      <svg viewBox="0 0 32 32" aria-hidden="true">
+        <rect width="32" height="32" rx="7" fill="#1c1b16"/>
+        <path d="M8.5 11.5h15v9h-15z" fill="none" stroke="#fbf8f0" stroke-width="2" stroke-linejoin="round"/>
+        <path d="M8.5 11.5l7.5 5.5 7.5-5.5" fill="none" stroke="#fbf8f0" stroke-width="2" stroke-linejoin="round"/>
+      </svg>
+      <strong>Mailroom</strong>
+      <span>locked</span>
+    </div>
+
+    <h1>Sign in to this mailroom</h1>
+    <label for="password">Password</label>
+    <input id="password" type="password" autocomplete="current-password" autofocus required>
+    <button type="submit" id="submit">Sign in</button>
+    <p class="error" id="error" role="alert"></p>
+    <p class="foot">This install requires the password set by whoever started it
+      (<code>MAILROOM_PASSWORD</code>).</p>
+  </form>
+
+<script>
+  const form = document.getElementById('form');
+  const input = document.getElementById('password');
+  const button = document.getElementById('submit');
+  const error = document.getElementById('error');
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    error.textContent = '';
+    button.disabled = true;
+    try {
+      const res = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ password: input.value }),
+      });
+      if (res.ok) {
+        window.location.replace('/');
+        return;
+      }
+      const data = await res.json().catch(() => ({}));
+      error.textContent = data.error || 'Could not sign in';
+      input.select();
+    } catch {
+      error.textContent = 'The server is not reachable';
+    } finally {
+      button.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>

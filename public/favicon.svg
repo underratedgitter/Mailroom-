@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Mailroom">
+  <rect width="32" height="32" rx="7" fill="#1c1b16"/>
+  <path d="M8.5 11.5h15v9h-15z" fill="none" stroke="#fbf8f0" stroke-width="2" stroke-linejoin="round"/>
+  <path d="M8.5 11.5l7.5 5.5 7.5-5.5" fill="none" stroke="#fbf8f0" stroke-width="2" stroke-linejoin="round"/>
+</svg>

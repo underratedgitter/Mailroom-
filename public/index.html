@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mailroom — send mail from your own mailbox</title>
+<meta name="description" content="Self-hosted bulk mail for your own SMTP account: pick a template, paste recipients, preview, send. No tracking, no third parties.">
+<meta name="theme-color" content="#1c1b16">
+<meta property="og:title" content="Mailroom">
+<meta property="og:description" content="Self-hosted bulk mail for your own SMTP account.">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<header class="waybill">
+  <div class="mark">
+    <svg class="mark__logo" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+      <rect x="2" y="2" width="28" height="28" rx="4" fill="currentColor"></rect>
+      <path d="M8.5 11.5h15v9h-15z" fill="none" stroke="#fbf8f0" stroke-width="2" stroke-linejoin="round"></path>
+      <path d="M8.5 11.5l7.5 5.5 7.5-5.5" fill="none" stroke="#fbf8f0" stroke-width="2" stroke-linejoin="round"></path>
+    </svg>
+    <span class="mark__name">Mailroom</span>
+    <span class="mark__place">self-hosted</span>
+  </div>
+
+  <dl class="waybill__meta">
+    <div><dt>Sending from</dt><dd id="metaFrom">—</dd></div>
+    <div><dt>Server</dt><dd id="metaServer">—</dd></div>
+    <div><dt>Log</dt><dd id="metaLog">—</dd></div>
+  </dl>
+
+  <div class="waybill__stamp">
+    <button id="queueBtn" class="btn btn--quiet btn--topbar" type="button">
+      Scheduled <span class="badge" id="queueCount" hidden>0</span>
+    </button>
+    <button id="settingsBtn" class="btn btn--quiet btn--topbar" type="button">Settings</button>
+    <button id="signOutBtn" class="btn btn--quiet btn--topbar" type="button" hidden>Sign out</button>
+    <button id="verifyBtn" class="btn btn--stamp" type="button">Check connection</button>
+    <span id="stampResult" class="stamp" data-state="idle" aria-live="polite"></span>
+  </div>
+</header>
+
+<main class="desk">
+
+  <!-- ── Dispatch slip ─────────────────────────────────────────── -->
+  <form class="slip" id="compose" autocomplete="off">
+    <div class="slip__head">
+      <h1>Compose</h1>
+      <span class="slip__no" id="slipNo">no campaign</span>
+    </div>
+
+    <div class="field">
+      <label for="template">Template</label>
+      <select id="template"></select>
+      <p class="hint" id="templateHint"></p>
+    </div>
+
+    <div class="field">
+      <div class="field__head">
+        <label for="csv">Recipients</label>
+        <div class="seg" role="group" aria-label="Where the recipients come from">
+          <button type="button" class="seg__btn is-on" id="modeSaved">Saved list</button>
+          <button type="button" class="seg__btn" id="modePaste">Paste emails</button>
+        </div>
+      </div>
+      <select id="csv"></select>
+      <div class="roster" id="roster" hidden>
+        <div class="roster__head">
+          <span id="rosterCount">0 addresses</span>
+          <span class="roster__note">Click one to preview it</span>
+        </div>
+        <ul class="roster__list" id="rosterList"></ul>
+      </div>
+      <div class="paste" id="pastePanel" hidden>
+        <textarea id="pasteBox" rows="6" spellcheck="false"
+          placeholder="priya@example.com, Priya Shah, Sunrise Chemicals&#10;Raj Patel &lt;raj@patel.in&gt;&#10;info@example.com"></textarea>
+        <div class="paste__foot">
+          <span class="hint" id="pasteCount"></span>
+          <button type="button" class="btn btn--quiet" id="saveCsvBtn">Save as CSV</button>
+        </div>
+      </div>
+      <p class="hint" id="csvHint"></p>
+    </div>
+
+    <div class="field">
+      <label for="subject">Subject line</label>
+      <input id="subject" type="text" placeholder="Subject line, e.g. Invitation to our November meetup" spellcheck="false">
+      <div class="tokens" id="tokens" aria-label="Insert a merge field"></div>
+    </div>
+
+    <div class="field-grid">
+      <div class="field">
+        <label for="campaign">Campaign</label>
+        <input id="campaign" type="text" spellcheck="false" placeholder="e.g. connect-nov-2026">
+        <p class="hint">Makes a re-run skip addresses already sent in it.</p>
+      </div>
+      <div class="field field--narrow">
+        <label for="limit">Limit</label>
+        <input id="limit" type="number" min="1" step="1" placeholder="all">
+      </div>
+    </div>
+
+    <div class="field-grid">
+      <div class="field field--narrow">
+        <label for="delay">Gap</label>
+        <input id="delay" type="number" min="0" step="500" value="4000">
+        <p class="hint">ms between sends.</p>
+      </div>
+      <div class="field">
+        <label for="testTo">Test address</label>
+        <input id="testTo" type="email" spellcheck="false" placeholder="you@yourdomain.com">
+        <p class="hint">Gets the first recipient's data.</p>
+      </div>
+    </div>
+
+    <div class="slip__actions">
+      <button id="sendBtn" class="btn btn--primary" type="button" disabled>Send</button>
+      <button id="scheduleBtn" class="btn" type="button" disabled>Schedule…</button>
+      <button id="testBtn" class="btn" type="button">Send test</button>
+      <button id="previewBtn" class="btn btn--quiet" type="button">Refresh</button>
+    </div>
+  </form>
+
+  <!-- ── Proof + activity ──────────────────────────────────────── -->
+  <section class="stage">
+
+    <div class="proof">
+      <div class="proof__bar">
+        <div class="proof__who">
+          <span id="proofTo">No recipient</span>
+          <span id="proofSubject" class="proof__subject"></span>
+        </div>
+        <div class="proof__page">
+          <button id="prevBtn" class="btn btn--icon" type="button" aria-label="Previous recipient">‹</button>
+          <span id="proofIndex">0 / 0</span>
+          <button id="nextBtn" class="btn btn--icon" type="button" aria-label="Next recipient">›</button>
+        </div>
+      </div>
+      <div class="proof__frame">
+        <iframe id="preview" sandbox="" title="Message preview"></iframe>
+        <div class="proof__empty" id="proofEmpty">Pick a template and recipients, then refresh the preview.</div>
+      </div>
+      <div class="proof__foot">
+        <span id="proofImages">0 inline images</span>
+        <span id="proofTotal"></span>
+      </div>
+    </div>
+
+    <div class="run">
+      <div class="run__head">
+        <h2>Dispatch</h2>
+        <div class="run__counts" id="runCounts"></div>
+        <button id="cancelBtn" class="btn btn--quiet" type="button" hidden>Stop after this one</button>
+      </div>
+      <ol class="ledger" id="ledger" aria-live="polite">
+        <li class="ledger__idle">Nothing sent from here yet.</li>
+      </ol>
+    </div>
+
+  </section>
+</main>
+
+<!-- ── Confirmation ──────────────────────────────────────────────── -->
+<div class="modal" id="modal" hidden>
+  <div class="modal__card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <h2 id="modalTitle">Send for real?</h2>
+    <p id="modalBody"></p>
+    <label class="check">
+      <input type="checkbox" id="modalCheck">
+      <span>I understand these messages go out immediately to real inboxes.</span>
+    </label>
+    <div class="modal__actions">
+      <button class="btn" id="modalCancel" type="button">Cancel</button>
+      <button class="btn btn--danger" id="modalConfirm" type="button" disabled>Send now</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Mailbox settings ──────────────────────────────────────────── -->
+<div class="modal" id="settingsModal" hidden>
+  <div class="modal__card modal__card--wide" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <h2 id="settingsTitle">Connect your mailbox</h2>
+    <p class="settings__lead" id="settingsLead">
+      Mailroom sends through your own SMTP account, so the mail comes from your
+      address and lands in your sent folder.
+    </p>
+
+    <div class="settings__grid">
+      <div class="field">
+        <label for="setHost">SMTP host</label>
+        <input id="setHost" type="text" spellcheck="false" placeholder="smtp.gmail.com">
+      </div>
+      <div class="field field--narrow">
+        <label for="setPort">Port</label>
+        <input id="setPort" type="number" inputmode="numeric" placeholder="465">
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="setUser">Mailbox address</label>
+      <input id="setUser" type="email" spellcheck="false" placeholder="you@yourdomain.com">
+      <p class="hint" id="setUserHint">The account Mailroom signs in as.</p>
+    </div>
+
+    <div class="field">
+      <label for="setPass">App password</label>
+      <input id="setPass" type="password" spellcheck="false" autocomplete="new-password" placeholder="16 characters">
+      <p class="hint" id="setPassHint">Gmail needs an App Password, not your login password.</p>
+    </div>
+
+    <div class="field">
+      <label for="setFrom">From line</label>
+      <input id="setFrom" type="text" spellcheck="false" placeholder="Your Name &lt;you@yourdomain.com&gt;">
+      <p class="hint">What recipients see. Defaults to the mailbox address.</p>
+    </div>
+
+    <p class="settings__status" id="settingsStatus" role="status" aria-live="polite"></p>
+    <p class="settings__path" id="settingsPath"></p>
+
+    <div class="modal__actions">
+      <button class="btn btn--quiet" id="settingsCancel" type="button">Cancel</button>
+      <button class="btn" id="settingsTestBtn" type="button">Test connection</button>
+      <button class="btn btn--primary" id="settingsSaveBtn" type="button">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Schedule a campaign ───────────────────────────────────────── -->
+<div class="modal" id="scheduleModal" hidden>
+  <div class="modal__card" role="dialog" aria-modal="true" aria-labelledby="scheduleTitle">
+    <h2 id="scheduleTitle">Schedule this campaign</h2>
+    <p class="settings__lead" id="scheduleSummary"></p>
+    <div class="field">
+      <label for="scheduleAt">Send at</label>
+      <input id="scheduleAt" type="datetime-local">
+      <p class="hint" id="scheduleZone"></p>
+    </div>
+    <p class="settings__status" id="scheduleStatus" role="status" aria-live="polite"></p>
+    <div class="modal__actions">
+      <button class="btn" id="scheduleCancel" type="button">Cancel</button>
+      <button class="btn btn--primary" id="scheduleConfirm" type="button">Schedule send</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Scheduled campaigns ───────────────────────────────────────── -->
+<div class="modal" id="queueModal" hidden>
+  <div class="modal__card modal__card--wide" role="dialog" aria-modal="true" aria-labelledby="queueTitle">
+    <h2 id="queueTitle">Scheduled campaigns</h2>
+    <p class="settings__lead">Mailroom has to be running at the scheduled time. If it is late by more
+      than the grace window, the campaign is held here instead of going out stale.</p>
+    <ul class="queue" id="queueList"></ul>
+    <p class="queue__empty" id="queueEmpty" hidden>Nothing scheduled yet. Use <strong>Schedule…</strong> beside Send.</p>
+    <div class="modal__actions">
+      <button class="btn" id="queueClose" type="button">Close</button>
+    </div>
+  </div>
+</div>
+
+<div class="notice" id="notice" role="status" aria-live="polite"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

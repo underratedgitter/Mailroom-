@@ -25,9 +25,9 @@ EXPOSE 4173
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
   CMD node -e "const tls=!!(process.env.MAILROOM_TLS_CERT&&process.env.MAILROOM_TLS_KEY);const mod=require(tls?'node:https':'node:http');const port=process.env.GUI_PORT||4173;mod.get({host:'127.0.0.1',port,path:'/api/health',rejectUnauthorized:false},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
 
-# MAILROOM_PASSWORD is required when publishing beyond this machine: without
-# it, anyone who can reach the port can send mail with your credentials.
-# Because the container binds 0.0.0.0, also set MAILROOM_TLS_CERT and
+# MAILROOM_PASSWORD is required: the container binds 0.0.0.0 and the app
+# refuses to start on a non-loopback host without it (even with
+# MAILROOM_ALLOW_INSECURE=1). Also set MAILROOM_TLS_CERT and
 # MAILROOM_TLS_KEY (PEM paths inside the container), or set
 # MAILROOM_ALLOW_INSECURE=1 when a trusted proxy terminates TLS.
 #   docker run -e MAILROOM_PASSWORD=... -e MAILROOM_TLS_CERT=/certs/cert.pem \

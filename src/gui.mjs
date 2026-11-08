@@ -108,13 +108,22 @@ function tlsOptions() {
 }
 
 function assertBindingIsSafe(host) {
-  if (TLS_ON || ALLOW_INSECURE || isLoopbackHost(host)) return;
-  throw new Error([
-    `Refusing to serve Mailroom over plain HTTP on ${host}.`,
-    'SMTP passwords and session cookies would cross the network unencrypted.',
-    'Set MAILROOM_TLS_CERT and MAILROOM_TLS_KEY (PEM file paths) to enable HTTPS,',
-    'or set MAILROOM_ALLOW_INSECURE=1 to accept the risk behind a trusted TLS proxy.',
-  ].join('\n  '));
+  if (isLoopbackHost(host)) return;
+  if (!TLS_ON && !ALLOW_INSECURE) {
+    throw new Error([
+      `Refusing to serve Mailroom over plain HTTP on ${host}.`,
+      'SMTP passwords and session cookies would cross the network unencrypted.',
+      'Set MAILROOM_TLS_CERT and MAILROOM_TLS_KEY (PEM file paths) to enable HTTPS,',
+      'or set MAILROOM_ALLOW_INSECURE=1 to accept the risk behind a trusted TLS proxy.',
+    ].join('\n  '));
+  }
+  if (!AUTH_ON) {
+    throw new Error([
+      `Refusing to serve Mailroom on ${host} without a password.`,
+      'Anyone who can reach this port could send mail with your SMTP account.',
+      'Set MAILROOM_PASSWORD to a long passphrase before binding beyond loopback.',
+    ].join('\n  '));
+  }
 }
 
 mkdirSync(dirname(LOG_PATH), { recursive: true });

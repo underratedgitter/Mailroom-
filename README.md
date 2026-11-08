@@ -67,8 +67,9 @@ docker run -d --name mailroom \
   mailroom
 ```
 
-Set `MAILROOM_PASSWORD` whenever the port is reachable by anyone else — the
-password gate is what stops a stranger from sending through your mailbox.
+`MAILROOM_PASSWORD` is required for any non-loopback bind, including every
+Docker setup above: Mailroom refuses to start without it, even with
+`MAILROOM_ALLOW_INSECURE=1`.
 
 ## HTTPS and network exposure
 
@@ -101,9 +102,9 @@ cookie flag, let Mailroom terminate TLS itself. `--host` and `GUI_HOST` keep
 working exactly as before — they are just checked against this rule.
 
 Upgrading: an existing Docker or LAN install that ran plain HTTP on
-`0.0.0.0` must now add the TLS pair or `MAILROOM_ALLOW_INSECURE=1`. Startup
-fails with a message naming both options rather than silently serving
-credentials in the clear.
+`0.0.0.0` must now add the TLS pair or `MAILROOM_ALLOW_INSECURE=1`, and must set
+`MAILROOM_PASSWORD`. Startup fails with a message naming the missing setting
+rather than silently serving credentials in the clear or an open relay.
 
 ## What it does
 

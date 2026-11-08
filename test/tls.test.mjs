@@ -44,6 +44,28 @@ test('the insecure opt-out allows a non-loopback HTTP bind', async (t) => {
   assert.equal((await get(server.base, '/api/health')).status, 200);
 });
 
+test('a non-loopback bind is refused without a password, even with the insecure opt-out', async () => {
+  const result = await expectStartupFailure({
+    env: { GUI_HOST: '0.0.0.0', MAILROOM_ALLOW_INSECURE: '1' },
+  });
+
+  assert.equal(result.code, 1);
+  assert.match(result.output, /without a password/);
+  assert.match(result.output, /MAILROOM_PASSWORD/);
+});
+
+test('a non-loopback HTTPS bind is refused without a password', async (t) => {
+  const { dir, cert, key } = selfSignedCert();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const result = await expectStartupFailure({
+    env: { GUI_HOST: '0.0.0.0', MAILROOM_TLS_CERT: cert, MAILROOM_TLS_KEY: key },
+  });
+
+  assert.equal(result.code, 1);
+  assert.match(result.output, /MAILROOM_PASSWORD/);
+});
+
 test('HTTPS serves the app and marks the session cookie Secure', async (t) => {
   const { dir, cert, key } = selfSignedCert();
   t.after(() => rmSync(dir, { recursive: true, force: true }));

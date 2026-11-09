@@ -15,6 +15,5 @@ data/*
 .env.tmp
 .env.*
 !.env.example
-graphify-out/
 *.pem
 *.key

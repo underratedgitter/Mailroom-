@@ -15,6 +15,10 @@ between you and your recipients.
                         └── logs/sent.jsonl   (who got what, resumable)
 ```
 
+## Requirements
+
+- Node.js >= 20.6 (or Docker)
+
 ## Quick start
 
 ```bash
@@ -46,6 +50,7 @@ docker run -d --name mailroom \
   -v mailroom-config:/root/.mailroom \
   -v "$PWD/data:/app/data" \
   -v "$PWD/templates:/app/templates" \
+  -v "$PWD/logs:/app/logs" \
   mailroom
 ```
 
@@ -64,6 +69,7 @@ docker run -d --name mailroom \
   -v mailroom-config:/root/.mailroom \
   -v "$PWD/data:/app/data" \
   -v "$PWD/templates:/app/templates" \
+  -v "$PWD/logs:/app/logs" \
   mailroom
 ```
 
@@ -87,9 +93,13 @@ npm start
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `MAILROOM_PASSWORD` | unset | Passphrase required for non-loopback binds to gate the GUI |
 | `MAILROOM_TLS_CERT` | unset | Path to a PEM certificate (chain included if needed) |
 | `MAILROOM_TLS_KEY` | unset | Path to the matching PEM private key |
 | `MAILROOM_ALLOW_INSECURE` | unset | Set to `1` to permit a non-loopback plain-HTTP bind |
+| `GUI_HOST` | `127.0.0.1` | Network interface to bind (CLI: `--host`) |
+| `GUI_PORT` | `4173` | Port to listen on (CLI: `--port`) |
+| `GUI_ALLOWED_HOSTS` | unset | Comma-separated list of additional allowed `Host` headers |
 
 Set both TLS variables together; Mailroom refuses to start if only one is
 present or if either file cannot be read. When TLS is active the session cookie
@@ -109,8 +119,10 @@ rather than silently serving credentials in the clear or an open relay.
 ## What it does
 
 **Compose** — every `templates/*.html` file is offered as a template. A folder
-next to it (`newsletter-assets/`) is picked up automatically and its images
-attached inline with `cid:` (Gmail blocks `data:` URIs).
+next to it named `<template>-assets/` (for example, `bcci-connect-v2-assets/`) is
+picked up automatically and its images attached inline with `cid:` (Gmail blocks
+`data:` URIs). Bundled templates include `bcci-connect-v2.html`,
+`bcci-connect.html`, and `bcci-membership.html`.
 
 **Recipients** — either a saved `data/*.csv`, or paste addresses straight in:
 
@@ -144,11 +156,11 @@ one campaign runs at a time, so a scheduled send waits for any manual run to fin
 
 ```bash
 npm run send -- \
-  --csv data/recipients.csv \
-  --html templates/newsletter.html \
-  --assets-dir templates/newsletter-assets \
-  --subject "Chamber News | November" \
-  --campaign newsletter-nov-2026 \
+  --csv data/recipients.example.csv \
+  --html templates/bcci-connect-v2.html \
+  --assets-dir templates/bcci-connect-v2-assets \
+  --subject "BCCI Connect | November" \
+  --campaign bcci-connect-nov-2026 \
   --send
 ```
 
@@ -172,9 +184,10 @@ driven from the browser, where the queue and its history can be seen.
   server reports a quota or `5.4.5` error, and the campaign resumes where it
   stopped the next day. For lists beyond a few hundred, use a provider built for
   bulk (Postmark, SES, SendGrid, Mailgun) rather than a mailbox.
-- **Keep messages small.** Inline images travel with every message; the bundled
-  template is ~1 MB per recipient, so 5 000 recipients is ~5 GB of upload. Cut
-  image weight (or host them) before a big run.
+- **Keep messages small.** Inline images travel with every message; bundled
+  templates with inlined images range from ~70 KB to ~800 KB per recipient, so
+  large runs add up in upload bandwidth. Cut image weight (or host them) before
+  a big run.
 - **A broken link stops the run.** After 10 consecutive connection-level
   failures (network down, IP blocked, provider refusing) Mailroom stops instead
   of burning three retries per address down the list; the rest stay unsent and
@@ -211,8 +224,8 @@ src/lib/config.mjs      settings file (read/write, 0600)
 src/lib/mailer.mjs      SMTP rules (TLS, From, app-password cleanup)
 public/                 the browser UI
 templates/              HTML templates + their image folders
-data/                   recipient CSVs
-logs/                   send log
+data/                   recipient CSVs (data/recipients.example.csv tracked)
+logs/                   send log (sent.jsonl) and schedule queue (schedule.json)
 test/                   node:test suite (npm test)
 ```
 
@@ -220,20 +233,23 @@ Settings resolve in this order: `MAILROOM_CONFIG` → a `./.env` beside the app 
 `~/.mailroom/config.env`. Real environment variables always win, so Docker can
 override the file.
 
+Supported SMTP environment variables:
+`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER` (or `GMAIL_USER`), `SMTP_PASS` (or `GMAIL_PASS`), `EMAIL_FROM` (or `SMTP_FROM`), `SMTP_SECURE`, `SMTP_ALLOW_SELF_SIGNED`.
+
 ## Security notes
 
 - Binds to `127.0.0.1` by default. A non-loopback bind requires
-  `MAILROOM_TLS_CERT` + `MAILROOM_TLS_KEY`, or an explicit
-  `MAILROOM_ALLOW_INSECURE=1` for a trusted TLS proxy; plain HTTP elsewhere is
-  refused before the port opens.
+  `MAILROOM_PASSWORD` along with either `MAILROOM_TLS_CERT` + `MAILROOM_TLS_KEY`
+  or an explicit `MAILROOM_ALLOW_INSECURE=1` for a trusted TLS proxy; otherwise
+  startup is refused before the port opens.
 - With TLS active the session cookie is `HttpOnly`, `SameSite=Strict` and
   `Secure`; on loopback HTTP it omits `Secure` so local use still works.
-- Requests must carry a loopback `Host` header, which stops DNS-rebinding pages
-  from driving the server.
+- Requests must carry a loopback `Host` header (or one configured in
+  `GUI_ALLOWED_HOSTS`), which stops DNS-rebinding pages from driving the server.
 - A request carrying a foreign `Origin` is refused, so another website cannot
   POST a send here and spend the stored SMTP credentials.
-- `data/` is ignored by git in full: pasted lists and saved CSVs are personal
-  data and should never be committed.
+- `data/` is ignored by git in full (except `data/recipients.example.csv`):
+  pasted lists and saved CSVs are personal data and should never be committed.
 - Only files inside `data/` and `templates/` can be selected.
 - The settings file is written atomically with mode `0600`; passwords are never
   returned by the API.
@@ -242,7 +258,7 @@ override the file.
 ## Tests
 
 ```bash
-npm test     # 36 tests: parsing, rendering, resume, retries, scheduling, API, auth, TLS, guards
+npm test     # 38 tests: parsing, rendering, resume, retries, scheduling, API, auth, TLS, guards
 ```
 
 The API tests boot the real server against an in-process SMTP sink, so no mail

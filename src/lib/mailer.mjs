@@ -4,6 +4,12 @@
 // Port 465 is implicit TLS; 587 and 25 require STARTTLS. A local MTA on
 // localhost needs no credentials.
 
+/** The settings a send still needs; a local relay needs none. */
+export function missingSmtpFields(cfg) {
+  if (cfg.isLocal) return [];
+  return [!cfg.user && 'SMTP_USER', !cfg.pass && 'SMTP_PASS'].filter(Boolean);
+}
+
 export function resolveSmtpConfig(env = process.env) {
   const user = (env.SMTP_USER || env.GMAIL_USER || '').trim();
   // Strip internal/surrounding whitespace (Google shows App Passwords in

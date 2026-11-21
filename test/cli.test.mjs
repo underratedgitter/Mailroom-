@@ -9,7 +9,7 @@ import { spawnSync } from 'node:child_process';
 const SEND = resolve(dirname(fileURLToPath(import.meta.url)), '../src/send.mjs');
 
 // Preview mode renders locally and never opens an SMTP connection.
-function runPreview(extraArgs) {
+function runPreview(extraArgs, env = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'mailroom-cli-'));
   try {
     writeFileSync(join(dir, 'r.csv'), 'email,name\na@example.com,Ann\nb@example.com,Bob\n');
@@ -19,7 +19,7 @@ function runPreview(extraArgs) {
     ], {
       cwd: dir,
       encoding: 'utf8',
-      env: { PATH: process.env.PATH, HOME: dir, MAILROOM_CONFIG: join(dir, 'none.env') },
+      env: { PATH: process.env.PATH, HOME: dir, MAILROOM_CONFIG: join(dir, 'none.env'), ...env },
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -46,6 +46,28 @@ test('CLI reports a flag value that looks like another option as a plain error',
   const res = runPreview(['--delay', '-5']);
   assert.equal(res.status, 1);
   assert.match(res.stderr, /^\s*Error: .*--delay/);
+  assert.doesNotMatch(res.stderr, /\n\s+at /);
+});
+
+test('CLI --send without credentials names every missing SMTP setting', () => {
+  const res = runPreview(['--send']);
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /SMTP_USER/);
+  assert.match(res.stderr, /SMTP_PASS/);
+  assert.doesNotMatch(res.stderr, /\n\s+at /);
+});
+
+test('CLI refuses an invalid SMTP_PORT before connecting', () => {
+  const res = runPreview(['--send'], { SMTP_USER: 'a@b.co', SMTP_PASS: 'x', SMTP_PORT: 'abc' });
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /SMTP_PORT/);
+  assert.match(res.stderr, /"abc"/);
+});
+
+test('CLI reports an unreadable template as a plain error', () => {
+  const res = runPreview(['--html', '.']);
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /Cannot read template/);
   assert.doesNotMatch(res.stderr, /\n\s+at /);
 });
 

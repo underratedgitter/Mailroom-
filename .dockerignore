@@ -3,9 +3,16 @@ npm-debug.log*
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+*.log
 logs
 data/*.csv
+data/.mailroom-test-*
 test
+coverage
+.claude
+.github
 .git
 .gitignore
 .DS_Store

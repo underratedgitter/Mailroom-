@@ -2,7 +2,8 @@
 // without touching a network mailbox.
 import net from 'node:net';
 
-export function startSmtpSink() {
+// `rcpt(address)` may return an SMTP reply line to refuse that recipient.
+export function startSmtpSink({ rcpt } = {}) {
   const messages = [];
   const connections = new Set();
 
@@ -46,7 +47,13 @@ export function startSmtpSink() {
           envelope.from = line.replace(/^MAIL FROM:\s*/i, '').trim();
           sock.write('250 2.1.0 OK\r\n');
         } else if (verb === 'RCPT') {
-          envelope.to.push(line.replace(/^RCPT TO:\s*/i, '').trim());
+          const address = line.replace(/^RCPT TO:\s*/i, '').trim();
+          const refusal = rcpt?.(address);
+          if (refusal) {
+            sock.write(`${refusal}\r\n`);
+            continue;
+          }
+          envelope.to.push(address);
           sock.write('250 2.1.5 OK\r\n');
         } else if (verb === 'DATA') {
           sock.write('354 go ahead\r\n');

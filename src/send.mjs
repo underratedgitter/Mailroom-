@@ -44,26 +44,31 @@ import { loadConfig } from './lib/config.mjs';
 // Same settings the browser writes: ./.env or ~/.mailroom/config.env.
 loadConfig();
 
-const { values } = parseArgs({
-  options: {
-    csv: { type: 'string' },
-    html: { type: 'string' },
-    subject: { type: 'string' },
-    'assets-dir': { type: 'string' },
-    campaign: { type: 'string' },
-    delay: { type: 'string', default: '4000' },
-    limit: { type: 'string' },
-    log: { type: 'string', default: 'logs/sent.jsonl' },
-    send: { type: 'boolean', default: false },
-    test: { type: 'string' },
-    dump: { type: 'string' },
-  },
-});
-
 const die = (msg) => {
   console.error(`\nError: ${msg}\n`);
   process.exit(1);
 };
+
+let values;
+try {
+  ({ values } = parseArgs({
+    options: {
+      csv: { type: 'string' },
+      html: { type: 'string' },
+      subject: { type: 'string' },
+      'assets-dir': { type: 'string' },
+      campaign: { type: 'string' },
+      delay: { type: 'string', default: '4000' },
+      limit: { type: 'string' },
+      log: { type: 'string', default: 'logs/sent.jsonl' },
+      send: { type: 'boolean', default: false },
+      test: { type: 'string' },
+      dump: { type: 'string' },
+    },
+}));
+} catch (err) {
+  die(err.message);
+}
 
 if (!values.csv) die('--csv is required');
 if (!values.html) die('--html is required');
@@ -73,8 +78,13 @@ if (!existsSync(values.html)) die(`Template not found: ${values.html}`);
 
 mkdirSync(dirname(values.log), { recursive: true });
 
-const delayMs = Math.max(0, Number(values.delay) || 0);
-const limit = values.limit ? Math.max(1, Number(values.limit)) : Infinity;
+// Number('abc') is NaN, which would silently mean "no throttling" or "no limit".
+const wholeNumber = (flag, text, min, rule) => {
+  if (!/^\d+$/.test(text.trim()) || Number(text) < min) die(`${flag} must be ${rule}, got "${text}"`);
+  return Number(text);
+};
+const delayMs = wholeNumber('--delay', values.delay, 0, 'a whole number of milliseconds');
+const limit = values.limit === undefined ? Infinity : wholeNumber('--limit', values.limit, 1, 'a whole number of at least 1');
 
 let parsed;
 try {

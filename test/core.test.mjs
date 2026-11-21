@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -18,7 +18,9 @@ import {
   readLog,
   runCampaign,
   emailRe,
+  createMailer,
 } from '../src/lib/core.mjs';
+import { startSmtpSink } from './helpers/smtp-sink.mjs';
 
 const workDir = () => mkdtempSync(join(tmpdir(), 'mailroom-core-'));
 
@@ -103,6 +105,15 @@ test('render escapes values and understands the column aliases', () => {
   assert.equal(render('100% {{name}}', rec), '100% &lt;Priya&gt;');
 });
 
+test('placeholders never resolve to inherited Object.prototype members', () => {
+  const rec = { _email: 'a@b.co', _name: 'Priya', _company: 'A', city: 'Bharuch' };
+  for (const key of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf']) {
+    assert.equal(render(`[{{${key}}}]`, rec), '[]', key);
+    assert.equal(renderSubject(`[{{${key}}}]`, rec), '[]', key);
+  }
+  assert.equal(render('{{city}}', rec), 'Bharuch');
+});
+
 test('renderSubject keeps punctuation a header must not escape', () => {
   const rec = { _email: 'a@b.co', _name: "Priya O'Brien", _company: 'A & B' };
   assert.equal(
@@ -134,6 +145,25 @@ test('attachmentsFor and inlineForPreview resolve cid: references', () => {
     const preview = inlineForPreview(html, dir);
     assert.match(preview, /src="data:image\/png;base64,/);
     assert.match(preview, /cid:missing/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a symlink in the assets folder cannot attach or preview a file outside it', () => {
+  const dir = workDir();
+  try {
+    const assets = join(dir, 'assets');
+    mkdirSync(assets);
+    writeFileSync(join(assets, 'logo.png'), Buffer.from('89504e470d0a1a0a', 'hex'));
+    writeFileSync(join(dir, 'secret.txt'), 'top secret');
+    symlinkSync(join(dir, 'secret.txt'), join(assets, 'leak.png'));
+    const html = '<img src="cid:logo"><img src="cid:leak">';
+
+    assert.deepEqual(attachmentsFor(html, assets).map((a) => a.cid), ['logo']);
+    const preview = inlineForPreview(html, assets);
+    assert.match(preview, /cid:leak/);
+    assert.ok(!preview.includes(Buffer.from('top secret').toString('base64')));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -240,9 +270,60 @@ test('runCampaign retries transient failures and stops on fatal ones', async () 
     });
     assert.equal(fatal.stopped, true);
     assert.equal(fatal.failed, 1);
+    assert.deepEqual(fatal.failures, [{ email: 'a@b.co', error: 'Daily user sending limit exceeded' }]);
     assert.equal(readLog(join(dir, 'fatal.jsonl')).length, 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** Runs one recipient against a mailer that always fails with `failure`; resolves the attempt count and summary. */
+async function attemptsFor(failure) {
+  let attempts = 0;
+  const summary = await runCampaign({
+    recipients: [recipient('a@b.co')],
+    templateHtml: 'x',
+    subjectTemplate: 'x',
+    delayMs: 0,
+    retryDelay: 1,
+    mailer: { send: async () => { attempts++; return { success: false, ...failure }; } },
+    onEvent: () => {},
+  });
+  return { attempts, summary };
+}
+
+test('a permanent rejection is not retried because the address echoed in it contains "rate" or "421"', async () => {
+  const echoed = 'Recipient rate421@example.com rejected: no such user';
+  assert.equal((await attemptsFor({ error: echoed, responseCode: 550 })).attempts, 1);
+  assert.equal((await attemptsFor({ error: echoed, code: 'EENVELOPE' })).attempts, 1);
+  // No structured code: the text heuristic still applies.
+  assert.equal((await attemptsFor({ error: 'Too many connections, rate limited' })).attempts, 3);
+});
+
+test('a 4xx reply or a network error code is retried whatever the message says', async () => {
+  assert.equal((await attemptsFor({ error: 'Mailbox busy', responseCode: 451 })).attempts, 3);
+  assert.equal((await attemptsFor({ error: 'read failed', code: 'ECONNRESET' })).attempts, 3);
+  assert.equal((await attemptsFor({ error: 'read failed', code: 'ETIMEDOUT' })).attempts, 3);
+  assert.equal((await attemptsFor({ error: 'read failed', code: 'ESOCKET' })).attempts, 3);
+});
+
+test('EAUTH stops the run even when the message does not say "authentication"', async () => {
+  const { attempts, summary } = await attemptsFor({ error: 'Invalid login: 535 credentials rejected', code: 'EAUTH' });
+  assert.equal(attempts, 1);
+  assert.equal(summary.stopped, true);
+});
+
+test('createMailer reports the SMTP reply code of a rejection', async () => {
+  const sink = await startSmtpSink({ rcpt: (addr) => (addr.includes('rate421') ? '550 5.1.1 no such user' : null) });
+  const mailer = createMailer({ host: '127.0.0.1', port: sink.port, secure: false, requireTLS: false, from: 'me@x.co' });
+  try {
+    const result = await mailer.send({ to: 'rate421@example.com', subject: 's', html: 'x' });
+    assert.equal(result.success, false);
+    assert.equal(result.responseCode, 550);
+    assert.equal(result.code, 'EENVELOPE');
+  } finally {
+    mailer.close();
+    await sink.close();
   }
 });
 
@@ -301,4 +382,20 @@ test('emailRe rejects obvious junk', () => {
   assert.equal(emailRe.test('a b@c.co'), false);
   assert.equal(emailRe.test('a@b'), false);
   assert.equal(emailRe.test('@b.co'), false);
+});
+
+test('an address the mailer would split or rewrite is invalid, not mailed to someone else', () => {
+  // nodemailer reads "a,b@x.com" as two recipients and "a<b@x.com" as b@x.com,
+  // so the address that was validated, de-duplicated and logged is not the
+  // one that receives the message.
+  for (const bad of ['a,b@x.com', 'a;b@x.com', 'a<b@x.com', 'a@x.com>', 'x@y.com,z.org', '"a"@x.com', 'a(b)@x.com']) {
+    assert.equal(emailRe.test(bad), false, bad);
+  }
+  for (const good of ['first.last+tag@sub.example.co.uk', "o'brien@example.com", 'a_b-c@x.io']) {
+    assert.equal(emailRe.test(good), true, good);
+  }
+
+  const parsed = parseRecipients('email,name\n"a,b@x.com",A\nok@x.com,Ok\n');
+  assert.deepEqual(parsed.recipients.map((r) => r._email), ['ok@x.com']);
+  assert.equal(parsed.invalid, 1);
 });

@@ -172,7 +172,10 @@ function cookies(req) {
   for (const part of header.split(';')) {
     const eq = part.indexOf('=');
     if (eq === -1) continue;
-    out[part.slice(0, eq).trim()] = decodeURIComponent(part.slice(eq + 1).trim());
+    const name = part.slice(0, eq).trim();
+    const raw = part.slice(eq + 1).trim();
+    // A malformed escape must read as "no such session", not crash the request.
+    try { out[name] = decodeURIComponent(raw); } catch { out[name] = raw; }
   }
   return out;
 }
@@ -227,15 +230,22 @@ async function readJson(req, limit = 2 * 1024 * 1024) {
   const chunks = [];
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > limit) throw new Error('Request body too large');
+    if (size > limit) throw Object.assign(new Error('Request body too large'), { status: 413 });
     chunks.push(chunk);
   }
   if (!chunks.length) return {};
+  let body;
   try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
   } catch {
     throw new Error('Invalid JSON body');
   }
+  // Every route reads fields off the result, so null, arrays and scalars
+  // would surface as a TypeError and a 500.
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    throw new Error('Invalid JSON body: expected an object');
+  }
+  return body;
 }
 
 /** Real path of a root, whether or not the directory already exists. */
@@ -604,11 +614,12 @@ function templateFor(entry) {
 }
 
 /** Runs one due entry; the caller has already marked it "sending". */
-async function fireScheduled(entry, list) {
+async function fireScheduled(entry) {
   try {
     const template = templateFor(entry);
     const campaignId = String(entry.campaign || '');
     const recipients = (entry.recipients || []).map((r) => ({
+      ...r.fields,
       _email: r.email,
       _name: r.name || '',
       _company: r.company || '',
@@ -637,7 +648,17 @@ async function fireScheduled(entry, list) {
     entry.status = 'failed';
     entry.error = err.message;
   } finally {
-    writeSchedule(list);
+    // A send can run for hours, during which schedules are added and
+    // cancelled. Write this entry's outcome into the file as it is now rather
+    // than overwriting it with the copy read before the send began.
+    const current = readSchedule();
+    const stored = current.find((e) => e.id === entry.id);
+    if (stored) {
+      stored.status = entry.status;
+      stored.error = entry.error ?? null;
+      stored.result = entry.result ?? null;
+      writeSchedule(current);
+    }
   }
 }
 
@@ -680,7 +701,7 @@ async function tick() {
 
     due.status = 'sending';
     writeSchedule(list);
-    await fireScheduled(due, list);
+    await fireScheduled(due);
   } catch (err) {
     console.error('[schedule] tick failed:', err.message);
   } finally {
@@ -866,6 +887,10 @@ async function route(req, res) {
     if (!cfg.user) return fail(res, 400, 'Mailbox address is required');
     if (!cfg.pass) return fail(res, 400, 'An app password is required');
     if (!cfg.configured) return fail(res, 400, 'Those settings are incomplete');
+    // Each value becomes one line of the config file; a line break would add keys.
+    if ([cfg.host, cfg.user, cfg.from].some((value) => /[\r\n\0]/.test(value))) {
+      return fail(res, 400, 'Settings cannot contain line breaks');
+    }
 
     let verified = false;
     let verifyError = null;
@@ -1041,6 +1066,9 @@ async function route(req, res) {
         email: r._email,
         name: r._name,
         company: r._company,
+        // The other CSV columns, so {{column}} in the template and subject
+        // renders the same when the entry fires as it did in the preview.
+        fields: Object.fromEntries(Object.entries(r).filter(([key]) => !key.startsWith('_'))),
       })),
       status: 'pending',
       error: null,

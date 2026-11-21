@@ -258,7 +258,7 @@ Supported SMTP environment variables:
 ## Tests
 
 ```bash
-npm test     # 38 tests: parsing, rendering, resume, retries, scheduling, API, auth, TLS, guards
+npm test     # 49 tests: parsing, rendering, resume, retries, scheduling, CLI, API, auth, TLS, guards
 ```
 
 The API tests boot the real server against an in-process SMTP sink, so no mail

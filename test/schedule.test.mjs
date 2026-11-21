@@ -2,13 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { startServer, post, get, wait } from './helpers/server.mjs';
 import { startSmtpSink } from './helpers/smtp-sink.mjs';
 
 import { CSV } from './helpers/server.mjs';
 const TEMPLATE = 'templates/bcci-connect.html';
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const FAST = { SCHEDULER_INTERVAL_MS: '100' };
 
 const scheduleBody = (overrides = {}) => ({
@@ -214,4 +216,63 @@ test('the scheduler rejects a time in the past and a missing subject', async (t)
 
   const missing = await post(base, `/api/schedule/${randomUUID()}/cancel`, {});
   assert.equal(missing.status, 404);
+});
+
+test('a schedule created while another one is sending is not lost', async (t) => {
+  const sink = await startSmtpSink();
+  const server = await startServer({ env: FAST });
+  t.after(async () => { await server.stop(); await sink.close(); });
+  const base = server.base;
+
+  await post(base, '/api/settings', {
+    host: '127.0.0.1', port: sink.port, user: 'desk@local.test', pass: 'x',
+    from: 'Desk <desk@local.test>',
+  });
+
+  const first = await post(base, '/api/schedule', scheduleBody({
+    at: new Date(Date.now() + 1200).toISOString(), campaign: 'long-run', delay: 600,
+  }));
+  assert.equal(first.status, 201);
+  await waitForStatus(base, first.data.entry.id, ['sending']);
+
+  // The queue is edited (one entry added, one cancelled) while the first is in flight.
+  const later = await post(base, '/api/schedule', scheduleBody({
+    at: new Date(Date.now() + 3_600_000).toISOString(), campaign: 'queued-meanwhile',
+  }));
+  assert.equal(later.status, 201);
+  const doomed = await post(base, '/api/schedule', scheduleBody({
+    at: new Date(Date.now() + 3_600_000).toISOString(), campaign: 'cancelled-meanwhile',
+  }));
+  assert.equal((await post(base, `/api/schedule/${doomed.data.entry.id}/cancel`, {})).status, 200);
+
+  await waitForStatus(base, first.data.entry.id, ['sent', 'failed']);
+
+  const entries = (await get(base, '/api/schedule')).data.entries;
+  const byId = new Map(entries.map((entry) => [entry.id, entry]));
+  assert.equal(byId.get(later.data.entry.id)?.status, 'pending');
+  assert.equal(byId.get(doomed.data.entry.id)?.status, 'cancelled');
+});
+
+test('a scheduled send keeps the custom CSV columns the preview showed', async (t) => {
+  const sink = await startSmtpSink();
+  const server = await startServer({ env: FAST });
+  const csv = `${dirname(CSV)}/roles.csv`;
+  writeFileSync(join(ROOT, csv), 'email,name,company,role\nrep@example.com,Rep,Acme,Treasurer\n');
+  t.after(async () => { await server.stop(); await sink.close(); });
+  const base = server.base;
+
+  await post(base, '/api/settings', {
+    host: '127.0.0.1', port: sink.port, user: 'desk@local.test', pass: 'x',
+    from: 'Desk <desk@local.test>',
+  });
+
+  const body = scheduleBody({ csv, subject: 'Hello {{role}}', campaign: 'custom-columns' });
+  const preview = await post(base, '/api/preview', body);
+  assert.equal(preview.data.subject, 'Hello Treasurer');
+
+  const created = await post(base, '/api/schedule', { ...body, at: new Date(Date.now() + 1200).toISOString() });
+  assert.equal(created.status, 201);
+  const done = await waitForStatus(base, created.data.entry.id, ['sent', 'failed']);
+  assert.equal(done.status, 'sent');
+  assert.match(String(sink.messages[0].data), /Subject: Hello Treasurer/);
 });

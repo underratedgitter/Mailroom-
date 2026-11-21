@@ -259,3 +259,47 @@ test('MAILROOM_PASSWORD gates the whole app', async (t) => {
   await post(base, '/api/logout', {}, { cookie: session });
   assert.equal((await get(base, '/api/state', { cookie: session })).status, 401);
 });
+
+test('a malformed session cookie is just signed out, not a server error', async (t) => {
+  const server = await startServer({ env: { MAILROOM_PASSWORD: 'secret-pass' } });
+  t.after(server.stop);
+
+  const res = await get(server.base, '/api/state', { cookie: 'mr_session=%E0%A4%A' });
+  assert.equal(res.status, 401);
+  assert.doesNotMatch(server.output(), /request failed/);
+});
+
+test('a request body that is not a JSON object or is too large is a client error', async (t) => {
+  const server = await startServer();
+  t.after(server.stop);
+  const send = (body) => fetch(`${server.base}/api/preview`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body,
+  });
+
+  for (const body of ['null', '[]', '"text"', '42']) {
+    const res = await send(body);
+    assert.equal(res.status, 400, `body ${body}`);
+  }
+
+  const big = await send(JSON.stringify({ subject: 'x'.repeat(3 * 1024 * 1024) }));
+  assert.equal(big.status, 413);
+  assert.doesNotMatch(server.output(), /request failed/);
+});
+
+test('a line break in a settings field cannot add keys to the config file', async (t) => {
+  const server = await startServer();
+  t.after(server.stop);
+
+  const res = await post(server.base, '/api/settings', {
+    host: '127.0.0.1', port: 2525, user: 'desk@local.test', pass: 'x', test: false,
+    from: 'Desk <desk@local.test>\nSMTP_HOST=attacker.example',
+  });
+  assert.equal(res.status, 400);
+
+  const saved = existsSync(join(server.workDir, 'config.env'))
+    ? readFileSync(join(server.workDir, 'config.env'), 'utf8')
+    : '';
+  assert.doesNotMatch(saved, /attacker\.example/);
+});

@@ -5,8 +5,8 @@
 // drift apart. Anything fatal is thrown as an Error; the callers decide
 // whether that means a non-zero exit or an HTTP 400.
 
-import { readFileSync, appendFileSync, existsSync, readdirSync, statSync } from 'node:fs';
-import { extname } from 'node:path';
+import { readFileSync, appendFileSync, existsSync, readdirSync, statSync, realpathSync } from 'node:fs';
+import { extname, sep } from 'node:path';
 import nodemailer from 'nodemailer';
 import { resolveSmtpConfig } from './mailer.mjs';
 
@@ -66,7 +66,9 @@ function pick(rec, keys) {
   return '';
 }
 
-export const emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// Characters that make a mailer split or rewrite the address (list separators,
+// display-name brackets, quoting and comments) are refused outright.
+export const emailRe = /^[^\s@,;:<>()[\]"\\]+@[^\s@,;:<>()[\]"\\]+\.[^\s@,;:<>()[\]"\\]+$/;
 
 /** Validates, de-duplicates and limits a list of `{_email,_name,_company}` records. */
 function finishRecords(records, limit) {
@@ -164,13 +166,16 @@ export const escapeHtml = (s) => String(s)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
+/** A recipient's own column; `{{constructor}}` must not reach Object.prototype. */
+const field = (rec, key) => (Object.hasOwn(rec, key) ? String(rec[key] ?? '') : '');
+
 /** `{{column}}` substitution for HTML bodies, escaped so a name cannot inject markup. */
 export const render = (tpl, rec) => String(tpl).replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (_, key) => {
   const k = key.toLowerCase();
   if (k === 'name') return escapeHtml(rec._name);
   if (k === 'company') return escapeHtml(rec._company);
   if (k === 'email') return escapeHtml(rec._email);
-  return escapeHtml(rec[k] ?? '');
+  return escapeHtml(field(rec, k));
 });
 
 /**
@@ -185,7 +190,7 @@ export const renderSubject = (tpl, rec) => String(tpl).replace(/\{\{\s*([\w.-]+)
   if (k === 'name') return String(rec._name ?? '');
   if (k === 'company') return String(rec._company ?? '');
   if (k === 'email') return String(rec._email ?? '');
-  return String(rec[k] ?? '');
+  return field(rec, k);
 }).replace(/[\r\n]+/g, ' ').trim();
 
 /** Every `{{column}}` the template actually uses, in first-seen order. */
@@ -201,6 +206,14 @@ export function templateVariables(tpl) {
 // silently attaching nothing.
 const assetCache = new Map();
 
+function staysInside(root, path) {
+  try {
+    return realpathSync(path).startsWith(root + sep);
+  } catch {
+    return false; // dangling link
+  }
+}
+
 export function assetFiles(dir) {
   if (!dir || !existsSync(dir)) return [];
   let stamp;
@@ -211,7 +224,9 @@ export function assetFiles(dir) {
   }
   const hit = assetCache.get(dir);
   if (hit && hit.stamp === stamp) return hit.files;
-  const files = readdirSync(dir).filter((f) => !f.startsWith('.')).sort();
+  // A symlink must not turn an asset name into any file the process can read.
+  const root = realpathSync(dir);
+  const files = readdirSync(dir).filter((f) => !f.startsWith('.') && staysInside(root, `${dir}/${f}`)).sort();
   assetCache.set(dir, { stamp, files });
   return files;
 }
@@ -335,7 +350,7 @@ export function createMailer(cfg = resolveSmtpConfig()) {
     } catch (err) {
       // Fresh socket on the next attempt — pooled connections can go stale.
       transport = null;
-      return { success: false, error: err.message };
+      return { success: false, error: err.message, code: err.code, responseCode: err.responseCode };
     }
   }
 
@@ -348,11 +363,25 @@ export function createMailer(cfg = resolveSmtpConfig()) {
 }
 
 // ── Error classification ─────────────────────────────────────────────
-export const isTransient = (err) =>
-  /timeout|timed out|ECONN|ETIMEDOUT|EAI_AGAIN|ESOCKET|EPIPE|socket hang up|connection closed|connection lost|421|450|451|452|try again|rate/i.test(err || '');
+// Both take a send result `{ error, code?, responseCode? }` (or just the error
+// text). nodemailer's structured fields win: matching words in the message
+// would retry a permanent rejection that merely echoes an address such as
+// "rate421@example.com". The text heuristic is the fallback for errors that
+// carry neither field.
+const TRANSIENT_CODES = /^(ECONN\w*|ETIMEDOUT|EAI_AGAIN|ESOCKET|EPIPE)$/;
 
-export const isFatal = (err) =>
-  /daily user sending limit|5\.4\.5|quota|account.*disabled|authentication/i.test(err || '');
+export function isTransient(failure) {
+  const { error, code, responseCode } = typeof failure === 'object' && failure ? failure : { error: failure };
+  if (Number.isInteger(responseCode)) return responseCode >= 400 && responseCode < 500;
+  if (code) return TRANSIENT_CODES.test(code);
+  return /timeout|timed out|ECONN|ETIMEDOUT|EAI_AGAIN|ESOCKET|EPIPE|socket hang up|connection closed|connection lost|421|450|451|452|try again|rate/i.test(error || '');
+}
+
+export function isFatal(failure) {
+  const { error, code } = typeof failure === 'object' && failure ? failure : { error: failure };
+  if (code === 'EAUTH') return true;
+  return /daily user sending limit|5\.4\.5|quota|account.*disabled|authentication/i.test(error || '');
+}
 
 // ── Send loop ────────────────────────────────────────────────────────
 /**
@@ -422,14 +451,15 @@ export async function runCampaign({
     for (let attempt = 1; attempt <= 3; attempt++) {
       result = await mailer.send({ to: addr, subject, html, assetsDir });
       if (result.success) break;
-      if (isFatal(result.error)) {
+      if (isFatal(result)) {
         if (logPath) appendLog(logPath, { email: addr, status: 'failed', error: result.error, at: new Date().toISOString(), campaign: campaignId || null });
         failed++;
+        failures.push({ email: addr, error: result.error });
         stopped = true;
         onEvent({ type: 'fatal', email: addr, error: result.error });
         break;
       }
-      if (!isTransient(result.error) || attempt === 3) break;
+      if (!isTransient(result) || attempt === 3) break;
       await pause(attempt * retryDelay);
       if (shouldStop()) break;
     }
@@ -447,7 +477,7 @@ export async function runCampaign({
       if (logPath) appendLog(logPath, { email: addr, status: 'failed', error: result.error, at: new Date().toISOString(), campaign: campaignId || null });
       onEvent({ type: 'progress', index: i + 1, total, status: 'failed', email: addr, error: result.error });
 
-      if (isTransient(result.error)) {
+      if (isTransient(result)) {
         transportFailures++;
         if (transportFailures >= MAX_TRANSPORT_FAILURES) {
           stopped = true;

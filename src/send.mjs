@@ -19,6 +19,10 @@
  * The browser front end (npm start) drives the exact same engine in
  * src/lib/core.mjs.
  *
+ * Suppression: --suppress a@x.com,b@x.com adds addresses to the suppression
+ * list (data/suppressed.csv, or --suppression-file / SUPPRESSION_FILE) and
+ * exits. Every send, test included, skips what is on the list.
+ *
  * Flags: --delay 4000 (ms between sends), --limit 100, --log logs/sent.jsonl,
  *        --campaign <id> (labels the log so a re-run resumes that campaign),
  *        --send (actually send), --test addr (single test recipient),
@@ -26,7 +30,7 @@
  */
 
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import {
   recipientsFromFile,
@@ -40,9 +44,13 @@ import {
   resolveSmtpConfig,
   SIGNAL_EXIT,
   describeInterruption,
+  defaultSuppressionPath,
+  addSuppressed,
+  isSuppressed,
+  rateLimitsFromEnv,
 } from './lib/core.mjs';
 import { loadConfig, smtpProblems } from './lib/config.mjs';
-import { missingSmtpFields } from './lib/mailer.mjs';
+import { missingSmtpFields, configIssue } from './lib/mailer.mjs';
 
 // Same settings the browser writes: ./.env or ~/.mailroom/config.env.
 loadConfig();
@@ -67,10 +75,24 @@ try {
       send: { type: 'boolean', default: false },
       test: { type: 'string' },
       dump: { type: 'string' },
+      suppress: { type: 'string' },
+      'suppression-file': { type: 'string' },
     },
 }));
 } catch (err) {
   die(err.message);
+}
+
+const suppressionPath = values['suppression-file'] ? resolve(values['suppression-file']) : defaultSuppressionPath();
+
+if (values.suppress !== undefined) {
+  const emails = values.suppress.split(/[\s,;]+/).filter(Boolean);
+  if (!emails.length) die('--suppress needs at least one address');
+  const result = addSuppressed(suppressionPath, emails);
+  console.log(`\nsuppressed ${result.added.length} address(es) in ${suppressionPath}`);
+  if (result.already.length) console.log(`  already listed: ${result.already.join(', ')}`);
+  if (result.invalid.length) die(`not an email address: ${result.invalid.join(', ')}`);
+  process.exit(0);
 }
 
 if (!values.csv) die('--csv is required');
@@ -106,6 +128,13 @@ const recipients = parsed.recipients;
 
 if (!recipients.length) die('No valid email addresses found in the CSV');
 
+let limits;
+try {
+  limits = rateLimitsFromEnv();
+} catch (err) {
+  die(err.message);
+}
+
 const campaignId = String(values.campaign || '').trim();
 const alreadySent = sentAddresses(readLog(values.log), campaignId);
 
@@ -127,6 +156,9 @@ console.log(`  from      ${cfg.from}`);
 console.log(`  password  ${cfg.pass ? `${cfg.pass.slice(0, 2)}${'•'.repeat(8)}` : '(not set)'}`);
 console.log(`  recipients ${recipients.length}${alreadySent.size ? ` (${alreadySent.size} already sent, will skip)` : ''}`);
 console.log(`  delay     ${delayMs}ms between sends`);
+console.log(`  ceiling   ${limits.perHour ? `${limits.perHour} messages/hour` : 'no hourly limit'}${limits.perDomainPerHour ? `, ${limits.perDomainPerHour} per domain` : ''}`);
+const held = recipients.filter((rec) => isSuppressed(suppressionPath, rec._email)).length;
+if (held) console.log(`  suppressed ${held} (will skip)`);
 if (campaignId) console.log(`  campaign  ${campaignId}`);
 
 // ── Preview (default) — works without credentials ───────────────────
@@ -170,6 +202,9 @@ if (!values.dump && !values.test) {
   }
 }
 
+const issue = configIssue(cfg);
+if (issue) die(issue);
+
 const mailer = createMailer(cfg);
 const ok = await mailer.verify();
 if (!ok.ok) {
@@ -192,6 +227,10 @@ if (values.dump) {
 
 // ── Test mode: one rendered message to a single address ──────────────
 if (values.test) {
+  if (isSuppressed(suppressionPath, values.test)) {
+    mailer.close();
+    die(`${values.test} is on the suppression list`);
+  }
   const rec = { ...recipients[0], _email: values.test };
   const subject = renderSubject(subjectTemplate, rec);
   const html = render(templateHtml, rec);
@@ -213,6 +252,8 @@ try {
     assetsDir,
     campaignId,
     alreadySent,
+    suppressionPath,
+    limits,
     delayMs,
     mailer,
     logPath: values.log,
@@ -220,9 +261,12 @@ try {
     onEvent: (event) => {
       if (event.type === 'progress') {
         const n = `[${event.index}/${event.total}]`;
-        if (event.status === 'skip') console.log(`${n} skip   ${event.email} (already sent)`);
+        if (event.status === 'skip') console.log(`${n} skip   ${event.email} (${event.reason === 'suppressed' ? 'suppressed' : 'already sent'})`);
         else if (event.status === 'sent') console.log(`${n} sent   ${event.email}`);
         else console.log(`${n} FAILED ${event.email} — ${event.error}`);
+      } else if (event.type === 'throttle') {
+        const minutes = Math.ceil(event.waitMs / 60000);
+        console.log(`        waiting ~${minutes} min: ${event.scope === 'hour' ? 'hourly send ceiling' : `${event.scope} ceiling`} reached (Ctrl+C to stop; re-run to resume)`);
       } else if (event.type === 'fatal') {
         console.error(`\nFATAL: ${event.error}\nStopping so the mailbox is not locked.`);
       }
@@ -240,6 +284,7 @@ console.log('────');
 console.log(`  sent    ${summary.sent}`);
 console.log(`  failed  ${summary.failed}`);
 console.log(`  skipped ${summary.skipped}`);
+if (summary.suppressed) console.log(`  suppressed ${summary.suppressed} (on the suppression list)`);
 console.log(`  log     ${values.log}`);
 if (summary.failures.length) {
   console.log('\nFailures');

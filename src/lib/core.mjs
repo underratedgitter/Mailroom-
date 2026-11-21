@@ -5,10 +5,10 @@
 // drift apart. Anything fatal is thrown as an Error; the callers decide
 // whether that means a non-zero exit or an HTTP 400.
 
-import { readFileSync, appendFileSync, existsSync, readdirSync, statSync, realpathSync, renameSync, rmSync } from 'node:fs';
-import { basename, dirname, extname, join, sep } from 'node:path';
+import { readFileSync, appendFileSync, mkdirSync, existsSync, readdirSync, statSync, realpathSync, renameSync, rmSync } from 'node:fs';
+import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import nodemailer from 'nodemailer';
-import { resolveSmtpConfig } from './mailer.mjs';
+import { resolveSmtpConfig, bulkFields, addressDomain } from './mailer.mjs';
 
 // ── CSV ──────────────────────────────────────────────────────────────
 /** Minimal CSV parser: quoted fields, embedded commas, CRLF, BOM. */
@@ -198,6 +198,54 @@ export function templateVariables(tpl) {
   return [...new Set([...String(tpl).matchAll(/\{\{\s*([\w.-]+)\s*\}\}/g)].map((m) => m[1]))];
 }
 
+const NAMED_ENTITIES = {
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', copy: '\u00A9', reg: '\u00AE', trade: '\u2122',
+  ndash: '\u2013', mdash: '\u2014', hellip: '\u2026', lsquo: '\u2018', rsquo: '\u2019', ldquo: '\u201C',
+  rdquo: '\u201D', bull: '\u2022', middot: '\u00B7', euro: '\u20AC', pound: '\u00A3', rupee: '\u20B9',
+};
+
+/** One pass, so an escaped `&amp;lt;` becomes `&lt;` and not `<`. */
+function decodeEntities(text) {
+  return text.replace(/&(?:#(\d+)|#x([\da-f]+)|([a-z]+));/gi, (match, dec, hex, name) => {
+    const code = dec !== undefined ? Number(dec) : hex !== undefined ? parseInt(hex, 16) : null;
+    if (code === null) return NAMED_ENTITIES[name.toLowerCase()] ?? match;
+    return code > 0 && code <= 0x10FFFF && !(code >= 0xD800 && code <= 0xDFFF) ? String.fromCodePoint(code) : match;
+  });
+}
+
+/**
+ * Plain-text alternative for an HTML body. Mail with no text part is a spam
+ * signal and unreadable in text-only clients; links keep their address so the
+ * text part is still usable.
+ */
+export function htmlToText(html) {
+  const stripTags = (s) => s.replace(/<[^>]*>/g, '');
+  const text = String(html)
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<(head|style|script|title)\b[\s\S]*?<\/\1\s*>/gi, '')
+    .replace(/<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))[^>]*>([\s\S]*?)<\/a\s*>/gi, (_, dq, sq, bare, label) => {
+      const href = decodeEntities((dq ?? sq ?? bare).trim());
+      const shown = decodeEntities(stripTags(label)).trim();
+      return /^(https?:|mailto:)/i.test(href) && shown && shown !== href && shown !== href.replace(/^mailto:/i, '')
+        ? `${label} (${href})`
+        : label;
+    })
+    .replace(/<img\b[^>]*?\balt\s*=\s*(?:"([^"]*)"|'([^']*)')[^>]*>/gi, (_, dq, sq) => ` ${dq ?? sq} `)
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<(ul|ol)\b[^>]*>/gi, '\n')
+    .replace(/<li\b[^>]*>/gi, '- ')
+    .replace(/<\/(p|h[1-6])\s*>/gi, '\n\n')
+    .replace(/<\/(div|tr|table|li|ul|ol|blockquote)\s*>/gi, '\n')
+    .replace(/<\/(td|th)\s*>/gi, ' ');
+
+  return decodeEntities(stripTags(text))
+    .split('\n')
+    .map((line) => line.replace(/[ \t\u00A0]+/g, ' ').trim())
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 // ── Inline images ────────────────────────────────────────────────────
 // Gmail blocks data: URIs, so the template's `cid:NAME` references are
 // attached inline from <template>-assets/NAME.*.
@@ -364,6 +412,108 @@ export function describeInterruption(signal, summary, { campaign = '', resume } 
   ].join('\n');
 }
 
+// ── Suppression list ─────────────────────────────────────────────────
+// Addresses that must never be mailed again (unsubscribes, complaints, hard
+// bounces). One CSV, `email,reason,added`; a plain list of addresses also
+// works so an export from another tool can be dropped in. The file is checked
+// before every message, so an address added while a campaign runs is honoured
+// by the very next send.
+
+export const defaultSuppressionPath = (env = process.env) => resolve(env.SUPPRESSION_FILE || 'data/suppressed.csv');
+
+const suppressionCache = new Map();
+
+export function loadSuppressed(path) {
+  let stamp;
+  try {
+    const stats = statSync(path);
+    stamp = `${stats.mtimeMs}:${stats.size}`;
+  } catch {
+    suppressionCache.delete(path);
+    return new Set();
+  }
+  const hit = suppressionCache.get(path);
+  if (hit && hit.stamp === stamp) return hit.set;
+
+  const set = new Set();
+  for (const line of readFileSync(path, 'utf8').split(/\r?\n/)) {
+    const first = line.split(/[,;\t]/)[0].trim().replace(/^"|"$/g, '').toLowerCase();
+    if (emailRe.test(first)) set.add(first);
+  }
+  suppressionCache.set(path, { stamp, set });
+  return set;
+}
+
+export const isSuppressed = (path, email) => loadSuppressed(path).has(String(email).trim().toLowerCase());
+
+/** Adds addresses to the list; reports which were new, already there, or not addresses. */
+export function addSuppressed(path, emails, reason = 'manual') {
+  const known = loadSuppressed(path);
+  const added = [];
+  const already = [];
+  const invalid = [];
+  for (const raw of emails) {
+    const email = String(raw).trim().toLowerCase();
+    if (!emailRe.test(email)) invalid.push(String(raw).trim());
+    else if (known.has(email)) already.push(email);
+    else if (!added.includes(email)) added.push(email);
+  }
+  if (!added.length) return { added, already, invalid };
+
+  mkdirSync(dirname(path), { recursive: true });
+  const existing = existsSync(path) ? readFileSync(path, 'utf8') : '';
+  const label = String(reason || 'manual').replace(/[\r\n,;"]+/g, ' ').trim().slice(0, 80) || 'manual';
+  const at = new Date().toISOString();
+  const rows = added.map((email) => `${email},${label},${at}\n`).join('');
+  const lead = !existing ? 'email,reason,added\n' : existing.endsWith('\n') ? '' : '\n';
+  appendFileSync(path, lead + rows);
+  return { added, already, invalid };
+}
+
+// ── Rate ceiling ─────────────────────────────────────────────────────
+// A rolling one-hour window, so a restart or a second run cannot reset it:
+// the starting point is rebuilt from the send log.
+const HOUR_MS = 3600000;
+
+/** MAX_PER_HOUR (default 500, 0 = off) and MAX_PER_DOMAIN_PER_HOUR (default off). */
+export function rateLimitsFromEnv(env = process.env) {
+  const read = (name, fallback) => {
+    const text = env[name];
+    if (text === undefined || text === '') return fallback;
+    if (!/^\d+$/.test(text)) throw new Error(`${name} must be a whole number of messages per hour (0 turns it off), got "${text}"`);
+    return Number(text);
+  };
+  return { perHour: read('MAX_PER_HOUR', 500), perDomainPerHour: read('MAX_PER_DOMAIN_PER_HOUR', 0) };
+}
+
+/**
+ * `check(domain)` says how long to wait before the next send is within the
+ * ceilings (`scope` is 'hour' or the throttled domain); `record` notes a send.
+ * `history` is `[{ at, domain }]`, oldest first.
+ */
+export function createRateLimiter({ perHour = 0, perDomainPerHour = 0, history = [], now = Date.now }) {
+  const sends = history.map(({ at, domain }) => ({ at: typeof at === 'number' ? at : Date.parse(at), domain }));
+
+  // The send that must age out before another fits under `limit`.
+  const releaseAt = (list, limit) => (limit && list.length >= limit ? list[list.length - limit].at + HOUR_MS : 0);
+
+  return {
+    check(domain) {
+      const t = now();
+      while (sends.length && sends[0].at <= t - HOUR_MS) sends.shift();
+      const global = releaseAt(sends, perHour);
+      const perDomain = releaseAt(sends.filter((s) => s.domain === domain), perDomainPerHour);
+      if (!global && !perDomain) return { waitMs: 0, scope: null };
+      return global >= perDomain
+        ? { waitMs: global - t, scope: 'hour' }
+        : { waitMs: perDomain - t, scope: domain };
+    },
+    record(domain) {
+      sends.push({ at: now(), domain });
+    },
+  };
+}
+
 // ── SMTP ─────────────────────────────────────────────────────────────
 export function createMailer(cfg = resolveSmtpConfig()) {
   let transport = null;
@@ -407,7 +557,9 @@ export function createMailer(cfg = resolveSmtpConfig()) {
         to,
         subject,
         html,
+        text: htmlToText(html),
         attachments,
+        ...bulkFields(cfg, to),
       });
       return { success: true, messageId: info.messageId, inline: attachments.length };
     } catch (err) {
@@ -452,7 +604,9 @@ export function isFatal(failure) {
  * and the GUI so resume, retry and kill-switch rules are identical.
  *
  * onEvent receives:
- *   { type: 'progress', index, total, status: 'sent'|'skip'|'failed', email, error? }
+ *   { type: 'progress', index, total, status: 'sent'|'skip'|'failed', email, error?, reason? }
+ *       (a skip's reason is 'already-sent' or 'suppressed')
+ *   { type: 'throttle', email, waitMs, scope }   waiting for the hourly ceiling
  *   { type: 'fatal', email, error }
  *   { type: 'done', summary }
  */
@@ -463,6 +617,8 @@ export async function runCampaign({
   assetsDir,
   campaignId = '',
   alreadySent = new Set(),
+  suppressionPath = defaultSuppressionPath(),
+  limits = rateLimitsFromEnv(),
   delayMs = 4000,
   mailer,
   logPath,
@@ -486,7 +642,16 @@ export async function runCampaign({
 
   const total = recipients.length;
 
-  let sent = 0, failed = 0, skipped = 0, stopped = false;
+  // Sends from earlier runs in the last hour count against the ceiling too.
+  const hourAgo = Date.now() - HOUR_MS;
+  const limiter = createRateLimiter({
+    ...limits,
+    history: (logPath ? readLog(logPath) : [])
+      .filter((e) => e.status === 'sent' && Date.parse(e.at) > hourAgo)
+      .map((e) => ({ at: e.at, domain: addressDomain(e.email) })),
+  });
+
+  let sent = 0, failed = 0, skipped = 0, suppressed = 0, stopped = false;
   // A broken link (network down, provider blocking the IP) fails every
   // recipient. Retrying each of them three times over a long list hammers the
   // server and delays the real fix, so stop the run after a run of these.
@@ -500,11 +665,23 @@ export async function runCampaign({
     const rec = recipients[i];
     const addr = rec._email;
 
-    if (alreadySent.has(addr.toLowerCase())) {
+    const skip = (reason) => {
       skipped++;
-      if (logPath) appendLog(logPath, { email: addr, status: 'skipped', at: new Date().toISOString(), campaign: campaignId || null });
-      onEvent({ type: 'progress', index: i + 1, total, status: 'skip', email: addr });
-      continue;
+      if (reason === 'suppressed') suppressed++;
+      if (logPath) appendLog(logPath, { email: addr, status: 'skipped', ...(reason === 'suppressed' ? { reason } : {}), at: new Date().toISOString(), campaign: campaignId || null });
+      onEvent({ type: 'progress', index: i + 1, total, status: 'skip', email: addr, reason });
+    };
+
+    if (alreadySent.has(addr.toLowerCase())) { skip('already-sent'); continue; }
+    // Checked afresh for every message: an unsubscribe that arrives mid-run counts.
+    if (isSuppressed(suppressionPath, addr)) { skip('suppressed'); continue; }
+
+    const domain = addressDomain(addr);
+    const gate = limiter.check(domain);
+    if (gate.waitMs > 0) {
+      onEvent({ type: 'throttle', email: addr, waitMs: gate.waitMs, scope: gate.scope });
+      await pause(gate.waitMs);
+      if (shouldStop()) { stopped = true; break; }
     }
 
     const subject = renderSubject(subjectTemplate, rec);
@@ -532,7 +709,8 @@ export async function runCampaign({
     if (result.success) {
       transportFailures = 0;
       sent++;
-      if (logPath) appendLog(logPath, { email: addr, status: 'sent', at: new Date().toISOString(), campaign: campaignId || null });
+      limiter.record(domain);
+      if (logPath) appendLog(logPath, { email: addr, status: 'sent', messageId: result.messageId || null, at: new Date().toISOString(), campaign: campaignId || null });
       onEvent({ type: 'progress', index: i + 1, total, status: 'sent', email: addr });
     } else {
       failed++;
@@ -560,7 +738,7 @@ export async function runCampaign({
   }
 
   const remaining = total - sent - failed - skipped;
-  const summary = { sent, failed, skipped, failures, stopped, total, remaining, logPath: logPath || null };
+  const summary = { sent, failed, skipped, suppressed, failures, stopped, total, remaining, logPath: logPath || null };
   onEvent({ type: 'done', summary });
   return summary;
 }

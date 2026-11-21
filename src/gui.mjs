@@ -32,6 +32,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { randomUUID, randomBytes } from 'node:crypto';
 import { hashPassword, verifyPassword, parsePasswordHash } from './lib/auth.mjs';
+import { configIssue } from './lib/mailer.mjs';
 import { loadConfig, saveConfig, resolveConfigPath, smtpFileValues, assertConfig } from './lib/config.mjs';
 import { readFileSync, writeFileSync, renameSync, rmSync, existsSync, readdirSync, statSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import { dirname, extname, join, resolve, sep } from 'node:path';
@@ -46,6 +47,10 @@ import {
   inlineForPreview,
   attachmentsFor,
   readLog,
+  loadSuppressed,
+  addSuppressed,
+  isSuppressed,
+  rateLimitsFromEnv,
   sentAddresses,
   campaignSummaries,
   createMailer,
@@ -72,6 +77,7 @@ const PUBLIC_DIR = join(ROOT, 'public');
 const DATA_DIR = join(ROOT, 'data');
 const TEMPLATE_DIR = join(ROOT, 'templates');
 const LOG_PATH = resolve(process.env.SEND_LOG || join(ROOT, 'logs', 'sent.jsonl'));
+const SUPPRESSION_PATH = resolve(process.env.SUPPRESSION_FILE || join(DATA_DIR, 'suppressed.csv'));
 const SCHEDULE_PATH = resolve(process.env.SCHEDULE_FILE || join(ROOT, 'logs', 'schedule.json'));
 // A schedule that came due while the server was off is sent if it is at most
 // this late; later than that it is parked as "missed" for a human to decide.
@@ -390,6 +396,7 @@ function listCsvs() {
   if (!existsSync(DATA_DIR)) return [];
   return readdirSync(DATA_DIR)
     .filter((name) => name.toLowerCase().endsWith('.csv'))
+    .filter((name) => join(DATA_DIR, name) !== SUPPRESSION_PATH)
     .filter((name) => !lstatSync(join(DATA_DIR, name)).isSymbolicLink())
     .sort()
     .map((name) => {
@@ -475,6 +482,16 @@ function smtpState() {
   };
 }
 
+/** Why a send cannot go out compliantly (bad ceiling, From or unsubscribe URL), or null. */
+function complianceIssue(cfg) {
+  try {
+    rateLimitsFromEnv();
+  } catch (err) {
+    return err.message;
+  }
+  return configIssue(cfg);
+}
+
 /** Shared input resolution for preview / test / send. */
 function resolveInput(body) {
   const templatePath = safePath(body.html, { roots: [TEMPLATE_DIR], ext: ['.html', '.htm'] });
@@ -530,6 +547,9 @@ function nextCsvPath(name) {
 function previewFor(input, index = 0) {
   const i = Math.max(0, Math.min(input.parsed.recipients.length - 1, Number(index) || 0));
   const rec = input.parsed.recipients[i];
+  const held = (r) => !input.alreadySent.has(r._email.toLowerCase()) && isSuppressed(SUPPRESSION_PATH, r._email);
+  const suppressed = input.parsed.recipients.filter(held).length;
+  const skipped = input.parsed.recipients.filter((r) => input.alreadySent.has(r._email.toLowerCase())).length;
   const raw = render(input.templateHtml, rec);
   return {
     index: i,
@@ -542,8 +562,9 @@ function previewFor(input, index = 0) {
     alreadySent: input.alreadySent.has(rec._email.toLowerCase()),
     source: input.source,
     html: inlineForPreview(raw, input.assetsDir),
-    willSend: input.parsed.recipients.filter((r) => !input.alreadySent.has(r._email.toLowerCase())).length,
-    skipped: input.parsed.recipients.filter((r) => input.alreadySent.has(r._email.toLowerCase())).length,
+    willSend: input.parsed.recipients.length - skipped - suppressed,
+    skipped,
+    suppressed,
     invalid: input.parsed.invalid,
     duplicates: input.parsed.duplicates,
     truncated: input.parsed.truncated,
@@ -626,6 +647,8 @@ function startCampaign(input, { delay = 0 } = {}) {
   (async () => {
     const mailer = createMailer(cfg);
     try {
+      const issue = complianceIssue(cfg);
+      if (issue) throw new Error(issue);
       const verify = await mailer.verify();
       if (!verify.ok) {
         emit(job, { type: 'error', error: `Connection failed: ${verify.error}` });
@@ -646,6 +669,7 @@ function startCampaign(input, { delay = 0 } = {}) {
         assetsDir: input.assetsDir,
         campaignId: input.campaignId,
         alreadySent: input.alreadySent,
+        suppressionPath: SUPPRESSION_PATH,
         delayMs: delay,
         mailer,
         logPath: LOG_PATH,
@@ -955,6 +979,7 @@ async function route(req, res) {
         entries: entries.length,
         campaigns: campaignSummaries(entries).slice(0, 12),
       },
+      suppression: { path: rel(SUPPRESSION_PATH), count: loadSuppressed(SUPPRESSION_PATH).size },
       defaults: { delay: 4000, campaign: suggestedCampaign() },
       platform: process.platform,
     });
@@ -1096,8 +1121,11 @@ async function route(req, res) {
     const input = resolveInput(body);
     const to = String(body.to || '').trim();
     if (!emailRe.test(to)) return fail(res, 400, 'Enter a valid test address');
+    if (isSuppressed(SUPPRESSION_PATH, to)) return fail(res, 400, `${to} is on the suppression list`);
     const cfg = resolveSmtpConfig();
     if (!cfg.configured) return fail(res, 400, 'SMTP credentials are not set');
+    const issue = complianceIssue(cfg);
+    if (issue) return fail(res, 400, issue);
 
     const rec = { ...input.parsed.recipients[0], _email: to };
     const mailer = createMailer(cfg);
@@ -1128,6 +1156,8 @@ async function route(req, res) {
     const input = resolveInput(body);
     const cfg = resolveSmtpConfig();
     if (!cfg.configured) return fail(res, 400, 'SMTP credentials are not set');
+    const issue = complianceIssue(cfg);
+    if (issue) return fail(res, 400, issue);
 
     const delay = delayFrom(body.delay);
     let job;
@@ -1137,6 +1167,26 @@ async function route(req, res) {
       return fail(res, err.status || 409, err.message);
     }
     return json(res, 202, { jobId: job.id, total: input.parsed.recipients.length, skipped: input.alreadySent.size });
+  }
+
+  // ── Suppression list ──────────────────────────────────────────────
+  if (req.method === 'GET' && pathname === '/api/suppression') {
+    const emails = [...loadSuppressed(SUPPRESSION_PATH)].sort();
+    return json(res, 200, { path: rel(SUPPRESSION_PATH), count: emails.length, emails });
+  }
+
+  // Body: { emails: "a@x.com\nb@x.com" | ["a@x.com"], reason?: "unsubscribe" }
+  if (req.method === 'POST' && pathname === '/api/suppress') {
+    const body = await readJson(req);
+    const list = typeof body.emails === 'string' ? body.emails.split(/[\s,;]+/) : body.emails;
+    if (!Array.isArray(list) || list.some((item) => typeof item !== 'string')) {
+      return fail(res, 400, 'emails must be a string or an array of strings');
+    }
+    const emails = list.map((item) => item.trim()).filter(Boolean);
+    if (!emails.length) return fail(res, 400, 'Give at least one address to suppress');
+    const result = addSuppressed(SUPPRESSION_PATH, emails, typeof body.reason === 'string' ? body.reason : 'manual');
+    if (!result.added.length && !result.already.length) return fail(res, 400, `Not an email address: ${result.invalid.join(', ')}`);
+    return json(res, 200, { ...result, count: loadSuppressed(SUPPRESSION_PATH).size });
   }
 
   // ── Scheduled campaigns ───────────────────────────────────────────
@@ -1152,6 +1202,10 @@ async function route(req, res) {
   if (req.method === 'POST' && pathname === '/api/schedule') {
     const body = await readJson(req);
     const input = resolveInput(body);
+    // Queueing before SMTP is set up is allowed; the run re-checks when it fires.
+    const smtp = resolveSmtpConfig();
+    const issue = smtp.configured ? complianceIssue(smtp) : null;
+    if (issue) return fail(res, 400, issue);
 
     const at = Date.parse(String(body.at || ''));
     if (!Number.isFinite(at)) return fail(res, 400, 'Pick a date and time');

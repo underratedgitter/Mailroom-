@@ -5,8 +5,8 @@
 // drift apart. Anything fatal is thrown as an Error; the callers decide
 // whether that means a non-zero exit or an HTTP 400.
 
-import { readFileSync, appendFileSync, existsSync, readdirSync, statSync, realpathSync } from 'node:fs';
-import { extname, sep } from 'node:path';
+import { readFileSync, appendFileSync, existsSync, readdirSync, statSync, realpathSync, renameSync, rmSync } from 'node:fs';
+import { basename, dirname, extname, join, sep } from 'node:path';
 import nodemailer from 'nodemailer';
 import { resolveSmtpConfig } from './mailer.mjs';
 
@@ -259,14 +259,57 @@ export function inlineForPreview(html, dir) {
 }
 
 // ── Send log (resumability) ──────────────────────────────────────────
-export function readLog(logPath) {
-  if (!existsSync(logPath)) return [];
-  const entries = [];
-  for (const line of readFileSync(logPath, 'utf8').split('\n')) {
+// The log is the resume state, so it is never truncated: a full file is
+// renamed to <log>.1 (older archives shift up, the oldest past the retention
+// count is deleted) and reads span the live file and every archive.
+const DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024;
+const DEFAULT_LOG_KEEP = 5;
+
+/** Rotation limits from SEND_LOG_MAX_BYTES (0 disables rotation) and SEND_LOG_KEEP. */
+export function logLimits(env = process.env) {
+  const whole = (text, fallback, min) => (/^\d+$/.test(String(text ?? '').trim()) && Number(text) >= min ? Number(text) : fallback);
+  return {
+    maxBytes: whole(env.SEND_LOG_MAX_BYTES, DEFAULT_LOG_MAX_BYTES, 0),
+    keep: whole(env.SEND_LOG_KEEP, DEFAULT_LOG_KEEP, 1),
+  };
+}
+
+/** Archives of a log as `{ n, path }`, oldest (highest n) first. */
+export function logArchives(logPath) {
+  const prefix = `${basename(logPath)}.`;
+  let names;
+  try {
+    names = readdirSync(dirname(logPath));
+  } catch {
+    return [];
+  }
+  return names
+    .filter((name) => name.startsWith(prefix) && /^\d+$/.test(name.slice(prefix.length)))
+    .map((name) => ({ n: Number(name.slice(prefix.length)), path: join(dirname(logPath), name) }))
+    .sort((a, b) => b.n - a.n);
+}
+
+function parseLogFile(path, entries) {
+  for (const line of readFileSync(path, 'utf8').split('\n')) {
     if (!line.trim()) continue;
     try { entries.push(JSON.parse(line)); } catch { /* ignore malformed line */ }
   }
+}
+
+/** Every entry, oldest first, across the live file and its archives. */
+export function readLog(logPath) {
+  const entries = [];
+  for (const { path } of logArchives(logPath)) parseLogFile(path, entries);
+  if (existsSync(logPath)) parseLogFile(logPath, entries);
   return entries;
+}
+
+function rotateLog(logPath, keep) {
+  for (const { n, path } of logArchives(logPath)) {
+    if (n >= keep) rmSync(path, { force: true });
+    else renameSync(path, `${logPath}.${n + 1}`);
+  }
+  renameSync(logPath, `${logPath}.1`);
 }
 
 /**
@@ -298,8 +341,28 @@ export function campaignSummaries(entries) {
   return [...byId.values()].sort((a, b) => String(b.last).localeCompare(String(a.last)));
 }
 
-export const appendLog = (logPath, entry) =>
-  appendFileSync(logPath, `${JSON.stringify(entry)}\n`);
+export function appendLog(logPath, entry, { maxBytes, keep } = logLimits()) {
+  try {
+    if (maxBytes > 0 && existsSync(logPath) && statSync(logPath).size >= maxBytes) rotateLog(logPath, keep);
+    appendFileSync(logPath, `${JSON.stringify(entry)}\n`);
+  } catch (err) {
+    // Mailing on without a record would send duplicates after a resume.
+    throw new Error(`Cannot write the send log ${logPath}: ${err.message}. Stopped so nobody is mailed without being recorded; fix the problem and run the campaign again to resume.`);
+  }
+}
+
+/** Exit codes for a run stopped by a signal (128 + signal number). */
+export const SIGNAL_EXIT = { SIGINT: 130, SIGTERM: 143 };
+
+/** The message printed when a signal stopped a campaign part-way. */
+export function describeInterruption(signal, summary, { campaign = '', resume } = {}) {
+  const done = summary.sent + summary.failed + summary.skipped;
+  const label = campaign ? `campaign "${campaign}"` : 'the campaign';
+  return [
+    `Interrupted by ${signal}: ${label} stopped after ${done} of ${summary.total} recipient(s); ${summary.remaining} recipient(s) were not attempted.`,
+    `Progress is saved${summary.logPath ? ` in ${summary.logPath}` : ''}. ${resume}`,
+  ].join('\n');
+}
 
 // ── SMTP ─────────────────────────────────────────────────────────────
 export function createMailer(cfg = resolveSmtpConfig()) {
@@ -496,7 +559,8 @@ export async function runCampaign({
     if (i < total - 1 && delayMs) await pause(delayMs);
   }
 
-  const summary = { sent, failed, skipped, failures, stopped, total, logPath: logPath || null };
+  const remaining = total - sent - failed - skipped;
+  const summary = { sent, failed, skipped, failures, stopped, total, remaining, logPath: logPath || null };
   onEvent({ type: 'done', summary });
   return summary;
 }

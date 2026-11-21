@@ -20,6 +20,9 @@ import {
   chmodSync,
   renameSync,
   rmSync,
+  statSync,
+  accessSync,
+  constants,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -122,6 +125,90 @@ export function smtpFileValues({ host, port, user, pass, from }) {
   // A blank password means "keep the one already saved".
   if (pass) values.SMTP_PASS = pass;
   return values;
+}
+
+// ── Startup validation ───────────────────────────────────────────────
+// A typo in an environment variable should stop the process with a sentence
+// naming the variable, not surface later as NaN or a stack trace.
+const isWhole = (text) => /^\d+$/.test(text);
+
+function portProblem(env, name, min, hint = '') {
+  const value = env[name];
+  if (value === undefined || value === '') return null;
+  const text = String(value).trim();
+  if (isWhole(text) && Number(text) >= min && Number(text) <= 65535) return null;
+  return `${name} must be a whole number from ${min} to 65535, got "${value}"${hint}`;
+}
+
+function wholeProblem(env, name, min) {
+  const value = env[name];
+  if (value === undefined || value === '') return null;
+  if (isWhole(String(value).trim()) && Number(value) >= min) return null;
+  return `${name} must be a whole number of at least ${min}, got "${value}"`;
+}
+
+/** Problems with the SMTP variables alone (what the CLI needs). */
+export function smtpProblems(env = process.env) {
+  const problems = [portProblem(env, 'SMTP_PORT', 1)];
+  const secure = env.SMTP_SECURE;
+  if (secure !== undefined && secure !== '' && secure !== 'true' && secure !== 'false') {
+    problems.push(`SMTP_SECURE must be "true" or "false", got "${secure}"`);
+  }
+  return problems.filter(Boolean);
+}
+
+function templatesProblem(dir) {
+  let info;
+  try {
+    info = statSync(dir);
+  } catch (err) {
+    return err.code === 'ENOENT' || err.code === 'ENOTDIR'
+      ? `Templates folder not found: ${dir}`
+      : `Cannot read the templates folder ${dir}: ${err.message}`;
+  }
+  if (!info.isDirectory()) return `Templates folder ${dir} is not a folder`;
+  try {
+    accessSync(dir, constants.R_OK | constants.X_OK);
+  } catch (err) {
+    return `Cannot read the templates folder ${dir}: ${err.message}`;
+  }
+  return null;
+}
+
+function writableProblem({ label, path }) {
+  try {
+    mkdirSync(path, { recursive: true });
+    accessSync(path, constants.W_OK);
+    return null;
+  } catch (err) {
+    return `Cannot use the ${label} ${path}: ${err.message}`;
+  }
+}
+
+/**
+ * Everything wrong with the server's configuration, in one list so a
+ * misconfigured install is fixed in one pass. `writableDirs` are created if
+ * missing.
+ */
+export function configProblems(env = process.env, { templatesDir, writableDirs = [] } = {}) {
+  const problems = [
+    portProblem(env, 'GUI_PORT', 0, ' (set it with --port or GUI_PORT)'),
+    ...smtpProblems(env),
+    wholeProblem(env, 'SCHEDULE_GRACE_MS', 0),
+    wholeProblem(env, 'SCHEDULER_INTERVAL_MS', 1),
+    wholeProblem(env, 'SEND_LOG_MAX_BYTES', 0),
+    wholeProblem(env, 'SEND_LOG_KEEP', 1),
+  ];
+  if (templatesDir) problems.push(templatesProblem(templatesDir));
+  for (const dir of writableDirs) problems.push(writableProblem(dir));
+  return problems.filter(Boolean);
+}
+
+/** Throws one Error listing every problem; returns quietly when there are none. */
+export function assertConfig(env = process.env, options = {}) {
+  const problems = configProblems(env, options);
+  if (!problems.length) return;
+  throw new Error(`Invalid configuration:\n    - ${problems.join('\n    - ')}`);
 }
 
 export { KEYS };

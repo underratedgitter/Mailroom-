@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, symlinkSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -16,6 +16,8 @@ import {
   sentAddresses,
   campaignSummaries,
   readLog,
+  appendLog,
+  logArchives,
   runCampaign,
   emailRe,
   createMailer,
@@ -204,6 +206,110 @@ test('campaignSummaries counts outcomes per campaign', () => {
   assert.deepEqual(summaries.map(({ id, sent, skipped, failed }) => ({ id, sent, skipped, failed })), [
     { id: 'x', sent: 1, skipped: 1, failed: 1 },
   ]);
+});
+
+test('the send log rotates by size and resume still sees every archive', () => {
+  const dir = workDir();
+  const logPath = join(dir, 'sent.jsonl');
+  try {
+    const limits = { maxBytes: 300, keep: 3 };
+    for (let n = 1; n <= 30; n++) {
+      appendLog(logPath, { email: `u${n}@b.co`, status: 'sent', at: 'x', campaign: 'big' }, limits);
+    }
+
+    const files = readdirSync(dir).sort();
+    assert.deepEqual(files, ['sent.jsonl', 'sent.jsonl.1', 'sent.jsonl.2', 'sent.jsonl.3']);
+
+    // Entries come back oldest first, and the newest ones are in the live file.
+    const emails = readLog(logPath).map((e) => e.email);
+    assert.equal(emails.at(-1), 'u30@b.co');
+    assert.deepEqual(emails, [...emails].sort((a, b) => parseInt(a.slice(1), 10) - parseInt(b.slice(1), 10)));
+    assert.ok(sentAddresses(readLog(logPath), 'big').has('u30@b.co'));
+    assert.ok(readFileSync(logPath, 'utf8').length < 300 + 100);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('log rotation drops only archives beyond the retention count and is off at 0 bytes', () => {
+  const dir = workDir();
+  const logPath = join(dir, 'sent.jsonl');
+  try {
+    // A leftover from when more archives were kept, plus an unrelated file.
+    for (const name of ['sent.jsonl.1', 'sent.jsonl.2', 'sent.jsonl.7', 'sent.jsonl.bak']) {
+      writeFileSync(join(dir, name), '{"email":"old@b.co","status":"sent"}\n');
+    }
+    appendLog(logPath, { email: 'a@b.co', status: 'sent' }, { maxBytes: 1, keep: 2 });
+    appendLog(logPath, { email: 'b@b.co', status: 'sent' }, { maxBytes: 1, keep: 2 });
+
+    assert.deepEqual(logArchives(logPath).map((a) => a.n), [2, 1]);
+    assert.ok(readdirSync(dir).includes('sent.jsonl.bak'));
+    assert.ok(!readdirSync(dir).includes('sent.jsonl.7'));
+
+    appendLog(logPath, { email: 'c@b.co', status: 'sent' }, { maxBytes: 0, keep: 2 });
+    appendLog(logPath, { email: 'd@b.co', status: 'sent' }, { maxBytes: 0, keep: 2 });
+    assert.equal(logArchives(logPath).length, 2, 'maxBytes 0 never rotates');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the rotation limits come from SEND_LOG_MAX_BYTES and SEND_LOG_KEEP', () => {
+  const dir = workDir();
+  const logPath = join(dir, 'sent.jsonl');
+  const saved = { max: process.env.SEND_LOG_MAX_BYTES, keep: process.env.SEND_LOG_KEEP };
+  try {
+    process.env.SEND_LOG_MAX_BYTES = '100';
+    process.env.SEND_LOG_KEEP = '1';
+    for (let n = 0; n < 10; n++) appendLog(logPath, { email: `u${n}@b.co`, status: 'sent' });
+    assert.deepEqual(readdirSync(dir).sort(), ['sent.jsonl', 'sent.jsonl.1']);
+  } finally {
+    for (const [key, value] of [['SEND_LOG_MAX_BYTES', saved.max], ['SEND_LOG_KEEP', saved.keep]]) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a send log that cannot be written stops the run with a plain message', async () => {
+  const dir = workDir();
+  try {
+    let count = 0;
+    await assert.rejects(runCampaign({
+      recipients: [recipient('a@b.co'), recipient('b@c.co')],
+      templateHtml: 'x',
+      subjectTemplate: 'x',
+      delayMs: 0,
+      mailer: { send: async () => { count++; return { success: true }; } },
+      logPath: join(dir, 'missing-folder', 'sent.jsonl'),
+      onEvent: () => {},
+    }), /Cannot write the send log .*sent\.jsonl/);
+    assert.equal(count, 1, 'must not keep mailing people it cannot record');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('runCampaign reports how many recipients were never attempted when stopped', async () => {
+  const dir = workDir();
+  try {
+    let count = 0;
+    const summary = await runCampaign({
+      recipients: [1, 2, 3, 4].map((n) => recipient(`u${n}@b.co`)),
+      templateHtml: 'x',
+      subjectTemplate: 'x',
+      delayMs: 0,
+      mailer: { send: async () => { count++; return { success: true }; } },
+      logPath: join(dir, 'stop.jsonl'),
+      shouldStop: () => count >= 2,
+      onEvent: () => {},
+    });
+    assert.equal(summary.stopped, true);
+    assert.equal(summary.remaining, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 const recipient = (email) => ({ _email: email, _name: 'Name', _company: 'Co' });

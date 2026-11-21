@@ -31,7 +31,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { randomUUID, randomBytes, timingSafeEqual } from 'node:crypto';
-import { loadConfig, saveConfig, resolveConfigPath, smtpFileValues } from './lib/config.mjs';
+import { loadConfig, saveConfig, resolveConfigPath, smtpFileValues, assertConfig } from './lib/config.mjs';
 import { readFileSync, writeFileSync, renameSync, rmSync, existsSync, readdirSync, statSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import { dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -51,7 +51,10 @@ import {
   runCampaign,
   resolveSmtpConfig,
   emailRe,
+  SIGNAL_EXIT,
+  describeInterruption,
 } from './lib/core.mjs';
+import { missingSmtpFields } from './lib/mailer.mjs';
 
 // Read the product config before anything looks at process.env.
 const configFile = loadConfig();
@@ -125,9 +128,6 @@ function assertBindingIsSafe(host) {
     ].join('\n  '));
   }
 }
-
-mkdirSync(dirname(LOG_PATH), { recursive: true });
-mkdirSync(dirname(SCHEDULE_PATH), { recursive: true });
 
 // Loopback addresses the page is allowed to arrive through. Anything else is
 // a DNS-rebinding attempt: a public hostname pointed at 127.0.0.1 would let a
@@ -468,7 +468,15 @@ function runningJob() {
   return job && !job.done ? job : null;
 }
 
+// Set by the signal handler; no new campaign may start once it is true.
+let shuttingDown = false;
+
 function createJob() {
+  if (shuttingDown) {
+    const err = new Error('Mailroom is shutting down');
+    err.status = 503;
+    throw err;
+  }
   // One campaign at a time: two runs would double-send whatever they share.
   if (runningJob()) {
     const err = new Error('A campaign is already running — wait for it to finish');
@@ -635,6 +643,7 @@ async function fireScheduled(entry) {
       campaignId,
       alreadySent: sentAddresses(readLog(LOG_PATH), campaignId),
     }, { delay: delayFrom(entry.delay) });
+    job.scheduleId = entry.id;
 
     const summary = await job.finished;
     entry.result = {
@@ -642,7 +651,15 @@ async function fireScheduled(entry) {
       failed: summary?.failed || 0,
       skipped: summary?.skipped || 0,
     };
-    entry.status = summary?.error || (!summary?.sent && summary?.failed) ? 'failed' : 'sent';
+    if (job.cancelled && summary?.remaining > 0) {
+      // Stopped part-way. A shutdown puts the entry back in line so the next
+      // start resumes it (the log skips whoever was already mailed); a person
+      // pressing Stop means it is over.
+      entry.status = shuttingDown ? 'pending' : 'cancelled';
+      if (shuttingDown) entry.result = null;
+    } else {
+      entry.status = summary?.error || (!summary?.sent && summary?.failed) ? 'failed' : 'sent';
+    }
     if (summary?.error) entry.error = summary.error;
   } catch (err) {
     entry.status = 'failed';
@@ -666,7 +683,7 @@ let schedulerTimer = null;
 let ticking = false;
 
 async function tick() {
-  if (ticking) return;
+  if (ticking || shuttingDown) return;
   ticking = true;
   try {
     const list = readSchedule();
@@ -1200,6 +1217,13 @@ let started = null;
 export function startServer({ port = PORT, host = HOST } = {}) {
   if (started) return Promise.resolve(started);
   try {
+    assertConfig(process.env, {
+      templatesDir: TEMPLATE_DIR,
+      writableDirs: [
+        { label: 'log folder', path: dirname(LOG_PATH) },
+        { label: 'schedule folder', path: dirname(SCHEDULE_PATH) },
+      ],
+    });
     assertBindingIsSafe(host);
     server = createServer();
   } catch (err) {
@@ -1230,7 +1254,8 @@ function banner() {
   console.log(`\n  Mailroom ${APP_VERSION}`);
   console.log(`  ─────────────`);
   console.log(`  url       ${TLS_ON ? 'https' : 'http'}://${HOST}:${PORT}`);
-  console.log(`  smtp      ${cfg.host}:${cfg.port} ${cfg.configured ? '(configured)' : '(set it up in the browser)'}`);
+  const missing = missingSmtpFields(cfg);
+  console.log(`  smtp      ${cfg.host}:${cfg.port} ${cfg.configured ? '(configured)' : `(missing ${missing.join(', ')}; set it up in the browser)`}`);
   console.log(`  config    ${rel(configFile.path)}`);
   console.log(`  log       ${rel(LOG_PATH)}`);
   if (!LOOPBACK) {
@@ -1252,28 +1277,53 @@ if (isMain) {
     });
 }
 
-let shuttingDown = false;
+const SHUTDOWN_WAIT_MS = 8000;
 
-for (const signal of ['SIGINT', 'SIGTERM']) {
+/** Stops the running campaign cleanly, reports it, and returns the exit code. */
+async function shutDown(signal) {
+  if (schedulerTimer) clearInterval(schedulerTimer);
+
+  // The message in flight finishes and is logged; the rest are never started.
+  // A scheduled entry goes back to "pending" and resumes on the next start.
+  const job = runningJob();
+  if (job) job.cancelled = true;
+
+  const deadline = Date.now() + SHUTDOWN_WAIT_MS;
+  while ((runningJob() || ticking) && Date.now() < deadline) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+  }
+  if (!job) return 0;
+
+  const start = job.events.find((event) => event.type === 'start') || {};
+  const campaign = start.campaign || '';
+  const resume = job.scheduleId
+    ? 'The scheduled entry is back in the queue and resumes when Mailroom starts again (or use Run now).'
+    : 'Start the same campaign again to resume; addresses already sent are skipped.';
+
+  if (!job.done) {
+    console.error(`\n  Interrupted by ${signal}: ${campaign ? `campaign "${campaign}"` : 'the campaign'} did not stop within ${SHUTDOWN_WAIT_MS / 1000}s.`);
+    console.error('  The message in flight may or may not have been delivered; check the send log before running it again.\n');
+    return SIGNAL_EXIT[signal];
+  }
+  if (job.summary?.remaining > 0) {
+    console.error(`\n  ${describeInterruption(signal, job.summary, { campaign, resume }).replace(/\n/g, '\n  ')}\n`);
+    return SIGNAL_EXIT[signal];
+  }
+  return 0;
+}
+
+for (const signal of Object.keys(SIGNAL_EXIT)) {
   process.on(signal, async () => {
-    if (shuttingDown) process.exit(1); // second Ctrl+C is a hard stop
+    if (shuttingDown) {
+      console.error('\n  Second signal: exiting now. A message in flight may not have been recorded.\n');
+      process.exit(SIGNAL_EXIT[signal]);
+    }
     shuttingDown = true;
 
-    if (schedulerTimer) clearInterval(schedulerTimer);
-
-    // Stop cleanly: the message in flight finishes and is logged, the rest
-    // are never started. A scheduled entry stays pending and fires on the
-    // next start if it is still within the grace window.
-    for (const job of jobs.values()) job.cancelled = true;
-
-    const deadline = Date.now() + 8000;
-    while (runningJob() && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-
-    server?.close(() => process.exit(0));
-    if (!server) process.exit(0);
-    setTimeout(() => process.exit(0), 500).unref();
+    const code = await shutDown(signal);
+    server?.close(() => process.exit(code));
+    if (!server) process.exit(code);
+    setTimeout(() => process.exit(code), 500).unref();
   });
 }
 

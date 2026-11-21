@@ -126,8 +126,10 @@ h2 { font-size: 13px; font-weight: 600; letter-spacing: 0.02em; }
 
 /* ── Desk layout ────────────────────────────────────────────────── */
 /* Hidden until the first state arrives, so the form is not seen growing as
-   its lists, hints and roster fill in. */
-body.is-loading .desk { visibility: hidden; animation: unveil 0s 3s forwards; }
+   its lists, hints and roster fill in, nor the header values sliding. */
+body.is-loading .desk,
+body.is-loading .waybill__meta,
+body.is-loading .waybill__stamp { visibility: hidden; animation: unveil 0s 3s forwards; }
 @keyframes unveil { to { visibility: visible; } } /* failsafe if the script never finishes */
 
 .desk {

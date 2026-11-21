@@ -100,6 +100,17 @@ npm start
 | `GUI_HOST` | `127.0.0.1` | Network interface to bind (CLI: `--host`) |
 | `GUI_PORT` | `4173` | Port to listen on (CLI: `--port`) |
 | `GUI_ALLOWED_HOSTS` | unset | Comma-separated list of additional allowed `Host` headers |
+| `SEND_LOG_MAX_BYTES` | `10485760` | Size at which `logs/sent.jsonl` is rotated (`0` turns rotation off) |
+| `SEND_LOG_KEEP` | `5` | Rotated archives kept (`sent.jsonl.1` is the newest); at least 1 |
+
+Startup is validated before the port opens: a bad `GUI_PORT` / `--port`, a
+non-numeric `SMTP_PORT`, `SMTP_SECURE` other than `true`/`false`, a bad
+`SCHEDULE_GRACE_MS`, `SCHEDULER_INTERVAL_MS`, `SEND_LOG_MAX_BYTES` or
+`SEND_LOG_KEEP`, a missing or unreadable `templates/` folder, or a `logs/`
+folder that cannot be written all stop the process with one message listing
+every problem. A missing SMTP user or password is not fatal for the browser
+(you set it up there) and is shown in the startup banner; the CLI names the
+missing variables and exits 1 for `--test` and `--send`.
 
 Set both TLS variables together; Mailroom refuses to start if only one is
 present or if either file cannot be read. When TLS is active the session cookie
@@ -196,10 +207,10 @@ driven from the browser, where the queue and its history can be seen.
   logged as sent for `campaign-x`, so use a new campaign name for a new
   newsletter. The default name is the current month, which is right for a
   monthly send and wrong for two different mails in the same month.
-- **Disk and memory**: the send log grows by ~100 bytes per recipient, and a
-  long-lived process settles at roughly 170 MB RSS after a few thousand large
-  messages (it does not keep growing). Reloading the log at start is linear in
-  its size, so a multi-hundred-thousand-line log adds a moment to startup.
+- **Disk and memory**: the send log grows by ~100 bytes per recipient and is
+  rotated by size (see below), so `logs/` stays bounded. A long-lived process
+  settles at roughly 170 MB RSS after a few thousand large messages (it does
+  not keep growing). Reloading the log at start is linear in its size.
 
 ## How it behaves
 
@@ -208,8 +219,29 @@ driven from the browser, where the queue and its history can be seen.
   pooled SMTP connection, retries with backoff on transient errors.
 - Quota, `5.4.5` and authentication errors stop the run so the mailbox is not
   locked, and 10 connection failures in a row stop it too.
-- `Ctrl+C` finishes and logs the message in flight, then exits.
+- `Ctrl+C` (SIGINT) or SIGTERM during a campaign, in the CLI and in the
+  browser server alike, finishes and logs the message in flight, starts no
+  more, prints how many recipients were not attempted and how to resume, and
+  exits non-zero (130 for SIGINT, 143 for SIGTERM). An idle server exits 0. A
+  second signal exits immediately; the message in flight may then be
+  unrecorded, so check the log before re-running. The server waits up to 8 s
+  for the message in flight, so keep your supervisor's stop timeout above that
+  (Docker's default 10 s is enough).
+- A scheduled send interrupted by a shutdown goes back to `pending` and
+  resumes on the next start, skipping whoever was already mailed, as long as it
+  is inside the grace window (otherwise it is parked as `missed` and **Run
+  now** resumes it). An entry left `sending` by a crash gets the same
+  treatment at startup. Pressing Stop on a running scheduled send marks it
+  `cancelled`.
 - Every outcome is appended to `logs/sent.jsonl`; that log is the resume state.
+  If it cannot be written the run stops rather than mail people it cannot record.
+- **Log rotation**: when `sent.jsonl` reaches `SEND_LOG_MAX_BYTES` it is renamed
+  to `sent.jsonl.1` (older archives shift to `.2`, `.3`, ...) and the oldest
+  beyond `SEND_LOG_KEEP` is deleted. Resume and the campaign list read the live
+  file and every archive, so nothing is lost until an archive is deleted; a send
+  older than the kept history is no longer skipped on a re-run, so raise
+  `SEND_LOG_KEEP` if you resume very old campaigns. `schedule.json` is bounded
+  separately (finished entries are dropped after 60 days).
 - A subject line is not HTML: `&` and apostrophes reach the recipient as typed,
   while the body is escaped so a name cannot break the markup.
 
@@ -217,6 +249,7 @@ driven from the browser, where the queue and its history can be seen.
 
 ```
 bin/mailroom.mjs        launcher (port, host, browser)
+scripts/                dev tooling (check-syntax.mjs, used by npm run check)
 src/gui.mjs             HTTP/HTTPS server + JSON/SSE API
 src/send.mjs            command-line front end
 src/lib/core.mjs        CSV, render, cid: images, SMTP, send loop
@@ -258,8 +291,13 @@ Supported SMTP environment variables:
 ## Tests
 
 ```bash
-npm test     # 49 tests: parsing, rendering, resume, retries, scheduling, CLI, API, auth, TLS, guards
+npm test            # 77 tests: parsing, rendering, resume, retries, scheduling, shutdown, log rotation, config validation, CLI, API, auth, TLS, guards
+npm run check       # parse every JS file in bin/, src/ and public/ without running it
 ```
+
+GitHub Actions (`.github/workflows/tests.yml`) runs `npm ci`, `npm run check`
+and `npm test` on Node 20, 22 and 24 for every push to `main` and every pull
+request.
 
 The API tests boot the real server against an in-process SMTP sink, so no mail
 leaves the machine.

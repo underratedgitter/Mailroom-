@@ -42,12 +42,12 @@ Docker:
 ```bash
 docker build -t mailroom .
 docker run -d --name mailroom \
-  -e MAILROOM_PASSWORD='a-long-passphrase' \
+  -e MAILROOM_PASSWORD_HASH='scrypt:...' \
   -e MAILROOM_TLS_CERT=/certs/fullchain.pem \
   -e MAILROOM_TLS_KEY=/certs/privkey.pem \
   -p 4173:4173 \
   -v "$PWD/certs:/certs:ro" \
-  -v mailroom-config:/root/.mailroom \
+  -v mailroom-config:/home/node/.mailroom \
   -v "$PWD/data:/app/data" \
   -v "$PWD/templates:/app/templates" \
   -v "$PWD/logs:/app/logs" \
@@ -55,27 +55,44 @@ docker run -d --name mailroom \
 ```
 
 The container binds `0.0.0.0`, so it needs the TLS pair (or the opt-out
-described below) as well as `MAILROOM_PASSWORD`. With the command above the app
+described below) as well as a password. With the command above the app
 is at `https://localhost:4173`.
+
+The image runs as the unprivileged `node` user (uid 1000), not root. Named
+volumes just work; a bind mount (`./data`, `./logs`, ...) must be writable by
+uid 1000. Create the hash for `MAILROOM_PASSWORD_HASH` with:
+
+```bash
+docker run --rm -it mailroom node src/lib/auth.mjs
+```
+
+The container health check calls `/api/health`, which is open on purpose and
+returns only `ok` and the version.
 
 If TLS ends at a reverse proxy, keep the container on a private network and
 allow plain HTTP only for that hop:
 
 ```bash
 docker run -d --name mailroom \
-  -e MAILROOM_PASSWORD='a-long-passphrase' \
+  -e MAILROOM_PASSWORD_HASH='scrypt:...' \
   -e MAILROOM_ALLOW_INSECURE=1 \
+  -e MAILROOM_TRUST_PROXY=1 \
   -p 127.0.0.1:4173:4173 \
-  -v mailroom-config:/root/.mailroom \
+  -v mailroom-config:/home/node/.mailroom \
   -v "$PWD/data:/app/data" \
   -v "$PWD/templates:/app/templates" \
   -v "$PWD/logs:/app/logs" \
   mailroom
 ```
 
-`MAILROOM_PASSWORD` is required for any non-loopback bind, including every
-Docker setup above: Mailroom refuses to start without it, even with
-`MAILROOM_ALLOW_INSECURE=1`.
+A password (`MAILROOM_PASSWORD_HASH` or `MAILROOM_PASSWORD`) is required for any
+non-loopback bind, including every Docker setup above: Mailroom refuses to
+start without one, even with `MAILROOM_ALLOW_INSECURE=1`.
+
+**Upgrading an existing container:** the config volume moved from
+`/root/.mailroom` to `/home/node/.mailroom`. Mount the same volume at the new
+path and make it writable by uid 1000 once, e.g.
+`docker run --rm -v mailroom-config:/c alpine chown -R 1000:1000 /c`.
 
 ## HTTPS and network exposure
 
@@ -93,7 +110,10 @@ npm start
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `MAILROOM_PASSWORD` | unset | Passphrase required for non-loopback binds to gate the GUI |
+| `MAILROOM_PASSWORD_HASH` | unset | Salted scrypt hash of the GUI password (see below); preferred over `MAILROOM_PASSWORD` and wins if both are set |
+| `MAILROOM_PASSWORD` | unset | Plaintext GUI password; still supported, hashed in memory at login time |
+| `MAILROOM_SESSION_TTL_SECONDS` | `43200` (12 h) | How long a login lasts; the cookie and the server-side session both expire then |
+| `MAILROOM_TRUST_PROXY` | unset | Set to `1` behind a reverse proxy you control: honours `X-Forwarded-Proto` (Secure cookie, HSTS), `X-Forwarded-Host` and `X-Forwarded-For` (login throttling) |
 | `MAILROOM_TLS_CERT` | unset | Path to a PEM certificate (chain included if needed) |
 | `MAILROOM_TLS_KEY` | unset | Path to the matching PEM private key |
 | `MAILROOM_ALLOW_INSECURE` | unset | Set to `1` to permit a non-loopback plain-HTTP bind |
@@ -112,6 +132,25 @@ every problem. A missing SMTP user or password is not fatal for the browser
 (you set it up there) and is shown in the startup banner; the CLI names the
 missing variables and exits 1 for `--test` and `--send`.
 
+### Hashing the password
+
+A hash keeps the passphrase itself out of your config file, shell history,
+`docker inspect` and process list:
+
+```bash
+node src/lib/auth.mjs            # prompts without echo; or pipe the password on stdin
+# MAILROOM_PASSWORD_HASH=scrypt:32768:8:1:<salt>:<key>
+```
+
+Put that line in `.env` / `~/.mailroom/config.env` or pass it as an environment
+variable. The hash is salted scrypt (N=32768, r=8, p=1) and is compared in
+constant time. A malformed hash stops startup rather than leaving the app open.
+
+**Migrating an existing install:** `MAILROOM_PASSWORD` keeps working unchanged
+(Mailroom prints a reminder at startup). To switch, generate a hash for the same
+passphrase, add `MAILROOM_PASSWORD_HASH=...` and delete the `MAILROOM_PASSWORD`
+line; the passphrase people type does not change.
+
 Set both TLS variables together; Mailroom refuses to start if only one is
 present or if either file cannot be read. When TLS is active the session cookie
 is marked `Secure`, so it is never sent over a plain-HTTP connection.
@@ -119,7 +158,8 @@ is marked `Secure`, so it is never sent over a plain-HTTP connection.
 A non-loopback host over plain HTTP is refused at startup unless
 `MAILROOM_ALLOW_INSECURE=1` is set. Use that opt-out only when a trusted reverse
 proxy terminates TLS on the same private network; if you need the `Secure`
-cookie flag, let Mailroom terminate TLS itself. `--host` and `GUI_HOST` keep
+cookie flag, also set `MAILROOM_TRUST_PROXY=1` (and have the proxy send
+`X-Forwarded-Proto: https`) or let Mailroom terminate TLS itself. `--host` and `GUI_HOST` keep
 working exactly as before — they are just checked against this rule.
 
 Upgrading: an existing Docker or LAN install that ran plain HTTP on
@@ -275,12 +315,24 @@ Supported SMTP environment variables:
   `MAILROOM_PASSWORD` along with either `MAILROOM_TLS_CERT` + `MAILROOM_TLS_KEY`
   or an explicit `MAILROOM_ALLOW_INSECURE=1` for a trusted TLS proxy; otherwise
   startup is refused before the port opens.
-- With TLS active the session cookie is `HttpOnly`, `SameSite=Strict` and
-  `Secure`; on loopback HTTP it omits `Secure` so local use still works.
+- The GUI password is never compared in plaintext: it is checked as a salted
+  scrypt hash (`MAILROOM_PASSWORD_HASH`, or `MAILROOM_PASSWORD` hashed in memory)
+  with a constant-time comparison, and login attempts are throttled per client.
+- The session cookie is `HttpOnly`, `SameSite=Strict` and `Secure` whenever the
+  browser connected over HTTPS (Mailroom's own TLS, or a trusted proxy with
+  `MAILROOM_TRUST_PROXY=1`); on loopback HTTP it omits `Secure` so local use
+  still works. Sessions expire after `MAILROOM_SESSION_TTL_SECONDS`, logging out
+  destroys the session on the server, and logging in again retires the old one.
+- Every response sends a Content-Security-Policy (scripts and connections only
+  from Mailroom itself, no framing, no plugins), `X-Frame-Options`,
+  `Referrer-Policy: no-referrer`, cross-origin isolation headers and, over
+  HTTPS, HSTS. The message preview is a sandboxed frame with no script access.
 - Requests must carry a loopback `Host` header (or one configured in
   `GUI_ALLOWED_HOSTS`), which stops DNS-rebinding pages from driving the server.
-- A request carrying a foreign `Origin` is refused, so another website cannot
-  POST a send here and spend the stored SMTP credentials.
+- A request whose `Origin` is not the page's own host is refused, and so is any
+  state-changing request the browser labels `Sec-Fetch-Site: cross-site` or
+  `same-site`, so another website cannot POST a send here and spend the stored
+  SMTP credentials.
 - `data/` is ignored by git in full (except `data/recipients.example.csv`):
   pasted lists and saved CSVs are personal data and should never be committed.
 - Only files inside `data/` and `templates/` can be selected.

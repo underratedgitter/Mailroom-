@@ -5,7 +5,7 @@
  *   mailroom                  → http://127.0.0.1:4173
  *   mailroom --port 5000 --open
  *   GUI_HOST=0.0.0.0 MAILROOM_TLS_CERT=cert.pem MAILROOM_TLS_KEY=key.pem
- *   GUI_HOST=0.0.0.0 MAILROOM_ALLOW_INSECURE=1 (plain HTTP behind a TLS proxy)
+ *   GUI_HOST=0.0.0.0 MAILROOM_ALLOW_INSECURE=1 MAILROOM_TRUST_PROXY=1 (plain HTTP behind a TLS proxy)
  *
  * A single process serving one page and a small JSON API, driving the same
  * engine as the CLI (src/lib/core.mjs). SMTP details live in a config file
@@ -16,7 +16,7 @@
  *   GET  /api/state            setup status, CSV/template inventory, log summary
  *   POST /api/settings         save SMTP settings (tests first when asked)
  *   POST /api/settings/test    authenticate with unsaved settings
- *   POST /api/login|logout     password session when MAILROOM_PASSWORD is set
+ *   POST /api/login|logout     password session when MAILROOM_PASSWORD or MAILROOM_PASSWORD_HASH is set
  *   POST /api/preview          render one recipient, with images inlined
  *   POST /api/verify           SMTP connect + auth check
  *   POST /api/test             send one real message to one address
@@ -30,7 +30,8 @@
 
 import http from 'node:http';
 import https from 'node:https';
-import { randomUUID, randomBytes, timingSafeEqual } from 'node:crypto';
+import { randomUUID, randomBytes } from 'node:crypto';
+import { hashPassword, verifyPassword, parsePasswordHash } from './lib/auth.mjs';
 import { loadConfig, saveConfig, resolveConfigPath, smtpFileValues, assertConfig } from './lib/config.mjs';
 import { readFileSync, writeFileSync, renameSync, rmSync, existsSync, readdirSync, statSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import { dirname, extname, join, resolve, sep } from 'node:path';
@@ -111,6 +112,7 @@ function tlsOptions() {
 }
 
 function assertBindingIsSafe(host) {
+  if (hashError) throw hashError;
   if (isLoopbackHost(host)) return;
   if (!TLS_ON && !ALLOW_INSECURE) {
     throw new Error([
@@ -124,7 +126,7 @@ function assertBindingIsSafe(host) {
     throw new Error([
       `Refusing to serve Mailroom on ${host} without a password.`,
       'Anyone who can reach this port could send mail with your SMTP account.',
-      'Set MAILROOM_PASSWORD to a long passphrase before binding beyond loopback.',
+      'Set MAILROOM_PASSWORD_HASH (or MAILROOM_PASSWORD) to a long passphrase before binding beyond loopback.',
     ].join('\n  '));
   }
 }
@@ -148,22 +150,56 @@ const ALLOWED_HOSTS = new Set([
 const ALLOWED_ORIGINS = new Set([...ALLOWED_HOSTS].flatMap((h) => [`http://${h}`, `https://${h}`]));
 
 // ── Optional password gate ───────────────────────────────────────────
-// Loopback-only installs need none. A Docker or LAN install must set
-// MAILROOM_PASSWORD or anyone on the network can send with these credentials.
+// Loopback-only installs need none. A Docker or LAN install must set a
+// password or anyone on the network can send with these credentials.
+// MAILROOM_PASSWORD_HASH (see src/lib/auth.mjs) keeps only a salted scrypt
+// hash on disk; a plaintext MAILROOM_PASSWORD still works so existing configs
+// keep running, and is hashed in memory with a fresh salt before any comparison.
 const PASSWORD = String(process.env.MAILROOM_PASSWORD || '');
-const AUTH_ON = PASSWORD.length > 0;
+const PASSWORD_HASH = String(process.env.MAILROOM_PASSWORD_HASH || '').trim();
+const AUTH_ON = PASSWORD_HASH.length > 0 || PASSWORD.length > 0;
+const MAX_PASSWORD_LENGTH = 1024;
+
+let hashError = null;
+if (PASSWORD_HASH) {
+  try { parsePasswordHash(PASSWORD_HASH); } catch (err) { hashError = err; }
+}
+
+let memoryHash = null;
+const storedHash = () => PASSWORD_HASH || (memoryHash ??= hashPassword(PASSWORD));
+
+// Behind a reverse proxy that terminates TLS, the proxy's X-Forwarded-* headers
+// say how the browser really connected. They are honoured only when asked for:
+// otherwise any client could claim to be on HTTPS or spoof its address.
+const TRUST_PROXY = /^(1|true|yes)$/i.test(String(process.env.MAILROOM_TRUST_PROXY || '').trim());
+const lastForwarded = (req, name) => String(req.headers[name] || '').split(',').pop().trim();
+const firstForwarded = (req, name) => String(req.headers[name] || '').split(',')[0].trim();
+
+const isSecureRequest = (req) => TLS_ON || (TRUST_PROXY && firstForwarded(req, 'x-forwarded-proto').toLowerCase() === 'https');
+const clientIp = (req) => (TRUST_PROXY && lastForwarded(req, 'x-forwarded-for')) || req.socket.remoteAddress || 'local';
+
 const COOKIE = 'mr_session';
-const COOKIE_SECURE = TLS_ON ? '; Secure' : '';
-const SESSION_TTL = 7 * 24 * 60 * 60 * 1000;
+const DEFAULT_SESSION_SECONDS = 12 * 60 * 60;
+const configuredTtl = Number(process.env.MAILROOM_SESSION_TTL_SECONDS);
+const SESSION_SECONDS = Number.isFinite(configuredTtl) && configuredTtl > 0 ? Math.floor(configuredTtl) : DEFAULT_SESSION_SECONDS;
+const SESSION_TTL = SESSION_SECONDS * 1000;
+const MAX_SESSIONS = 100;
 // Sessions live in memory only: restarting the server signs everyone out.
 const sessions = new Map();
 
 function createSession() {
   const now = Date.now();
   for (const [token, expiry] of sessions) if (expiry < now) sessions.delete(token);
+  // Maps iterate in insertion order, so the oldest sessions go first.
+  while (sessions.size >= MAX_SESSIONS) sessions.delete(sessions.keys().next().value);
   const token = randomBytes(32).toString('hex');
   sessions.set(token, now + SESSION_TTL);
   return token;
+}
+
+function sessionCookie(req, token, maxAgeSeconds) {
+  const secure = isSecureRequest(req) ? '; Secure' : '';
+  return `${COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAgeSeconds}${secure}`;
 }
 
 function cookies(req) {
@@ -197,20 +233,75 @@ function isAuthed(req) {
 }
 
 const loginAttempts = new Map();
+const ATTEMPT_WINDOW = 60_000;
+const MAX_ATTEMPTS = 8;
+
+function recentAttempts(ip) {
+  const now = Date.now();
+  const recent = (loginAttempts.get(ip) || []).filter((t) => now - t < ATTEMPT_WINDOW);
+  if (recent.length) loginAttempts.set(ip, recent);
+  else loginAttempts.delete(ip);
+  return recent;
+}
 
 function tooManyAttempts(ip) {
-  const now = Date.now();
-  const recent = (loginAttempts.get(ip) || []).filter((t) => now - t < 60_000);
-  loginAttempts.set(ip, recent);
-  return recent.length >= 8;
+  return recentAttempts(ip).length >= MAX_ATTEMPTS;
 }
 
 function noteAttempt(ip, ok) {
   if (ok) return loginAttempts.delete(ip);
-  const now = Date.now();
-  const recent = (loginAttempts.get(ip) || []).filter((t) => now - t < 60_000);
-  recent.push(now);
+  const recent = recentAttempts(ip);
+  recent.push(Date.now());
   loginAttempts.set(ip, recent);
+}
+
+// Scripts and styles come from our own files only. Styles also allow inline
+// rules because the preview iframe is a srcdoc frame, which inherits this
+// policy and shows an email whose own <style> blocks and inlined images must
+// render; its sandbox attribute (no allow-scripts) is what keeps it inert.
+const CSP = [
+  "default-src 'none'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: https:",
+  "font-src 'self' data: https:",
+  "connect-src 'self'",
+  "base-uri 'none'",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+  "object-src 'none'",
+].join('; ');
+
+function setSecurityHeaders(req, res) {
+  res.setHeader('Content-Security-Policy', CSP);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()');
+  if (isSecureRequest(req)) res.setHeader('Strict-Transport-Security', 'max-age=31536000');
+}
+
+// SameSite=Strict already keeps the session cookie off cross-site requests;
+// these checks stop a forged request from reaching the handlers at all.
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+function crossSiteReason(req) {
+  const origin = String(req.headers.origin || '').toLowerCase();
+  if (origin) {
+    let originHost = null;
+    try { originHost = new URL(origin).host; } catch { /* "null" and junk are foreign */ }
+    const ownHost = String((TRUST_PROXY && firstForwarded(req, 'x-forwarded-host')) || req.headers.host || '').toLowerCase();
+    if (!ALLOWED_ORIGINS.has(origin) && !(originHost && originHost === ownHost)) return 'Cross-origin request refused';
+  }
+  // Modern browsers label every request; same-site (a sibling subdomain) is
+  // still not us.
+  const site = String(req.headers['sec-fetch-site'] || '').toLowerCase();
+  if (!SAFE_METHODS.has(req.method) && site && site !== 'same-origin' && site !== 'none') {
+    return 'Cross-site request refused';
+  }
+  return null;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -759,6 +850,8 @@ const STATIC = {
   '/styles.css': ['styles.css', 'text/css; charset=utf-8'],
   '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
   '/login.html': ['login.html', 'text/html; charset=utf-8'],
+  '/login.css': ['login.css', 'text/css; charset=utf-8'],
+  '/login.js': ['login.js', 'text/javascript; charset=utf-8'],
   '/favicon.svg': ['favicon.svg', 'image/svg+xml'],
 };
 
@@ -779,9 +872,7 @@ function serveStatic(res, pathname) {
 
 // ── Routes ───────────────────────────────────────────────────────────
 async function route(req, res) {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Referrer-Policy', 'no-referrer');
-  res.setHeader('X-Frame-Options', 'DENY');
+  setSecurityHeaders(req, res);
 
   // Reject requests that did not arrive on a loopback name. Without this a
   // public DNS entry pointing at 127.0.0.1 could drive this server from a
@@ -791,10 +882,8 @@ async function route(req, res) {
     return fail(res, 403, 'Unexpected Host header');
   }
 
-  const origin = String(req.headers.origin || '').toLowerCase();
-  if (origin && !ALLOWED_ORIGINS.has(origin)) {
-    return fail(res, 403, 'Cross-origin request refused');
-  }
+  const crossSite = crossSiteReason(req);
+  if (crossSite) return fail(res, 403, crossSite);
 
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   const pathname = url.pathname;
@@ -816,27 +905,28 @@ async function route(req, res) {
     const body = await readJson(req);
     if (!AUTH_ON) return json(res, 200, { ok: true });
 
-    const ip = req.socket.remoteAddress || 'local';
+    const ip = clientIp(req);
     if (tooManyAttempts(ip)) return fail(res, 429, 'Too many attempts — wait a minute');
 
-    const given = Buffer.from(String(body.password || ''));
-    const ok = given.length === Buffer.byteLength(PASSWORD)
-      && timingSafeEqual(given, Buffer.from(PASSWORD));
+    const given = typeof body.password === 'string' ? body.password : '';
+    const ok = given.length > 0 && given.length <= MAX_PASSWORD_LENGTH
+      && await verifyPassword(given, await storedHash());
     noteAttempt(ip, ok);
     if (!ok) return fail(res, 401, 'Wrong password');
 
-    const token = createSession();
-    res.setHeader('Set-Cookie', `${COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800${COOKIE_SECURE}`);
+    // A new login replaces the session it was made from.
+    sessions.delete(sessionOf(req));
+    res.setHeader('Set-Cookie', sessionCookie(req, createSession(), SESSION_SECONDS));
     return json(res, 200, { ok: true });
   }
 
   if (req.method === 'POST' && pathname === '/api/logout') {
     sessions.delete(sessionOf(req));
-    res.setHeader('Set-Cookie', `${COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${COOKIE_SECURE}`);
+    res.setHeader('Set-Cookie', sessionCookie(req, '', 0));
     return json(res, 200, { ok: true });
   }
 
-  const publicPath = pathname === '/login.html' || pathname === '/favicon.svg';
+  const publicPath = ['/login.html', '/login.css', '/login.js', '/favicon.svg'].includes(pathname);
   if (AUTH_ON && !publicPath && !isAuthed(req)) {
     if (pathname.startsWith('/api/')) return fail(res, 401, 'Sign in required');
     res.statusCode = 302;
@@ -1257,6 +1347,7 @@ function banner() {
   const missing = missingSmtpFields(cfg);
   console.log(`  smtp      ${cfg.host}:${cfg.port} ${cfg.configured ? '(configured)' : `(missing ${missing.join(', ')}; set it up in the browser)`}`);
   console.log(`  config    ${rel(configFile.path)}`);
+  if (PASSWORD && !PASSWORD_HASH) console.log('  password  stored in plaintext (MAILROOM_PASSWORD); switch to MAILROOM_PASSWORD_HASH: node src/lib/auth.mjs');
   console.log(`  log       ${rel(LOG_PATH)}`);
   if (!LOOPBACK) {
     if (!TLS_ON) console.log('  transport plain HTTP (MAILROOM_ALLOW_INSECURE=1)');

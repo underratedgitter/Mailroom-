@@ -1016,8 +1016,10 @@ async function route(req, res) {
     const cfg = smtpConfigFrom(body);
 
     if (!cfg.host) return fail(res, 400, 'SMTP host is required');
-    if (!cfg.user) return fail(res, 400, 'Mailbox address is required');
-    if (!cfg.pass) return fail(res, 400, 'An app password is required');
+    // A relay on this machine needs no sign-in, only a From address to send as.
+    if (!cfg.isLocal && !cfg.user) return fail(res, 400, 'Mailbox address is required');
+    if (!cfg.isLocal && !cfg.pass) return fail(res, 400, 'An app password is required');
+    if (!cfg.from) return fail(res, 400, 'A From address is required');
     if (!cfg.configured) return fail(res, 400, 'Those settings are incomplete');
     // Each value becomes one line of the config file; a line break would add keys.
     if ([cfg.host, cfg.user, cfg.from].some((value) => /[\r\n\0]/.test(value))) {

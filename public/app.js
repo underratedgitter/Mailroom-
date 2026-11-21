@@ -447,6 +447,7 @@ function applyPreview(data) {
   setText(el.proofTotal, [
     `${data.willSend} to send`,
     `${data.skipped} already sent`,
+    data.suppressed ? `${data.suppressed} suppressed` : null,
     data.truncated ? `${data.truncated} held back by limit` : null,
   ].filter(Boolean).join(' · '));
 
@@ -728,8 +729,12 @@ function openConfirm() {
   count.textContent = plural(p.willSend, 'message');
   lead.append(count, ` from ${state.smtp.from} through ${state.smtp.host}, starting with ${p.to}.`);
   const note = document.createElement('p');
-  note.textContent = p.skipped
-    ? `${p.skipped} address${p.skipped === 1 ? ' is' : 'es are'} already logged for this campaign and will be skipped.`
+  const held = [
+    p.skipped ? `${p.skipped} already logged for this campaign` : null,
+    p.suppressed ? `${p.suppressed} on the suppression list` : null,
+  ].filter(Boolean);
+  note.textContent = held.length
+    ? `${held.join(' and ')} will be skipped.`
     : 'Every recipient in this selection will receive it.';
 
   el.modalBody.append(lead, note);
@@ -809,7 +814,15 @@ function listen(jobId, attempt = 0) {
         tag: data.status,
         tagLabel: data.status === 'skip' ? 'skip' : data.status,
         addr: data.email,
-        note: data.error || '',
+        note: data.error || (data.reason === 'suppressed' ? 'suppressed' : ''),
+      });
+    } else if (data.type === 'throttle') {
+      addLine({
+        n: '—',
+        tag: 'run',
+        tagLabel: 'wait',
+        addr: data.email,
+        note: `${data.scope === 'hour' ? 'hourly send ceiling' : `${data.scope} ceiling`} reached, resuming in about ${Math.ceil(data.waitMs / 60000)} min`,
       });
     } else if (data.type === 'fatal') {
       addLine({ n: '!!', tag: 'failed', tagLabel: 'halt', addr: data.email, note: data.error });

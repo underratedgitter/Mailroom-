@@ -38,8 +38,11 @@ import {
   createMailer,
   runCampaign,
   resolveSmtpConfig,
+  SIGNAL_EXIT,
+  describeInterruption,
 } from './lib/core.mjs';
-import { loadConfig } from './lib/config.mjs';
+import { loadConfig, smtpProblems } from './lib/config.mjs';
+import { missingSmtpFields } from './lib/mailer.mjs';
 
 // Same settings the browser writes: ./.env or ~/.mailroom/config.env.
 loadConfig();
@@ -76,7 +79,14 @@ if (!values.subject) die('--subject is required');
 if (!existsSync(values.csv)) die(`CSV not found: ${values.csv}`);
 if (!existsSync(values.html)) die(`Template not found: ${values.html}`);
 
-mkdirSync(dirname(values.log), { recursive: true });
+try {
+  mkdirSync(dirname(values.log), { recursive: true });
+} catch (err) {
+  die(`Cannot create the log folder for ${values.log}: ${err.message}`);
+}
+
+const configProblems = smtpProblems();
+if (configProblems.length) die(`Invalid configuration:\n  - ${configProblems.join('\n  - ')}`);
 
 // Number('abc') is NaN, which would silently mean "no throttling" or "no limit".
 const wholeNumber = (flag, text, min, rule) => {
@@ -99,7 +109,12 @@ if (!recipients.length) die('No valid email addresses found in the CSV');
 const campaignId = String(values.campaign || '').trim();
 const alreadySent = sentAddresses(readLog(values.log), campaignId);
 
-const templateHtml = readFileSync(values.html, 'utf8');
+let templateHtml;
+try {
+  templateHtml = readFileSync(values.html, 'utf8');
+} catch (err) {
+  die(`Cannot read template ${values.html}: ${err.message}`);
+}
 const subjectTemplate = values.subject;
 const assetsDir = values['assets-dir'];
 
@@ -135,9 +150,24 @@ if (!values.send && !values.test && !values.dump) {
 }
 
 if (!cfg.configured) {
-  console.log('\n  SMTP is not configured. Set SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS/EMAIL_FROM');
-  console.log('  (or pass --env-file to a file that has them) and re-run.\n');
-  process.exit(1);
+  die(`SMTP is not configured: missing ${missingSmtpFields(cfg).join(', ')}.
+  Set them in the environment, in ./.env or ~/.mailroom/config.env, or save them in the browser (npm start), then re-run.`);
+}
+
+// A signal during a campaign finishes the message in flight, records it, and
+// stops. The run exits non-zero so a script or scheduler knows it is unfinished.
+let stopSignal = null;
+if (!values.dump && !values.test) {
+  for (const signal of Object.keys(SIGNAL_EXIT)) {
+    process.on(signal, () => {
+      if (stopSignal) {
+        console.error('\nSecond signal: exiting now. A message in flight may not have been recorded.');
+        process.exit(SIGNAL_EXIT[signal]);
+      }
+      stopSignal = signal;
+      console.error(`\n${signal} received: finishing the message in flight, then stopping (signal again to quit now).`);
+    });
+  }
 }
 
 const mailer = createMailer(cfg);
@@ -174,27 +204,34 @@ if (values.test) {
 }
 
 // ── Send ─────────────────────────────────────────────────────────────
-const summary = await runCampaign({
-  recipients,
-  templateHtml,
-  subjectTemplate,
-  assetsDir,
-  campaignId,
-  alreadySent,
-  delayMs,
-  mailer,
-  logPath: values.log,
-  onEvent: (event) => {
-    if (event.type === 'progress') {
-      const n = `[${event.index}/${event.total}]`;
-      if (event.status === 'skip') console.log(`${n} skip   ${event.email} (already sent)`);
-      else if (event.status === 'sent') console.log(`${n} sent   ${event.email}`);
-      else console.log(`${n} FAILED ${event.email} — ${event.error}`);
-    } else if (event.type === 'fatal') {
-      console.error(`\nFATAL: ${event.error}\nStopping so the mailbox is not locked.`);
-    }
-  },
-});
+let summary;
+try {
+  summary = await runCampaign({
+    recipients,
+    templateHtml,
+    subjectTemplate,
+    assetsDir,
+    campaignId,
+    alreadySent,
+    delayMs,
+    mailer,
+    logPath: values.log,
+    shouldStop: () => stopSignal !== null,
+    onEvent: (event) => {
+      if (event.type === 'progress') {
+        const n = `[${event.index}/${event.total}]`;
+        if (event.status === 'skip') console.log(`${n} skip   ${event.email} (already sent)`);
+        else if (event.status === 'sent') console.log(`${n} sent   ${event.email}`);
+        else console.log(`${n} FAILED ${event.email} — ${event.error}`);
+      } else if (event.type === 'fatal') {
+        console.error(`\nFATAL: ${event.error}\nStopping so the mailbox is not locked.`);
+      }
+    },
+  });
+} catch (err) {
+  mailer.close();
+  die(err.message);
+}
 
 mailer.close();
 
@@ -210,3 +247,10 @@ if (summary.failures.length) {
   process.exitCode = 1;
 }
 if (summary.stopped) process.exitCode = 1;
+if (stopSignal && summary.remaining > 0) {
+  console.error(`\n${describeInterruption(stopSignal, summary, {
+    campaign: campaignId,
+    resume: `Run the same command again${campaignId ? `, keeping --campaign ${campaignId},` : ' with --campaign <name>'} to resume; addresses already sent are skipped.`,
+  })}\n`);
+  process.exitCode = SIGNAL_EXIT[stopSignal];
+}

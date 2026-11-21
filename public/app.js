@@ -102,6 +102,9 @@ const state = {
   templates: [],
   mode: 'saved',
   roster: null,
+  rosterSig: null,
+  rosterMarked: -1,
+  queueSig: '',
   index: 0,
   total: 0,
   willSend: 0,
@@ -145,13 +148,24 @@ function toast(message, kind = '') {
 
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
+// Writing identical text still swaps the text node, which makes the browser
+// re-layout (and can drop a text selection), so repeated refreshes go through
+// here and touch the DOM only when the value really changed.
+function setText(node, text) {
+  if (node.textContent !== text) node.textContent = text;
+}
+
 function options(select, items, current) {
-  select.innerHTML = '';
-  for (const item of items) {
-    const option = document.createElement('option');
-    option.value = item.value;
-    option.textContent = item.label;
-    select.append(option);
+  const unchanged = select.options.length === items.length
+    && items.every((item, i) => select.options[i].value === item.value && select.options[i].textContent === item.label);
+  if (!unchanged) {
+    select.innerHTML = '';
+    for (const item of items) {
+      const option = document.createElement('option');
+      option.value = item.value;
+      option.textContent = item.label;
+      select.append(option);
+    }
   }
   if (current && items.some((i) => i.value === current)) select.value = current;
 }
@@ -225,6 +239,7 @@ async function loadRoster() {
   } catch (err) {
     el.roster.hidden = true;
     el.rosterList.innerHTML = '';
+    state.rosterSig = null;
     el.rosterCount.textContent = err.message;
   }
 }
@@ -238,7 +253,13 @@ function renderRoster(data) {
   if (data.truncated) bits.push(`${data.truncated} held by limit`);
   if (data.duplicates) bits.push(`${data.duplicates} duplicate${data.duplicates === 1 ? '' : 's'}`);
   if (data.invalid) bits.push(`${data.invalid} unusable`);
-  el.rosterCount.textContent = bits.join(' · ');
+  setText(el.rosterCount, bits.join(' · '));
+
+  // Same list as already on screen: keep the rows, the scroll offset and any
+  // hover or focus state instead of rebuilding them.
+  const sig = JSON.stringify(data);
+  if (sig === state.rosterSig) { markRosterCurrent(state.index); return; }
+  state.rosterSig = sig;
 
   const frag = document.createDocumentFragment();
   data.recipients.forEach((rec, i) => {
@@ -293,7 +314,10 @@ function markRosterCurrent(index) {
     row.classList.toggle('is-current', current);
     if (current) active = row;
   }
-  if (active) active.scrollIntoView({ block: 'nearest' });
+  // Only follow the preview when it moved; otherwise every refresh would
+  // yank a list the reader has scrolled elsewhere back to the current row.
+  if (active && state.rosterMarked !== index) active.scrollIntoView({ block: 'nearest' });
+  state.rosterMarked = index;
 }
 
 function setMode(mode, { refresh = true, focus = false } = {}) {
@@ -329,11 +353,11 @@ async function loadState() {
   state.templates = data.templates;
   state.setup = data.setup || state.setup;
 
-  el.metaFrom.textContent = data.smtp.from || '(not set)';
+  setText(el.metaFrom, data.smtp.from || '(not set)');
   const localRelay = data.smtp.host === '127.0.0.1' || data.smtp.host === 'localhost';
   const transport = data.smtp.secure ? '' : localRelay ? ' plain' : ' starttls';
-  el.metaServer.textContent = `${data.smtp.host}:${data.smtp.port}${transport}`;
-  el.metaLog.textContent = data.log.path;
+  setText(el.metaServer, `${data.smtp.host}:${data.smtp.port}${transport}`);
+  setText(el.metaLog, data.log.path);
   el.signOutBtn.hidden = !state.setup.authRequired;
 
   const templateItems = data.templates.map((t) => ({
@@ -357,16 +381,16 @@ async function loadState() {
 
 function describeTemplate() {
   const t = state.templates.find((x) => x.path === el.template.value);
-  if (!t) { el.templateHint.textContent = ''; return; }
-  el.templateHint.textContent = t.assets
+  if (!t) { setText(el.templateHint, ''); return; }
+  setText(el.templateHint, t.assets
     ? `${plural(t.assets, 'file')} in ${t.assetsDir} — attached inline via cid:`
-    : 'No asset folder beside this template; images would not be embedded.';
+    : 'No asset folder beside this template; images would not be embedded.');
 }
 
 // The roster below the picker carries the counts; this line is for errors.
 function describeCsv() {
   const c = state.csvs.find((x) => x.path === el.csv.value);
-  el.csvHint.textContent = c?.error || '';
+  setText(el.csvHint, c?.error || '');
 }
 
 // ── Preview ──────────────────────────────────────────────────────────
@@ -412,22 +436,24 @@ function applyPreview(data) {
   state.willSend = data.willSend;
   state.lastPreview = data;
 
-  el.preview.srcdoc = data.html;
+  // Assigning srcdoc reloads the frame even when the markup is identical,
+  // which flashes white and resets its scroll position.
+  if (el.preview.srcdoc !== data.html) el.preview.srcdoc = data.html;
   el.proofEmpty.hidden = true;
-  el.proofTo.textContent = data.to;
-  el.proofSubject.textContent = data.subject;
-  el.proofIndex.textContent = `${data.index + 1} / ${data.total}`;
-  el.proofImages.textContent = plural(data.inline, 'inline image');
-  el.proofTotal.textContent = [
+  setText(el.proofTo, data.to);
+  setText(el.proofSubject, data.subject);
+  setText(el.proofIndex, `${data.index + 1} / ${data.total}`);
+  setText(el.proofImages, plural(data.inline, 'inline image'));
+  setText(el.proofTotal, [
     `${data.willSend} to send`,
     `${data.skipped} already sent`,
     data.truncated ? `${data.truncated} held back by limit` : null,
-  ].filter(Boolean).join(' · ');
+  ].filter(Boolean).join(' · '));
 
   markRosterCurrent(data.index);
 
-  el.slipNo.textContent = el.campaign.value.trim() || 'no campaign';
-  el.sendBtn.textContent = data.willSend ? `Send ${plural(data.willSend, 'message')}` : 'Nothing left to send';
+  setText(el.slipNo, el.campaign.value.trim() || 'no campaign');
+  setText(el.sendBtn, data.willSend ? `Send ${plural(data.willSend, 'message')}` : 'Nothing left to send');
   el.sendBtn.disabled = state.sending || data.willSend === 0;
   el.scheduleBtn.disabled = data.willSend === 0;
 
@@ -652,31 +678,43 @@ function addLine({ n, tag, tagLabel, addr, note }) {
   extra.textContent = note || '';
 
   li.append(num, label, who, extra);
-  el.ledger.append(li);
-  el.ledger.scrollTop = el.ledger.scrollHeight;
+  appendToLedger(li);
 }
 
 function addSummary(text) {
   const li = document.createElement('li');
   li.className = 'ledger__summary';
   li.textContent = text;
-  el.ledger.append(li);
-  el.ledger.scrollTop = el.ledger.scrollHeight;
+  appendToLedger(li);
 }
 
+// Follow new lines only while the reader is at the bottom; someone scrolled
+// up to read an earlier failure must not be dragged down on every message.
+function appendToLedger(li) {
+  const list = el.ledger;
+  const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 24;
+  list.append(li);
+  if (atBottom) list.scrollTop = list.scrollHeight;
+}
+
+const COUNT_NAMES = ['sent', 'failed', 'skipped'];
+
+// The three counters are built once and updated in place, so a progress
+// event changes one number instead of replacing the whole row.
 function setCounts({ sent = 0, failed = 0, skipped = 0 }) {
-  el.runCounts.innerHTML = '';
-  const groups = [
-    ['sent', sent, false],
-    ['failed', failed, failed > 0],
-    ['skipped', skipped, false],
-  ];
-  for (const [name, value, bad] of groups) {
-    const span = document.createElement('span');
-    if (bad) span.className = 'is-bad';
-    span.innerHTML = `${name} <b>${value}</b>`;
-    el.runCounts.append(span);
+  if (el.runCounts.children.length !== COUNT_NAMES.length) {
+    el.runCounts.replaceChildren(...COUNT_NAMES.map((name) => {
+      const span = document.createElement('span');
+      span.append(`${name} `, document.createElement('b'));
+      return span;
+    }));
   }
+  const values = { sent, failed, skipped };
+  COUNT_NAMES.forEach((name, i) => {
+    const span = el.runCounts.children[i];
+    setText(span.lastChild, String(values[name]));
+    span.classList.toggle('is-bad', name === 'failed' && failed > 0);
+  });
 }
 
 // ── Send ─────────────────────────────────────────────────────────────
@@ -819,7 +857,7 @@ function unlockControls() {
   el.verifyBtn.disabled = false;
   el.cancelBtn.hidden = true;
   if (state.lastPreview) {
-    el.sendBtn.textContent = state.lastPreview.willSend ? `Send ${plural(state.lastPreview.willSend, 'message')}` : 'Nothing left to send';
+    setText(el.sendBtn, state.lastPreview.willSend ? `Send ${plural(state.lastPreview.willSend, 'message')}` : 'Nothing left to send');
     el.sendBtn.disabled = state.lastPreview.willSend === 0;
   }
 }
@@ -879,7 +917,7 @@ async function loadQueue() {
     const data = await api('/api/schedule');
     state.queue = data.entries || [];
     const active = state.queue.filter((e) => e.status === 'pending' || e.status === 'sending').length;
-    el.queueCount.textContent = String(active);
+    setText(el.queueCount, String(active));
     el.queueCount.hidden = active === 0;
     if (!el.queueModal.hidden) renderQueue();
     return data;
@@ -893,6 +931,12 @@ function queueStatusLabel(status) {
 }
 
 function renderQueue() {
+  // The poll re-renders every 15 s; rebuilding an unchanged list would drop
+  // hover and keyboard focus on its buttons each time.
+  const sig = JSON.stringify([state.queue, state.queue.map((e) => (e.status === 'pending' ? relative(e.at) : ''))]);
+  if (sig === state.queueSig) return;
+  state.queueSig = sig;
+
   el.queueList.replaceChildren();
   el.queueEmpty.hidden = state.queue.length > 0;
 
@@ -1207,4 +1251,5 @@ loadState()
     el.proofEmpty.hidden = false;
     el.proofEmpty.textContent = `Could not reach the local server: ${err.message}`;
     toast('Could not reach the local server. Is `npm run gui` still running?', 'bad');
-  });
+  })
+  .finally(() => document.body.classList.remove('is-loading'));

@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { startSmtpSink } from './helpers/smtp-sink.mjs';
 
 const SEND = resolve(dirname(fileURLToPath(import.meta.url)), '../src/send.mjs');
 
@@ -54,4 +55,109 @@ test('CLI accepts valid numeric flags, including an explicit --delay 0', () => {
   assert.equal(res.status, 0, res.stderr);
   assert.match(res.stdout, /delay\s+0ms between sends/);
   assert.match(res.stdout, /Rendered 1 recipient/);
+});
+
+// The sink lives in this process, so a CLI that talks to it must run asynchronously.
+async function runCli(args, { env = {}, files = {}, collect = [] } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'mailroom-cli-'));
+  try {
+    writeFileSync(join(dir, 'r.csv'), 'email,name\na@example.com,Ann\nb@example.com,Bob\nc@example.com,Cy\n');
+    writeFileSync(join(dir, 't.html'), '<p>Hi {{name}}</p>');
+    for (const [name, text] of Object.entries(files)) {
+      mkdirSync(dirname(join(dir, name)), { recursive: true });
+      writeFileSync(join(dir, name), text);
+    }
+    const child = spawn(process.execPath, [SEND, ...args], {
+      cwd: dir,
+      env: { PATH: process.env.PATH, HOME: dir, MAILROOM_CONFIG: join(dir, 'none.env'), ...env },
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    const status = await new Promise((done) => child.on('close', done));
+    const read = (name) => { try { return readFileSync(join(dir, name), 'utf8'); } catch { return null; } };
+    return { status, stdout, stderr, written: Object.fromEntries(collect.map((name) => [name, read(name)])) };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const SEND_ARGS = ['--csv', 'r.csv', '--html', 't.html', '--subject', 'Hi', '--delay', '0'];
+const smtpEnv = (sink) => ({ SMTP_HOST: '127.0.0.1', SMTP_PORT: String(sink.port), EMAIL_FROM: 'Desk <desk@news.example.org>' });
+
+test('--suppress adds addresses to the suppression list without needing a campaign', async () => {
+  const res = await runCli(['--suppress', 'Gone@Example.com, b@example.com'], { collect: ['data/suppressed.csv'] });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /suppressed 2 address/);
+  assert.match(res.written['data/suppressed.csv'], /^email,reason,added\ngone@example\.com,manual,.*\nb@example\.com,manual,/);
+
+  const custom = await runCli(['--suppress', 'x@example.com', '--suppression-file', 'out/list.csv'], { collect: ['out/list.csv'] });
+  assert.equal(custom.status, 0, custom.stderr);
+  assert.match(custom.written['out/list.csv'], /x@example\.com/);
+});
+
+test('--suppress without an address is an error', async () => {
+  const res = await runCli(['--suppress', '']);
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /--suppress needs at least one address/);
+});
+
+test('--suppress reports an address it cannot use and exits non-zero', async () => {
+  const res = await runCli(['--suppress', 'good@example.com,nonsense']);
+  assert.equal(res.status, 1);
+  assert.match(res.stdout, /suppressed 1 address/);
+  assert.match(res.stderr, /not an email address: nonsense/);
+});
+
+test('preview says how many recipients the suppression list will hold back', async () => {
+  const res = await runCli(SEND_ARGS, { files: { 'data/suppressed.csv': 'email,reason,added\nB@example.com,unsubscribe,2026-01-01\n' } });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /suppressed\s+1 \(will skip\)/);
+});
+
+test('--send never mails a suppressed address', async (t) => {
+  const sink = await startSmtpSink();
+  t.after(() => sink.close());
+  const res = await runCli([...SEND_ARGS, '--send'], {
+    env: smtpEnv(sink),
+    files: { 'data/suppressed.csv': 'email,reason,added\nb@example.com,unsubscribe,2026-01-01\n' },
+  });
+
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  assert.deepEqual(sink.messages.map((m) => m.to[0]), ['<a@example.com>', '<c@example.com>']);
+  assert.match(res.stdout, /skip\s+b@example\.com \(suppressed\)/);
+  assert.match(res.stdout, /sent\s+2/);
+  assert.match(res.stdout, /suppressed\s+1/);
+  assert.match(sink.messages[0].data, /List-Unsubscribe: <mailto:desk@news\.example\.org\?subject=unsubscribe>/);
+});
+
+test('--test refuses a suppressed address', async (t) => {
+  const sink = await startSmtpSink();
+  t.after(() => sink.close());
+  const res = await runCli([...SEND_ARGS, '--test', 'me@example.com'], {
+    env: smtpEnv(sink),
+    files: { 'data/suppressed.csv': 'me@example.com\n' },
+  });
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /me@example\.com is on the suppression list/);
+  assert.equal(sink.messages.length, 0);
+});
+
+test('--send stops before connecting when the compliance settings are unusable', async (t) => {
+  const sink = await startSmtpSink();
+  t.after(() => sink.close());
+
+  const rate = await runCli([...SEND_ARGS, '--send'], { env: { ...smtpEnv(sink), MAX_PER_HOUR: 'lots' } });
+  assert.equal(rate.status, 1);
+  assert.match(rate.stderr, /MAX_PER_HOUR must be a whole number/);
+
+  const url = await runCli([...SEND_ARGS, '--send'], { env: { ...smtpEnv(sink), UNSUBSCRIBE_URL: 'http://x.example/u' } });
+  assert.equal(url.status, 1);
+  assert.match(url.stderr, /UNSUBSCRIBE_URL must be an https:\/\/ URL/);
+
+  const from = await runCli([...SEND_ARGS, '--send'], { env: { ...smtpEnv(sink), EMAIL_FROM: 'desk' } });
+  assert.equal(from.status, 1);
+  assert.match(from.stderr, /EMAIL_FROM must be a full address/);
+  assert.equal(sink.messages.length, 0);
 });

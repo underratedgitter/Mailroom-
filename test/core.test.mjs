@@ -531,6 +531,7 @@ async function campaignAgainstSink({ sink: sinkOptions, addresses, run = {} }) {
       summary,
       messages: sink.messages,
       connections: sink.connectionCount(),
+      open: sink.openCount(),
       log: readLog(logPath),
       suppressed: existsSync(suppressionPath) ? readFileSync(suppressionPath, 'utf8') : '',
     };
@@ -643,4 +644,23 @@ test('the socket timeout is long enough for a slow server to answer the DATA com
   } finally {
     mailer.close();
   }
+});
+
+test('refused recipients do not abandon open connections; a dropped link is recovered with a fresh pool', async () => {
+  // Every refusal used to orphan the pool, leaving its connection open for good.
+  const refused = await campaignAgainstSink({
+    sink: { rcpt: (addr) => (addr.includes('bad') ? '550 5.1.1 no such user' : null) },
+    addresses: [...Array.from({ length: 8 }, (_, i) => `bad${i}@example.test`), 'ok@example.test'],
+  });
+  assert.equal(refused.summary.sent, 1);
+  assert.equal(refused.summary.failed, 8);
+  assert.ok(refused.open <= 3, `${refused.open} connections left open`);
+
+  let dropped = false;
+  const unavailable = await campaignAgainstSink({
+    sink: { rcpt: () => (dropped ? null : ((dropped = true), '421 4.7.0 try again later')) },
+    addresses: ['one@example.test', 'two@example.test'],
+  });
+  assert.equal(unavailable.summary.sent, 2);
+  assert.ok(unavailable.open <= 3);
 });

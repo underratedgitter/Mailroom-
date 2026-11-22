@@ -92,6 +92,7 @@ export function startSmtpSink({ mail, rcpt, stall } = {}) {
         port: server.address().port,
         messages,
         connectionCount: () => accepted,
+        openCount: () => connections.size,
         close: () => new Promise((done) => {
           for (const sock of connections) sock.destroy();
           server.close(() => done());

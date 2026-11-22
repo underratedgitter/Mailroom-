@@ -539,6 +539,8 @@ export function createRateLimiter({ perHour = 0, perDomainPerHour = 0, history =
 // message; a shorter limit abandons a message it is about to accept.
 const SOCKET_TIMEOUT_MS = 120000;
 
+const isConnectionLevel = (err) => err.responseCode === 421 || /^(ECONN\w*|ESOCKET|ETIMEDOUT|EAI_AGAIN|EPIPE)$/.test(err.code || '');
+
 export function createMailer(cfg = resolveSmtpConfig()) {
   let transport = null;
 
@@ -582,7 +584,7 @@ export function createMailer(cfg = resolveSmtpConfig()) {
       await getTransport().verify();
       return { ok: true };
     } catch (err) {
-      transport = null;
+      close();
       return { ok: false, error: err.message };
     }
   }
@@ -603,8 +605,9 @@ export function createMailer(cfg = resolveSmtpConfig()) {
       });
       return { success: true, messageId: info.messageId, inline: attachments.length };
     } catch (err) {
-      // Fresh socket on the next attempt — pooled connections can go stale.
-      transport = null;
+      // A dead link gets a fresh pool on the next attempt (the old one is closed,
+      // not leaked); a refusal of one recipient says nothing about the pool.
+      if (isConnectionLevel(err)) close();
       // Without a reply after the body went out (timeout, dropped link) the
       // server may well have accepted the message: the outcome is unknown.
       const uncertain = dataStarted && !Number.isInteger(err.responseCode);

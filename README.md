@@ -169,13 +169,18 @@ rather than silently serving credentials in the clear or an open relay.
 
 ## What it does
 
+The browser app has a page for each step, in the sidebar: **Overview** (mailbox
+status, counts, recent campaigns), **Compose**, **Recipients**, **Send**,
+**Schedule**, **Suppression** and **Settings**. It follows your light or dark
+system theme and works on a phone-sized screen.
+
 **Compose** — every `templates/*.html` file is offered as a template. A folder
 next to it named `<template>-assets/` (for example, `bcci-connect-v2-assets/`) is
 picked up automatically and its images attached inline with `cid:` (Gmail blocks
 `data:` URIs). Bundled templates include `bcci-connect-v2.html`,
 `bcci-connect.html`, and `bcci-membership.html`.
 
-**Recipients** — either a saved `data/*.csv`, or paste addresses straight in:
+**Recipients** — a saved `data/*.csv`, a CSV you upload, or addresses pasted straight in:
 
 ```
 priya@example.com, Priya Shah, Sunrise Chemicals
@@ -183,8 +188,11 @@ Raj Patel <raj@patel.in>
 ops@example.com	Ops Desk	Example Co
 ```
 
-Invalid and duplicate lines are dropped as you type, and **Save as CSV** writes
-the list into `data/` for next time.
+Invalid and duplicate lines are dropped as you type, and **Save as list** writes
+the list into `data/` for next time. **Upload** checks a CSV before saving it and
+shows how each column is used: the email column, `name` and `company` (with their
+common aliases), and every other column as a `{{merge field}}` for the subject and
+template. The Compose page flags any `{{field}}` the list cannot fill.
 
 **Preview** — the actual rendered HTML for the selected recipient, images
 included, with arrows to page through the list.
@@ -193,10 +201,10 @@ included, with arrows to page through the list.
 Re-running a campaign skips everyone it already mailed. Close the tab and the
 send continues; reopen it and the page re-attaches.
 
-**Schedule** — **Schedule…** queues the same campaign for a later date and time
-(in your machine's time zone). The queue lives in `logs/schedule.json`, so it
-survives restarts; **Scheduled** in the header shows what is waiting, with
-*Send now* and *Cancel* on each entry. The recipient list is snapshotted at the
+**Schedule** — the **Schedule** page queues the same campaign for a later date
+and time (in your machine's time zone). The queue lives in `logs/schedule.json`,
+so it survives restarts; the page lists what is waiting, with *Send now* and
+*Cancel* on each entry. The recipient list is snapshotted at the
 moment you schedule it. Mailroom must be running when the time arrives — if it
 was down, anything more than 30 minutes late is parked as **missed** in the
 queue rather than going out stale, and you decide what to do with it. If the
@@ -418,7 +426,7 @@ Supported SMTP environment variables:
 ## Tests
 
 ```bash
-npm test            # 130 tests: parsing, rendering, resume, retries, scheduling, shutdown, log rotation, config validation, suppression, headers, rate ceiling, CLI, API, auth, TLS, guards
+npm test            # 142 tests: parsing, rendering, resume, retries, scheduling, shutdown, log rotation, config validation, suppression, headers, rate ceiling, CLI, API, auth, TLS, guards
 npm run check       # parse every JS file in bin/, src/ and public/ without running it
 ```
 

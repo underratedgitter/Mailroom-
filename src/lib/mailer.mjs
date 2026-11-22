@@ -79,6 +79,21 @@ export function configIssue(cfg) {
   return unsubscribeUrlIssue(cfg.unsubscribeUrl);
 }
 
+/** `mailto:` link to the unsubscribe mailbox (UNSUBSCRIBE_MAILTO, else Reply-To, else From), or ''. */
+function unsubscribeMailtoLink(cfg) {
+  const mailbox = bareAddress(cfg.unsubscribeMailto || cfg.replyTo || cfg.from);
+  if (!mailbox) return '';
+  const at = mailbox.lastIndexOf('@');
+  return `mailto:${encodeURIComponent(mailbox.slice(0, at))}${mailbox.slice(at)}?subject=unsubscribe`;
+}
+
+const unsubscribeUrlFor = (cfg, to) => cfg.unsubscribeUrl.replaceAll('{email}', encodeURIComponent(to));
+
+/** What `{{unsubscribe_url}}` stands for: the hosted URL for this recipient, else the mailto link; '' when neither exists. */
+export function unsubscribeLink(cfg, to) {
+  return cfg.unsubscribeUrl ? unsubscribeUrlFor(cfg, to) : unsubscribeMailtoLink(cfg);
+}
+
 /**
  * Message-ID, Date, Reply-To and List-Unsubscribe fields for one recipient.
  * The Message-ID is unique per message and on the sender's own domain.
@@ -87,14 +102,11 @@ export function bulkFields(cfg, to) {
   const targets = [];
   const headers = {};
   if (cfg.unsubscribeUrl) {
-    targets.push(`<${cfg.unsubscribeUrl.replaceAll('{email}', encodeURIComponent(to))}>`);
+    targets.push(`<${unsubscribeUrlFor(cfg, to)}>`);
     headers['List-Unsubscribe-Post'] = 'List-Unsubscribe=One-Click';
   }
-  const mailbox = bareAddress(cfg.unsubscribeMailto || cfg.replyTo || cfg.from);
-  if (mailbox) {
-    const at = mailbox.lastIndexOf('@');
-    targets.push(`<mailto:${encodeURIComponent(mailbox.slice(0, at))}${mailbox.slice(at)}?subject=unsubscribe>`);
-  }
+  const mailto = unsubscribeMailtoLink(cfg);
+  if (mailto) targets.push(`<${mailto}>`);
   if (targets.length) headers['List-Unsubscribe'] = targets.join(', ');
 
   return {

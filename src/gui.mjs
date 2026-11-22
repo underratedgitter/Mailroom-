@@ -37,7 +37,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { randomUUID, randomBytes } from 'node:crypto';
 import { hashPassword, verifyPassword, parsePasswordHash } from './lib/auth.mjs';
-import { configIssue, unsubscribeUrlIssue, bareAddress } from './lib/mailer.mjs';
+import { configIssue, unsubscribeUrlIssue, bareAddress, unsubscribeLink } from './lib/mailer.mjs';
 import { loadConfig, saveConfig, resolveConfigPath, smtpFileValues, assertConfig } from './lib/config.mjs';
 import { readFileSync, writeFileSync, renameSync, rmSync, existsSync, readdirSync, statSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import { dirname, extname, join, resolve, sep } from 'node:path';
@@ -49,6 +49,7 @@ import {
   recipientsToCsv,
   columnRoles,
   templateVariables,
+  linkWarnings,
   render,
   renderSubject,
   inlineForPreview,
@@ -593,7 +594,8 @@ function previewFor(input, index = 0) {
   const held = (r) => !input.alreadySent.has(r._email.toLowerCase()) && isSuppressed(SUPPRESSION_PATH, r._email);
   const suppressed = input.parsed.recipients.filter(held).length;
   const skipped = input.parsed.recipients.filter((r) => input.alreadySent.has(r._email.toLowerCase())).length;
-  const raw = render(input.templateHtml, rec);
+  const cfg = resolveSmtpConfig();
+  const raw = render(input.templateHtml, rec, cfg);
   const columns = columnRoles(input.parsed.columns || []);
   return {
     index: i,
@@ -614,6 +616,7 @@ function previewFor(input, index = 0) {
     truncated: input.parsed.truncated,
     columns,
     placeholders: placeholdersFor(`${input.templateHtml} ${input.subject}`, columns),
+    warnings: linkWarnings(raw, { unsubscribe: unsubscribeLink(cfg, rec._email) }),
   };
 }
 
@@ -626,7 +629,7 @@ function placeholdersFor(text, columns) {
     const key = name.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
-    const status = ['name', 'company', 'email'].includes(key) ? 'builtin' : known.has(key) ? 'column' : 'missing';
+    const status = ['name', 'company', 'email', 'unsubscribe_url'].includes(key) ? 'builtin' : known.has(key) ? 'column' : 'missing';
     found.push({ name: key, status });
   }
   return found;
@@ -1229,7 +1232,7 @@ async function route(req, res) {
     const result = await mailer.send({
       to,
       subject: renderSubject(input.subject, rec),
-      html: render(input.templateHtml, rec),
+      html: render(input.templateHtml, rec, cfg),
       assetsDir: input.assetsDir,
     });
     mailer.close();

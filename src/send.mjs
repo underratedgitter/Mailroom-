@@ -178,7 +178,7 @@ if (!values.send && !values.test && !values.dump) {
     console.log(`  subject: ${renderSubject(subjectTemplate, rec)}`);
     console.log(`  name:    ${rec._name || '(blank)'}`);
     console.log(`  company: ${rec._company || '(blank)'}`);
-    console.log(`  inline:  ${attachmentsFor(render(templateHtml, rec), assetsDir).length} image(s)`);
+    console.log(`  inline:  ${attachmentsFor(render(templateHtml, rec, cfg), assetsDir).length} image(s)`);
   }
   console.log(`\nRendered ${recipients.length} recipient(s).`);
   if (!cfg.configured) {
@@ -225,7 +225,7 @@ console.log('  connection ok\n');
 // ── Dump: render the first recipient to a file, send nothing ─────────
 if (values.dump) {
   const rec = recipients[0];
-  const html = render(templateHtml, rec);
+  const html = render(templateHtml, rec, cfg);
   writeFileSync(values.dump, html);
   console.log(`Wrote ${values.dump} (${html.length} bytes)`);
   console.log(`  recipient: ${rec._email}\n`);
@@ -241,7 +241,7 @@ if (values.test) {
   }
   const rec = { ...recipients[0], _email: values.test };
   const subject = renderSubject(subjectTemplate, rec);
-  const html = render(templateHtml, rec);
+  const html = render(templateHtml, rec, cfg);
   console.log(`Test send to ${values.test}`);
   console.log(`  subject: ${subject}`);
   const result = await mailer.send({ to: values.test, subject, html, assetsDir });

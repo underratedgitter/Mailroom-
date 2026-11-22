@@ -497,6 +497,13 @@ function draftChecks() {
           : 'Nothing left to send' + (held.length ? ': ' + held.join(', ') : '') + '.')
         : state.previewError || unpreviewedRecipients(),
     },
+    // A warning, not a blocker: the message can still be sent.
+    links: {
+      ok: Boolean(p && !p.warnings?.length),
+      text: !p ? 'Checked once there is a preview.'
+        : p.warnings?.length ? p.warnings.map((w) => w.message).join(' ')
+          : 'Every link works and there is an unsubscribe link.',
+    },
   };
 }
 
@@ -508,7 +515,7 @@ function renderDraft() {
   for (const [name, check] of Object.entries(checks)) {
     const li = ui.sendChecks.querySelector('[data-check="' + (name === 'compose' ? 'template' : name) + '"]');
     setAttr(li, 'data-state', check.ok ? 'ok' : 'bad');
-    const sub = ui[{ mailbox: 'chkMailbox', compose: 'chkCompose', recipients: 'chkRecipients' }[name]];
+    const sub = ui[{ mailbox: 'chkMailbox', compose: 'chkCompose', recipients: 'chkRecipients', links: 'chkLinks' }[name]];
     setText(sub, check.text);
     setAttr(sub, 'title', check.text);
   }
@@ -1472,7 +1479,7 @@ function renderSuppression() {
   reconcile(ui.suppressList, shown, (email) => email, (email) => h('li'), (li, email) => setText(li, email));
   setHidden(ui.suppressEmpty, shown.length > 0);
   setText(ui.suppressEmptyTitle, data.count ? 'No matches' : 'No suppressed addresses');
-  setText(ui.suppressEmptyText, data.count ? 'Nothing on the list matches “' + ui.suppressSearch.value.trim() + '”.' : 'Addresses you add, or that unsubscribe, appear here.');
+  setText(ui.suppressEmptyText, data.count ? 'Nothing on the list matches “' + ui.suppressSearch.value.trim() + '”.' : 'Addresses you add, and hard bounces found while sending, appear here. Unsubscribe requests are not added automatically: add them here when they arrive.');
   setText(ui.suppressNote, (matches.length > shown.length ? 'Showing the first ' + shown.length + ' of ' + matches.length + '. Filter to narrow it down. ' : '')
     + 'To remove an address, edit ' + data.path + '.');
 }

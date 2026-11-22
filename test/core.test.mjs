@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, symlinkSync, readdirSync, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import {
   parseCsv,
@@ -23,6 +24,7 @@ import {
   emailRe,
   createMailer,
   defaultLogPath,
+  linkWarnings,
   defaultSuppressionPath,
 } from '../src/lib/core.mjs';
 import { startSmtpSink } from './helpers/smtp-sink.mjs';
@@ -799,4 +801,59 @@ test('a recipient the server says does not exist is suppressed as a hard bounce;
     'policy@example.test': 550,
     'busy@example.test': 450,
   });
+});
+
+const unsubscribeConfig = { from: 'Desk <desk@news.example.org>' };
+
+test('{{unsubscribe_url}} is the recipient-specific link the unsubscribe header uses', () => {
+  const tpl = '<a href="{{unsubscribe_url}}">Unsubscribe</a>';
+  const rec = { _email: 'a+b@example.test', _name: '', _company: '' };
+
+  assert.equal(render(tpl, rec, unsubscribeConfig), '<a href="mailto:desk@news.example.org?subject=unsubscribe">Unsubscribe</a>');
+  assert.match(render(tpl, rec, { ...unsubscribeConfig, replyTo: 'Help <help@news.example.org>' }), /href="mailto:help@news\.example\.org\?subject=unsubscribe"/);
+  assert.match(render(tpl, rec, { ...unsubscribeConfig, replyTo: 'help@news.example.org', unsubscribeMailto: 'stop@news.example.org' }), /href="mailto:stop@news\.example\.org\?/);
+  assert.match(render(tpl, rec, { ...unsubscribeConfig, unsubscribeUrl: 'https://news.example.org/u?e={email}' }), /href="https:\/\/news\.example\.org\/u\?e=a%2Bb%40example\.test"/);
+  // With no configuration the link is empty rather than invented.
+  assert.equal(render(tpl, rec), '<a href="">Unsubscribe</a>');
+  // A column of the same name cannot override it.
+  assert.match(render(tpl, { ...rec, unsubscribe_url: 'https://evil.example' }, unsubscribeConfig), /mailto:desk@/);
+});
+
+test('linkWarnings flags dead links and a missing unsubscribe link', () => {
+  const codes = (html, options) => linkWarnings(html, options).map((w) => w.code).sort();
+  assert.deepEqual(codes('<a href="https://x.example/">x</a> <a href="mailto:a@x.example?subject=Unsubscribe">u</a>'), []);
+  assert.deepEqual(codes('<a href="#preview-only-unsubscribe">u</a>'), ['placeholder-link']);
+  assert.deepEqual(codes('<a href="#top">x</a> <a href="mailto:a@x.example?subject=unsubscribe">u</a>'), ['placeholder-link']);
+  assert.deepEqual(codes('<a href="">x</a> <a href="https://x.example/unsubscribe">u</a>'), ['placeholder-link']);
+  assert.deepEqual(codes('<a href="/unsubscribe_from_list">u</a> <a href="//x.example/y">y</a>'), ['relative-link']);
+  assert.deepEqual(codes('<a href="https://x.example/">x</a>'), ['no-unsubscribe']);
+  assert.deepEqual(codes('<p>no links at all</p>'), ['no-unsubscribe']);
+  // A hosted one-click URL need not say "unsubscribe" in it.
+  assert.deepEqual(codes('<a href="https://x.example/u/7">u</a>', { unsubscribe: 'https://x.example/u/7' }), []);
+  assert.match(linkWarnings('<a href="#x">u</a>')[0].message, /#x/);
+});
+
+test('every bundled template ships a working unsubscribe link and no dead links', () => {
+  const rec = { _email: 'a@example.test', _name: 'A', _company: 'Co' };
+  const dir = fileURLToPath(new URL('../templates', import.meta.url));
+  const names = readdirSync(dir).filter((name) => name.endsWith('.html'));
+  assert.ok(names.length >= 3);
+  for (const name of names) {
+    const html = render(readFileSync(join(dir, name), 'utf8'), rec, unsubscribeConfig);
+    assert.deepEqual(linkWarnings(html), [], name);
+  }
+});
+
+test('runCampaign gives each recipient their own unsubscribe link', async () => {
+  const bodies = [];
+  await runCampaign({
+    recipients: [recipient('a@b.co'), recipient('c@d.co')],
+    templateHtml: '<a href="{{unsubscribe_url}}">u</a>',
+    subjectTemplate: 'x',
+    delayMs: 0,
+    limits: { perHour: 0, perDomainPerHour: 0 },
+    mailer: { cfg: { from: 'me@x.co', unsubscribeUrl: 'https://x.co/u?e={email}' }, send: async ({ html }) => { bodies.push(html); return { success: true }; } },
+    onEvent: () => {},
+  });
+  assert.deepEqual(bodies, ['<a href="https://x.co/u?e=a%40b.co">u</a>', '<a href="https://x.co/u?e=c%40d.co">u</a>']);
 });

@@ -10,7 +10,7 @@ import { randomUUID } from 'node:crypto';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import nodemailer from 'nodemailer';
-import { resolveSmtpConfig, bulkFields, addressDomain } from './mailer.mjs';
+import { resolveSmtpConfig, bulkFields, addressDomain, unsubscribeLink } from './mailer.mjs';
 
 // ── CSV ──────────────────────────────────────────────────────────────
 /** Minimal CSV parser: quoted fields, embedded commas, CRLF, BOM. */
@@ -194,12 +194,17 @@ export const escapeHtml = (s) => String(s)
 /** A recipient's own column; `{{constructor}}` must not reach Object.prototype. */
 const field = (rec, key) => (Object.hasOwn(rec, key) ? String(rec[key] ?? '') : '');
 
-/** `{{column}}` substitution for HTML bodies, escaped so a name cannot inject markup. */
-export const render = (tpl, rec) => String(tpl).replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (_, key) => {
+/**
+ * `{{column}}` substitution for HTML bodies, escaped so a name cannot inject
+ * markup. `{{unsubscribe_url}}` is built from the SMTP settings `cfg` (the
+ * same link the List-Unsubscribe header carries) and is empty without them.
+ */
+export const render = (tpl, rec, cfg = null) => String(tpl).replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (_, key) => {
   const k = key.toLowerCase();
   if (k === 'name') return escapeHtml(rec._name);
   if (k === 'company') return escapeHtml(rec._company);
   if (k === 'email') return escapeHtml(rec._email);
+  if (k === 'unsubscribe_url') return escapeHtml(cfg ? unsubscribeLink(cfg, rec._email) : '');
   return escapeHtml(field(rec, k));
 });
 
@@ -236,6 +241,33 @@ function decodeEntities(text) {
     if (code === null) return NAMED_ENTITIES[name.toLowerCase()] ?? match;
     return code > 0 && code <= 0x10FFFF && !(code >= 0xD800 && code <= 0xDFFF) ? String.fromCodePoint(code) : match;
   });
+}
+
+/**
+ * Problems a recipient would meet in a rendered message's links: anchors that
+ * go nowhere (`href="#…"`, empty), relative links that only make sense on a
+ * website, and no unsubscribe link at all. `unsubscribe` is this message's own
+ * unsubscribe link, for a hosted URL that does not say "unsubscribe".
+ */
+export function linkWarnings(html, { unsubscribe = '' } = {}) {
+  const hrefs = [...String(html).matchAll(/<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')/gi)]
+    .map((m) => decodeEntities((m[1] ?? m[2]).trim()));
+  const placeholders = hrefs.filter((href) => href === '' || href.startsWith('#'));
+  const relative = hrefs.filter((href) => href !== '' && !href.startsWith('#') && !/^[a-z][a-z0-9+.-]*:/i.test(href));
+  const hasUnsubscribe = hrefs.some((href) => (unsubscribe && href === unsubscribe) || /unsubscri|opt[-_ ]?out/i.test(href));
+
+  const shown = (list) => list.slice(0, 2).map((href) => `“${href || '(empty)'}”`).join(', ');
+  const warnings = [];
+  if (placeholders.length) {
+    warnings.push({ code: 'placeholder-link', message: `${placeholders.length} link(s) go nowhere in an inbox (${shown(placeholders)}).` });
+  }
+  if (relative.length) {
+    warnings.push({ code: 'relative-link', message: `${relative.length} relative link(s) (${shown(relative)}) will not work in an email; use full https:// addresses.` });
+  }
+  if (!hasUnsubscribe) {
+    warnings.push({ code: 'no-unsubscribe', message: 'No unsubscribe link: add {{unsubscribe_url}} to the footer.' });
+  }
+  return warnings;
 }
 
 /**
@@ -844,7 +876,7 @@ async function sendCampaign({
     }
 
     const subject = renderSubject(subjectTemplate, rec);
-    const html = render(templateHtml, rec);
+    const html = render(templateHtml, rec, mailer.cfg);
 
     let result;
     for (let attempt = 1; attempt <= 3; attempt++) {

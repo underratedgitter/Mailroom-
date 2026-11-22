@@ -206,7 +206,18 @@ common aliases), and every other column as a `{{merge field}}` for the subject a
 template. The Compose page flags any `{{field}}` the list cannot fill.
 
 **Preview** — the actual rendered HTML for the selected recipient, images
-included, with arrows to page through the list.
+included, with arrows to page through the list. The **Links and unsubscribe**
+check on the Send page warns (without blocking) about links that go nowhere
+(`href="#…"` or empty), relative links such as `/unsubscribe`, and a message
+with no unsubscribe link.
+
+**Unsubscribe link** — put `{{unsubscribe_url}}` in a template's footer
+(`href="{{unsubscribe_url}}"`). It is the same target as the List-Unsubscribe
+header: `UNSUBSCRIBE_URL` with `{email}` replaced by the URL-encoded recipient
+when that is set, otherwise `mailto:` the unsubscribe mailbox
+(`UNSUBSCRIBE_MAILTO`, else Reply-To, else From) with the subject `unsubscribe`.
+All bundled templates use it. Mailroom does not receive unsubscribes: add the
+people who write back to the suppression list.
 
 **Send** — a confirmation gate, then per-recipient progress over a live stream.
 Re-running a campaign skips everyone it already mailed. Close the tab and the

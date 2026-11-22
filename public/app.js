@@ -1,771 +1,1148 @@
 // Mailroom — browser front end.
 // Talks only to the loopback server in src/gui.mjs, which owns all the real
 // work. Nothing here holds credentials or sends mail by itself.
+//
+// Layout stability: the page is polled in the background, so every render
+// path patches the DOM in place (setText, reconcile) and touches a node only
+// when its value really changed. Nothing rebuilds a list that is unchanged.
+'use strict';
 
-const $ = (id) => document.getElementById(id);
+// ── DOM helpers ──────────────────────────────────────────────────────
+// Reading a property of ui is a getElementById lookup, cached. A missing id
+// throws at first use rather than failing silently.
+const ui = new Proxy({}, {
+  get(cache, id) {
+    if (typeof id !== 'string') return undefined;
+    if (!(id in cache)) {
+      const node = document.getElementById(id);
+      if (!node) throw new Error('Missing element #' + id);
+      cache[id] = node;
+    }
+    return cache[id];
+  },
+});
 
-const el = {
-  metaFrom: $('metaFrom'),
-  metaServer: $('metaServer'),
-  metaLog: $('metaLog'),
-  verifyBtn: $('verifyBtn'),
-  stamp: $('stampResult'),
-  settingsBtn: $('settingsBtn'),
-  signOutBtn: $('signOutBtn'),
+const SVG_NS = 'http://www.w3.org/2000/svg';
 
-  queueBtn: $('queueBtn'),
-  queueCount: $('queueCount'),
-  scheduleBtn: $('scheduleBtn'),
-  scheduleModal: $('scheduleModal'),
-  scheduleSummary: $('scheduleSummary'),
-  scheduleAt: $('scheduleAt'),
-  scheduleZone: $('scheduleZone'),
-  scheduleStatus: $('scheduleStatus'),
-  scheduleCancel: $('scheduleCancel'),
-  scheduleConfirm: $('scheduleConfirm'),
-  queueModal: $('queueModal'),
-  queueList: $('queueList'),
-  queueEmpty: $('queueEmpty'),
-  queueClose: $('queueClose'),
+function h(tag, props = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(props)) {
+    if (value === undefined || value === null || value === false) continue;
+    if (key === 'class') node.className = value;
+    else if (key === 'dataset') Object.assign(node.dataset, value);
+    else if (key in node) node[key] = value;
+    else node.setAttribute(key, value === true ? '' : value);
+  }
+  node.append(...children.flat().filter((child) => child !== null && child !== undefined && child !== false));
+  return node;
+}
 
-  settingsModal: $('settingsModal'),
-  settingsTitle: $('settingsTitle'),
-  settingsLead: $('settingsLead'),
-  setHost: $('setHost'),
-  setPort: $('setPort'),
-  setUser: $('setUser'),
-  setPass: $('setPass'),
-  setFrom: $('setFrom'),
-  setUserHint: $('setUserHint'),
-  setPassHint: $('setPassHint'),
-  settingsStatus: $('settingsStatus'),
-  settingsPath: $('settingsPath'),
-  settingsTestBtn: $('settingsTestBtn'),
-  settingsSaveBtn: $('settingsSaveBtn'),
-  settingsCancel: $('settingsCancel'),
+function icon(name, className = 'icon') {
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('class', className);
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('focusable', 'false');
+  const use = document.createElementNS(SVG_NS, 'use');
+  use.setAttribute('href', '#i-' + name);
+  svg.append(use);
+  return svg;
+}
 
-  form: $('compose'),
-  template: $('template'),
-  templateHint: $('templateHint'),
-  csv: $('csv'),
-  csvHint: $('csvHint'),
-  modeSaved: $('modeSaved'),
-  modePaste: $('modePaste'),
-  roster: $('roster'),
-  rosterCount: $('rosterCount'),
-  rosterList: $('rosterList'),
-  pastePanel: $('pastePanel'),
-  pasteBox: $('pasteBox'),
-  pasteCount: $('pasteCount'),
-  saveCsvBtn: $('saveCsvBtn'),
-  subject: $('subject'),
-  tokens: $('tokens'),
-  campaign: $('campaign'),
-  limit: $('limit'),
-  delay: $('delay'),
-  testTo: $('testTo'),
-  slipNo: $('slipNo'),
+// Writing identical text still swaps the text node, which makes the browser
+// re-layout (and can drop a text selection), so repeated refreshes go through
+// these and touch the DOM only when the value really changed.
+function setText(node, text) {
+  const value = String(text);
+  if (node.textContent !== value) node.textContent = value;
+}
 
-  sendBtn: $('sendBtn'),
-  testBtn: $('testBtn'),
-  previewBtn: $('previewBtn'),
+function setHidden(node, hidden) {
+  if (node.hidden !== hidden) node.hidden = hidden;
+}
 
-  proofTo: $('proofTo'),
-  proofSubject: $('proofSubject'),
-  proofIndex: $('proofIndex'),
-  proofImages: $('proofImages'),
-  proofTotal: $('proofTotal'),
-  proofEmpty: $('proofEmpty'),
-  preview: $('preview'),
-  prevBtn: $('prevBtn'),
-  nextBtn: $('nextBtn'),
+function setAttr(node, name, value) {
+  if (node.getAttribute(name) !== value) node.setAttribute(name, value);
+}
 
-  runCounts: $('runCounts'),
-  ledger: $('ledger'),
-  cancelBtn: $('cancelBtn'),
+function setClass(node, name, on) {
+  if (node.classList.contains(name) !== on) node.classList.toggle(name, on);
+}
 
-  modal: $('modal'),
-  modalBody: $('modalBody'),
-  modalCheck: $('modalCheck'),
-  modalCancel: $('modalCancel'),
-  modalConfirm: $('modalConfirm'),
+/**
+ * Brings the keyed children of parent in line with items: creates the new,
+ * updates the kept, removes the gone and reorders only what moved. A list that
+ * did not change is left alone, so hover, focus and scroll state survive.
+ */
+function reconcile(parent, items, keyOf, create, update) {
+  const old = new Map();
+  for (const child of parent.children) old.set(child.dataset.key, child);
 
-  notice: $('notice'),
-};
+  const seen = new Set();
+  let cursor = parent.firstElementChild;
+  for (const item of items) {
+    const key = String(keyOf(item));
+    seen.add(key);
+    let node = old.get(key);
+    if (!node) {
+      node = create(item);
+      node.dataset.key = key;
+    }
+    update(node, item);
+    if (node === cursor) cursor = cursor.nextElementSibling;
+    else parent.insertBefore(node, cursor);
+  }
+  for (const [key, node] of old) if (!seen.has(key)) node.remove();
+}
 
+const plural = (n, one, many = one + 's') => n + ' ' + (n === 1 ? one : many);
+const baseName = (path) => String(path).split('/').pop();
+const mailboxOf = (smtp) => smtp.user || (smtp.from.match(/<([^>]+)>/) || [])[1] || smtp.from || '';
+
+function debounce(fn, ms) {
+  let timer;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), ms);
+  };
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// ── State ────────────────────────────────────────────────────────────
 const state = {
+  loaded: false,
+  stateSig: '',
+  online: true,
+  version: '',
+  platform: '',
   smtp: null,
   setup: { configured: false, configPath: '', authRequired: false },
-  firstRun: false,
-  queue: [],
+  conn: 'idle', // idle | wait | ok | bad — outcome of the last connection check
   csvs: [],
   templates: [],
-  mode: 'saved',
-  roster: null,
-  rosterSig: null,
+  log: { path: '', entries: 0, campaigns: [] },
+  suppression: { path: '', count: 0 },
+  queue: null,
+  suppressed: null,
+
+  mode: 'saved', // which source the campaign really uses: saved | paste
+  tab: 'saved', // which source tab is showing: saved | paste | upload
+  rosters: { saved: null, paste: null, upload: null },
+  rosterErrors: { saved: '', paste: '', upload: '' },
+  rosterSig: '',
   rosterMarked: -1,
-  queueSig: '',
+  columns: [],
+  upload: null,
+  previewSeq: 0,
+  rosterSeq: 0,
+  pasteSeq: 0,
   index: 0,
   total: 0,
-  willSend: 0,
+  lastPreview: null,
+  previewError: '',
+
   sending: false,
   stream: null,
   jobId: null,
-  lastPreview: null,
-  toastTimer: null,
+  run: { total: 0, sent: 0, failed: 0, skipped: 0, label: '', campaign: '' },
+  tested: false,
+  settingsDirty: false,
 };
 
 const store = {
   get(key, fallback = '') {
-    try { return localStorage.getItem(`ams:${key}`) ?? fallback; } catch { return fallback; }
+    try { return localStorage.getItem('ams:' + key) ?? fallback; } catch { return fallback; }
   },
   set(key, value) {
-    try { localStorage.setItem(`ams:${key}`, value); } catch { /* private mode */ }
+    try { localStorage.setItem('ams:' + key, value); } catch { /* private mode */ }
   },
 };
 
 // ── Plumbing ─────────────────────────────────────────────────────────
 async function api(path, body) {
-  const res = await fetch(path, {
-    method: body === undefined ? 'GET' : 'POST',
-    headers: body === undefined ? undefined : { 'content-type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
+  let res;
+  try {
+    res = await fetch(path, {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: body === undefined ? undefined : { 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch {
+    throw new Error('Cannot reach the Mailroom server. Is it still running?');
+  }
+  if (res.status === 401 && path !== '/api/login') {
+    window.location.replace('/login.html');
+    throw new Error('Sign in required');
+  }
   let data = {};
   try { data = await res.json(); } catch { /* empty body */ }
-  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  if (!res.ok) throw new Error(data.error || 'Request failed (' + res.status + ')');
   return data;
 }
 
-function toast(message, kind = '') {
-  el.notice.textContent = message;
-  el.notice.className = `notice is-on${kind ? ` is-${kind}` : ''}`;
-  clearTimeout(state.toastTimer);
-  state.toastTimer = setTimeout(() => {
-    el.notice.className = 'notice';
-  }, 6000);
+function toast(message, kind = 'info') {
+  const close = h('button', { class: 'toast__close', type: 'button', 'aria-label': 'Dismiss notification' }, icon('x'));
+  const node = h('div', { class: 'toast', role: kind === 'bad' ? 'alert' : 'status', dataset: { kind } },
+    h('span', { class: 'toast__text' }, message), close);
+  const remove = () => node.remove();
+  close.addEventListener('click', remove);
+  ui.toasts.append(node);
+  while (ui.toasts.children.length > 4) ui.toasts.firstElementChild.remove();
+  setTimeout(remove, kind === 'bad' ? 9000 : 5000);
 }
 
-const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+let confirmResolve = null;
 
-// Writing identical text still swaps the text node, which makes the browser
-// re-layout (and can drop a text selection), so repeated refreshes go through
-// here and touch the DOM only when the value really changed.
-function setText(node, text) {
-  if (node.textContent !== text) node.textContent = text;
-}
+/** A modal question. Resolves true only when the person confirms. */
+function confirmDialog({ title, body, confirmLabel = 'Confirm', cancelLabel = 'Cancel', danger = false, check = '' }) {
+  ui.confirmTitle.textContent = title;
+  ui.confirmBody.replaceChildren(...[].concat(body));
+  ui.confirmOk.textContent = confirmLabel;
+  ui.confirmOk.className = 'btn ' + (danger ? 'btn--danger' : 'btn--primary');
+  ui.confirmCancel.textContent = cancelLabel;
+  ui.confirmCheckText.textContent = check;
+  ui.confirmCheck.checked = false;
+  setHidden(ui.confirmCheckRow, !check);
+  ui.confirmOk.disabled = Boolean(check);
+  ui.confirmDialog.returnValue = '';
 
-function options(select, items, current) {
-  const unchanged = select.options.length === items.length
-    && items.every((item, i) => select.options[i].value === item.value && select.options[i].textContent === item.label);
-  if (!unchanged) {
-    select.innerHTML = '';
-    for (const item of items) {
-      const option = document.createElement('option');
-      option.value = item.value;
-      option.textContent = item.label;
-      select.append(option);
-    }
-  }
-  if (current && items.some((i) => i.value === current)) select.value = current;
+  return new Promise((resolve) => {
+    confirmResolve = resolve;
+    ui.confirmDialog.showModal();
+    (check ? ui.confirmCheck : ui.confirmCancel).focus();
+  });
 }
 
 function currentLimit() {
-  const n = Number(el.limit.value);
+  const n = Number(ui.limit.value);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
 }
 
 function currentDelay() {
-  const n = Number(el.delay.value);
+  const n = Number(ui.delay.value);
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 4000;
 }
 
 function body(extra = {}) {
   const base = {
-    html: el.template.value,
-    subject: el.subject.value,
-    campaign: el.campaign.value.trim(),
+    html: ui.template.value,
+    subject: ui.subject.value,
+    campaign: ui.campaign.value.trim(),
     limit: currentLimit(),
     ...extra,
   };
   return state.mode === 'paste'
-    ? { ...base, raw: el.pasteBox.value }
-    : { ...base, csv: el.csv.value };
+    ? { ...base, raw: ui.pasteBox.value }
+    : { ...base, csv: ui.csv.value };
 }
 
-// ── Recipient source: saved CSV or a pasted list ─────────────────────
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+function options(select, items, preferred) {
+  const unchanged = select.options.length === items.length
+    && items.every((item, i) => select.options[i].value === item.value && select.options[i].textContent === item.label);
+  if (unchanged) return;
 
-function inspectPaste(text = el.pasteBox.value) {
-  const seen = new Set();
-  let valid = 0, invalid = 0, duplicates = 0;
-  for (const rawLine of String(text).split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith('#')) continue;
-
-    const angled = line.match(/^(.*?)<([^>]+)>\s*$/);
-    const email = angled ? angled[2].trim() : (line.split(/\s*[,;\t]\s*/)[0] || '').trim();
-    if (!EMAIL_RE.test(email)) { invalid++; continue; }
-    const key = email.toLowerCase();
-    if (seen.has(key)) { duplicates++; continue; }
-    seen.add(key);
-    valid++;
-  }
-  return { valid, invalid, duplicates };
+  const keep = select.value;
+  select.replaceChildren(...items.map((item) => h('option', { value: item.value }, item.label)));
+  const wanted = [keep, preferred].find((value) => value && items.some((item) => item.value === value));
+  if (wanted) select.value = wanted;
 }
 
-function updatePasteCount() {
-  const { valid, invalid, duplicates } = inspectPaste();
-  if (!valid && !invalid) {
-    el.pasteCount.textContent = 'One address per line; name and company optional.';
-    return;
-  }
-  const parts = [plural(valid, 'address', 'addresses')];
-  if (duplicates) parts.push(`${duplicates} duplicate${duplicates === 1 ? '' : 's'}`);
-  if (invalid) parts.push(`${invalid} unusable`);
-  el.pasteCount.textContent = parts.join(' · ');
-}
-
-// ── Recipient roster (the saved CSV, made visible) ────────────────────
-async function loadRoster() {
-  if (state.mode !== 'saved' || !el.csv.value) { el.roster.hidden = true; return; }
-  try {
-    const data = await api('/api/roster', {
-      csv: el.csv.value,
-      campaign: el.campaign.value.trim(),
-      limit: currentLimit(),
-    });
-    renderRoster(data);
-  } catch (err) {
-    el.roster.hidden = true;
-    el.rosterList.innerHTML = '';
-    state.rosterSig = null;
-    el.rosterCount.textContent = err.message;
-  }
-}
-
-function renderRoster(data) {
-  state.roster = data;
-  el.roster.hidden = false;
-
-  const bits = [plural(data.total, 'address', 'addresses')];
-  if (data.sentCount) bits.push(`${data.sentCount} already sent`);
-  if (data.truncated) bits.push(`${data.truncated} held by limit`);
-  if (data.duplicates) bits.push(`${data.duplicates} duplicate${data.duplicates === 1 ? '' : 's'}`);
-  if (data.invalid) bits.push(`${data.invalid} unusable`);
-  setText(el.rosterCount, bits.join(' · '));
-
-  // Same list as already on screen: keep the rows, the scroll offset and any
-  // hover or focus state instead of rebuilding them.
-  const sig = JSON.stringify(data);
-  if (sig === state.rosterSig) { markRosterCurrent(state.index); return; }
-  state.rosterSig = sig;
-
-  const frag = document.createDocumentFragment();
-  data.recipients.forEach((rec, i) => {
-    const li = document.createElement('li');
-    const row = document.createElement('button');
-    row.type = 'button';
-    row.className = 'roster__row';
-    row.dataset.index = String(i);
-    row.title = `${rec.email} — click to preview`;
-
-    const no = document.createElement('span');
-    no.className = 'roster__no';
-    no.textContent = String(i + 1).padStart(2, '0');
-
-    const content = document.createElement('span');
-    content.className = 'roster__content';
-    const mail = document.createElement('span');
-    mail.className = 'roster__mail';
-    mail.textContent = rec.email;
-    content.append(mail);
-
-    const meta = [rec.name, rec.company].filter(Boolean).join(' · ');
-    if (meta) {
-      const metaEl = document.createElement('span');
-      metaEl.className = 'roster__meta';
-      metaEl.textContent = meta;
-      content.append(metaEl);
-    }
-
-    const tag = document.createElement('span');
-    tag.className = 'roster__tag';
-    tag.textContent = 'sent';
-    tag.hidden = !rec.sent;
-
-    row.append(no, content, tag);
-    row.addEventListener('click', () => {
-      state.index = i;
-      refreshPreview();
-    });
-    li.append(row);
-    frag.append(li);
+function formatWhen(iso) {
+  return new Date(iso).toLocaleString(undefined, {
+    weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
   });
-
-  el.rosterList.replaceChildren(frag);
-  markRosterCurrent(state.index);
 }
 
-function markRosterCurrent(index) {
-  let active = null;
-  for (const row of el.rosterList.querySelectorAll('.roster__row')) {
-    const current = Number(row.dataset.index) === index;
-    row.classList.toggle('is-current', current);
-    if (current) active = row;
+function relative(iso) {
+  const diff = Date.parse(iso) - Date.now();
+  if (diff <= 0) return 'due now';
+  const minutes = Math.round(diff / 60000);
+  if (minutes < 60) return 'in ' + Math.max(1, minutes) + ' min';
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return 'in ' + hours + ' h';
+  return 'in ' + Math.round(hours / 24) + ' d';
+}
+
+function formatDuration(ms) {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return seconds + ' s';
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return minutes + ' min';
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return hours + ' h' + (rest ? ' ' + rest + ' min' : '');
+}
+
+const pad2 = (n) => String(n).padStart(2, '0');
+
+function toLocalInput(date) {
+  return date.getFullYear() + '-' + pad2(date.getMonth() + 1) + '-' + pad2(date.getDate())
+    + 'T' + pad2(date.getHours()) + ':' + pad2(date.getMinutes());
+}
+
+// ── Routing ──────────────────────────────────────────────────────────
+const ROUTES = [
+  { id: 'overview', title: 'Overview', view: 'viewOverview', heading: 'hOverview', enter: () => loadHealth() },
+  { id: 'compose', title: 'Compose', view: 'viewCompose', heading: 'hCompose' },
+  { id: 'recipients', title: 'Recipients', view: 'viewRecipients', heading: 'hRecipients' },
+  { id: 'send', title: 'Send', view: 'viewSend', heading: 'hSend' },
+  { id: 'schedule', title: 'Schedule', view: 'viewSchedule', heading: 'hSchedule', enter: () => { prepareScheduleForm(); loadQueue(); } },
+  { id: 'suppression', title: 'Suppression list', view: 'viewSuppression', heading: 'hSuppression', enter: () => loadSuppression() },
+  { id: 'settings', title: 'Settings', view: 'viewSettings', heading: 'hSettings', enter: () => { loadSettingsForm(); loadHealth(); } },
+];
+
+function currentRoute() {
+  const id = window.location.hash.replace(/^#\/?/, '').split(/[?/]/)[0];
+  return ROUTES.find((route) => route.id === id) || ROUTES[0];
+}
+
+let shownRoute = null;
+
+function showRoute({ focus = false } = {}) {
+  const route = currentRoute();
+  const changed = route !== shownRoute;
+  shownRoute = route;
+
+  for (const item of ROUTES) setHidden(ui[item.view], item !== route);
+  for (const link of ui.nav.querySelectorAll('a')) {
+    if (link.dataset.route === route.id) setAttr(link, 'aria-current', 'page');
+    else link.removeAttribute('aria-current');
   }
-  // Only follow the preview when it moved; otherwise every refresh would
-  // yank a list the reader has scrolled elsewhere back to the current row.
-  if (active && state.rosterMarked !== index) active.scrollIntoView({ block: 'nearest' });
-  state.rosterMarked = index;
+  document.title = route.title + ' · Mailroom';
+
+  if (!changed) return;
+  window.scrollTo(0, 0);
+  const current = ui.nav.querySelector('[aria-current]');
+  current?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  if (focus) ui[route.heading].focus({ preventScroll: true });
+  route.enter?.();
 }
 
-function setMode(mode, { refresh = true, focus = false } = {}) {
-  state.mode = mode === 'paste' ? 'paste' : 'saved';
-  store.set('mode', state.mode);
-  const pasting = state.mode === 'paste';
-
-  el.modeSaved.classList.toggle('is-on', !pasting);
-  el.modePaste.classList.toggle('is-on', pasting);
-  el.modeSaved.setAttribute('aria-pressed', String(!pasting));
-  el.modePaste.setAttribute('aria-pressed', String(pasting));
-
-  el.csv.hidden = pasting;
-  el.csvHint.hidden = pasting;
-  el.roster.hidden = pasting;
-  el.pastePanel.hidden = !pasting;
-  el.sendBtn.disabled = true;
-
-  updatePasteCount();
-  if (pasting) {
-    if (focus) el.pasteBox.focus();
-  } else {
-    loadRoster();
-  }
-  if (refresh) refreshPreview({ resetIndex: true });
+function go(id) {
+  window.location.hash = '#/' + id;
 }
 
-// ── Boot ─────────────────────────────────────────────────────────────
+// ── Connection status ────────────────────────────────────────────────
+function renderConn() {
+  if (!state.smtp) return;
+  const configured = state.setup.configured;
+  const kind = !configured ? 'warn' : state.conn;
+  const labels = { idle: 'Not checked', wait: 'Checking…', ok: 'Connected', bad: 'Failed', warn: 'Not set up' };
+
+  setText(ui.connPill, labels[kind]);
+  setAttr(ui.connPill, 'data-state', kind);
+  setAttr(ui.sidebarConn, 'data-state', kind === 'wait' ? 'idle' : kind);
+  setText(ui.connSub, configured ? (mailboxOf(state.smtp) || state.smtp.host) : 'Not connected');
+  setText(ui.connTitle, !configured ? 'Mailbox needs setup' : labels[kind] === 'Not checked' ? 'Mailbox' : 'Mailbox ' + labels[kind].toLowerCase());
+}
+
+function setConn(kind) {
+  state.conn = kind;
+  renderConn();
+}
+
+// ── Loading the server's state ───────────────────────────────────────
 async function loadState() {
   const data = await api('/api/state');
+  applyState(data);
+  return data;
+}
+
+function applyState(data) {
+  const sig = JSON.stringify(data);
+  if (sig === state.stateSig) return;
+  state.stateSig = sig;
+
+  state.version = data.app?.version || '';
+  state.platform = data.platform || '';
   state.smtp = data.smtp;
+  state.setup = data.setup || state.setup;
   state.csvs = data.csvs;
   state.templates = data.templates;
-  state.setup = data.setup || state.setup;
+  state.log = data.log;
+  state.suppression = data.suppression;
+  state.defaults = data.defaults;
 
-  setText(el.metaFrom, data.smtp.from || '(not set)');
   const localRelay = data.smtp.host === '127.0.0.1' || data.smtp.host === 'localhost';
-  const transport = data.smtp.secure ? '' : localRelay ? ' plain' : ' starttls';
-  setText(el.metaServer, `${data.smtp.host}:${data.smtp.port}${transport}`);
-  setText(el.metaLog, data.log.path);
-  el.signOutBtn.hidden = !state.setup.authRequired;
+  const transport = data.smtp.secure ? 'SSL' : localRelay ? 'plain' : 'STARTTLS';
+  setText(ui.statMailbox, mailboxOf(data.smtp) || 'Not connected');
+  setText(ui.statServer, data.smtp.host ? data.smtp.host + ':' + data.smtp.port + ' · ' + transport : 'No server set');
+  setHidden(ui.setupCallout, data.setup.configured);
 
-  const templateItems = data.templates.map((t) => ({
-    value: t.path,
-    label: t.name,
-  }));
-  const csvItems = data.csvs.map((c) => ({
+  const listed = data.csvs.reduce((sum, c) => sum + c.recipients, 0);
+  setText(ui.statLists, data.csvs.length);
+  setText(ui.statListsSub, data.csvs.length ? plural(listed, 'recipient') + ' in total' : 'No lists yet');
+  const withImages = data.templates.filter((t) => t.assets).length;
+  setText(ui.statTemplates, data.templates.length);
+  setText(ui.statTemplatesSub, data.templates.length ? withImages + ' with inline images' : 'None found');
+  setText(ui.statSuppressed, data.suppression.count);
+  setText(ui.statLog, data.log.entries);
+  setText(ui.statLogSub, baseName(data.log.path));
+  setAttr(ui.statLogSub, 'title', data.log.path);
+
+  setHidden(ui.signOutBtn, !data.setup.authRequired);
+  setHidden(ui.accessActions, !data.setup.authRequired);
+  setText(ui.accessText, data.setup.authRequired
+    ? 'A password is required to open Mailroom.'
+    : 'Mailroom is only reachable from this computer.');
+  setText(ui.aboutVersion, data.app?.version || '—');
+  setText(ui.aboutPlatform, data.platform || '—');
+  setText(ui.aboutLog, data.log.path);
+  setText(ui.aboutSuppression, data.suppression.path);
+  setText(ui.settingsPath, data.setup.configPath ? 'Saved to ' + data.setup.configPath : '');
+  setText(ui.settingsLead, data.setup.configured
+    ? 'Change where Mailroom sends from. The password is never shown again once saved.'
+    : 'Mailroom sends through your own SMTP account, so mail comes from your address and lands in your sent folder. Nothing is shared with anyone else.');
+
+  options(ui.template, data.templates.map((t) => ({ value: t.path, label: t.name })), store.get('template'));
+  options(ui.csv, data.csvs.map((c) => ({
     value: c.path,
-    label: c.error ? `${c.name} (unreadable)` : `${c.name} — ${plural(c.recipients, 'recipient')}`,
-  }));
+    label: c.error ? c.name + ' (unreadable)' : c.name + ' — ' + plural(c.recipients, 'recipient'),
+  })), store.get('csv'));
+  setHidden(ui.csvEmpty, data.csvs.length > 0);
+  setHidden(ui.csv.closest('.field'), data.csvs.length === 0);
 
-  options(el.template, templateItems, store.get('template') || templateItems[0]?.value);
-  options(el.csv, csvItems, store.get('csv') || csvItems[0]?.value);
+  if (!ui.campaign.value) ui.campaign.value = store.get('campaign') || data.defaults.campaign;
+  if (!ui.delay.dataset.touched && store.get('delay') === '') ui.delay.value = data.defaults.delay;
 
-  if (!el.campaign.value) el.campaign.value = store.get('campaign') || data.defaults.campaign;
-  if (!el.delay.value) el.delay.value = data.defaults.delay;
-
+  renderCampaigns();
   describeTemplate();
   describeCsv();
+  renderConn();
+  renderDraft();
 }
 
 function describeTemplate() {
-  const t = state.templates.find((x) => x.path === el.template.value);
-  if (!t) { setText(el.templateHint, ''); return; }
-  setText(el.templateHint, t.assets
-    ? `${plural(t.assets, 'file')} in ${t.assetsDir} — attached inline via cid:`
+  const t = state.templates.find((x) => x.path === ui.template.value);
+  if (!state.templates.length) { setText(ui.templateHint, 'No templates found. Add an .html file to the templates folder.'); return; }
+  if (!t) { setText(ui.templateHint, ''); return; }
+  setText(ui.templateHint, t.assets
+    ? plural(t.assets, 'file') + ' in ' + t.assetsDir + ' — attached inline via cid:'
     : 'No asset folder beside this template; images would not be embedded.');
 }
 
-// The roster below the picker carries the counts; this line is for errors.
 function describeCsv() {
-  const c = state.csvs.find((x) => x.path === el.csv.value);
-  setText(el.csvHint, c?.error || '');
+  const c = state.csvs.find((x) => x.path === ui.csv.value);
+  setText(ui.csvHint, c?.error || '');
+}
+
+async function loadHealth() {
+  try {
+    const data = await api('/api/health');
+    state.online = true;
+    state.version = data.version || state.version;
+    setText(ui.aboutHealth, 'Online' + (data.version ? ' · v' + data.version : ''));
+  } catch {
+    state.online = false;
+    setText(ui.aboutHealth, 'Unreachable');
+  }
+  setHidden(ui.offlineBar, state.online);
+}
+
+// ── Overview ─────────────────────────────────────────────────────────
+function renderCampaigns() {
+  const rows = state.log.campaigns || [];
+  setHidden(ui.campaignsEmpty, rows.length > 0);
+  setHidden(ui.campaignsWrap, rows.length === 0);
+  const cells = (c) => [c.id, String(c.sent), String(c.failed), String(c.skipped), c.last ? formatWhen(c.last) : '—'];
+  reconcile(ui.campaignsBody, rows, (c) => c.id,
+    () => h('tr', {}, h('th', { scope: 'row' }), h('td', { class: 'num' }), h('td', { class: 'num' }), h('td', { class: 'num' }), h('td')),
+    (tr, c) => {
+      cells(c).forEach((text, i) => setText(tr.children[i], text));
+      setClass(tr.children[2], 'is-bad', c.failed > 0);
+    });
+}
+
+function setStep(name, done, text) {
+  const li = ui.steps.querySelector('[data-step="' + name + '"]');
+  setAttr(li, 'data-state', done ? 'done' : 'todo');
+  const sub = ui['step' + name[0].toUpperCase() + name.slice(1)];
+  setText(sub, text);
+  setAttr(sub, 'title', text);
+}
+
+function unpreviewedRecipients() {
+  const roster = state.rosters[state.mode];
+  return roster && roster.total
+    ? plural(roster.total, 'address', 'addresses') + ' in the list. Add a subject to see who will be mailed.'
+    : 'No recipients chosen yet.';
+}
+
+// What the campaign being drafted still needs, shown on Overview and Send.
+function draftChecks() {
+  const p = state.lastPreview;
+  const subject = ui.subject.value.trim();
+  const template = state.templates.find((t) => t.path === ui.template.value);
+  const held = p ? [
+    p.skipped ? p.skipped + ' already sent' : null,
+    p.suppressed ? p.suppressed + ' suppressed' : null,
+  ].filter(Boolean) : [];
+
+  return {
+    mailbox: {
+      ok: state.setup.configured,
+      text: state.setup.configured ? (state.smtp.from || state.smtp.user) : 'Not connected yet — add your SMTP details in Settings.',
+    },
+    compose: {
+      ok: Boolean(template && subject),
+      text: !state.templates.length ? 'No templates found.'
+        : !subject ? 'Add a subject line.'
+          : template.name + ' · “' + subject + '”',
+    },
+    recipients: {
+      ok: Boolean(p && p.willSend > 0),
+      text: p
+        ? (p.willSend > 0
+          ? plural(p.willSend, 'message') + ' to send' + (held.length ? ' (' + held.join(', ') + ')' : '')
+          : 'Nothing left to send' + (held.length ? ': ' + held.join(', ') : '') + '.')
+        : state.previewError || unpreviewedRecipients(),
+    },
+  };
+}
+
+function renderDraft() {
+  if (!state.smtp) return;
+  const checks = draftChecks();
+  const p = state.lastPreview;
+
+  for (const [name, check] of Object.entries(checks)) {
+    const li = ui.sendChecks.querySelector('[data-check="' + (name === 'compose' ? 'template' : name) + '"]');
+    setAttr(li, 'data-state', check.ok ? 'ok' : 'bad');
+    const sub = ui[{ mailbox: 'chkMailbox', compose: 'chkCompose', recipients: 'chkRecipients' }[name]];
+    setText(sub, check.text);
+    setAttr(sub, 'title', check.text);
+  }
+  setStep('mailbox', checks.mailbox.ok, checks.mailbox.ok ? checks.mailbox.text : 'Required before anything can be sent.');
+  setStep('compose', checks.compose.ok, checks.compose.text);
+  setStep('recipients', checks.recipients.ok, checks.recipients.text);
+  setStep('test', state.tested, state.tested ? 'Test delivered in this session.' : 'Recommended before every campaign.');
+
+  setText(ui.sumFrom, state.smtp.from || '(not set)');
+  setText(ui.sumSubject, p ? p.subject : (ui.subject.value.trim() || '—'));
+  setText(ui.sumCampaign, ui.campaign.value.trim() || 'No campaign name');
+  setText(ui.recipientSummary, p
+    ? 'Sending to ' + plural(p.willSend, 'recipient') + (p.source === 'pasted' ? ' from your pasted list.' : ' from ' + baseName(p.source) + '.')
+    : 'No recipients chosen yet.');
+
+  const ready = checks.mailbox.ok && checks.compose.ok && checks.recipients.ok;
+  setText(ui.sendLabel, ready ? 'Send ' + plural(p.willSend, 'message') : 'Send campaign');
+  ui.sendBtn.disabled = state.sending || !ready;
+  ui.scheduleBtn.disabled = !(checks.compose.ok && checks.recipients.ok);
+
+  const total = p ? p.willSend * currentDelay() : 0;
+  setText(ui.delayHint, ready && total > 0
+    ? 'About ' + formatDuration(total) + ' for ' + plural(p.willSend, 'message') + '.'
+    : 'Keeps a single mailbox inside provider rate limits.');
+
+  renderScheduleSummary();
+}
+
+// ── Merge fields ─────────────────────────────────────────────────────
+const BUILTIN_FIELDS = ['name', 'company', 'email'];
+
+function availableFields() {
+  const extra = state.columns.filter((c) => c.role === 'field').map((c) => c.name);
+  return [...BUILTIN_FIELDS, ...extra.filter((name) => !BUILTIN_FIELDS.includes(name))];
+}
+
+function renderTokens() {
+  reconcile(ui.tokens, availableFields(), (name) => name,
+    (name) => h('button', { type: 'button', class: 'chip', dataset: { field: name }, 'aria-label': 'Insert ' + name }, '{{' + name + '}}'),
+    () => {});
+}
+
+function renderPlaceholders(placeholders) {
+  const labels = { builtin: 'built in', column: 'from your list', missing: 'not in your list' };
+  setHidden(ui.placeholdersHint, false);
+  reconcile(ui.placeholders, placeholders, (p) => p.name,
+    (p) => h('span', { class: 'chip', role: 'listitem' }, h('code'), h('span', { class: 'chip__note' })),
+    (node, p) => {
+      setAttr(node, 'data-status', p.status);
+      setText(node.firstElementChild, '{{' + p.name + '}}');
+      setText(node.lastElementChild, labels[p.status]);
+    });
+  const missing = placeholders.filter((p) => p.status === 'missing').map((p) => '{{' + p.name + '}}');
+  setText(ui.placeholdersHint, missing.length
+    ? missing.join(', ') + ' will be left blank: no column of that name in the recipient list.'
+    : placeholders.length
+      ? 'Every merge field in this message can be filled from your list.'
+      : 'Use {{name}}, {{company}}, {{email}} or any column of your list.');
+}
+
+function insertToken(token) {
+  const input = ui.subject;
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? input.value.length;
+  input.value = input.value.slice(0, start) + token + input.value.slice(end);
+  input.focus();
+  input.setSelectionRange(start + token.length, start + token.length);
+  store.set('subject', input.value);
+  refreshPreview();
 }
 
 // ── Preview ──────────────────────────────────────────────────────────
-function clearProof(message) {
-  el.proofEmpty.hidden = false;
-  el.proofEmpty.textContent = message;
-  el.preview.srcdoc = '';
-  el.proofTo.textContent = 'No recipient';
-  el.proofSubject.textContent = '';
-  el.proofIndex.textContent = '0 / 0';
-  el.proofImages.textContent = '0 inline images';
-  el.proofTotal.textContent = '';
-  el.sendBtn.textContent = 'Send';
-  el.sendBtn.disabled = true;
-  state.willSend = 0;
+function clearProof(title, text = '', kind = 'error') {
+  state.previewSeq++;
+  setHidden(ui.proofEmpty, false);
+  setText(ui.proofEmptyTitle, title);
+  setText(ui.proofEmptyText, text);
+  if (ui.preview.srcdoc !== '') ui.preview.srcdoc = '';
+  setText(ui.proofTo, 'No recipient');
+  setText(ui.proofSubject, '');
+  setText(ui.proofIndex, '0 / 0');
+  setText(ui.proofImages, '0 inline images');
+  setText(ui.proofTotal, '');
+  ui.prevBtn.disabled = true;
+  ui.nextBtn.disabled = true;
   state.lastPreview = null;
+  state.previewError = kind === 'subject' ? '' : text || title;
+  renderPlaceholders([]);
+  renderDraft();
 }
 
 async function refreshPreview({ resetIndex = false } = {}) {
-  if (!el.template.value) return;
-  if (state.mode === 'paste' && !el.pasteBox.value.trim()) {
-    clearProof('Paste one address per line — name and company are optional.');
+  if (!ui.template.value) { clearProof('No template selected', 'Add an .html file to the templates folder.'); return; }
+  if (state.mode === 'paste' && !ui.pasteBox.value.trim()) {
+    clearProof('No recipients yet', 'Paste one address per line on the Recipients page.');
     return;
   }
-  if (state.mode === 'saved' && !el.csv.value) return;
-  if (!el.subject.value.trim()) {
-    clearProof('Add a subject line, then the preview appears here.');
+  if (state.mode === 'saved' && !ui.csv.value) {
+    clearProof('No recipient list', 'Choose, paste or upload a list on the Recipients page.');
+    return;
+  }
+  if (!ui.subject.value.trim()) {
+    clearProof('Add a subject line', 'The preview appears here once the message has a subject.', 'subject');
     return;
   }
   if (resetIndex) state.index = 0;
 
+  const seq = ++state.previewSeq;
   try {
     const data = await api('/api/preview', body({ index: state.index }));
-    applyPreview(data);
+    if (seq === state.previewSeq) applyPreview(data);
   } catch (err) {
-    clearProof(err.message);
+    if (seq === state.previewSeq) clearProof('Preview unavailable', err.message);
   }
 }
 
 function applyPreview(data) {
   state.index = data.index;
   state.total = data.total;
-  state.willSend = data.willSend;
   state.lastPreview = data;
+  state.previewError = '';
+  state.columns = data.columns || state.columns;
 
   // Assigning srcdoc reloads the frame even when the markup is identical,
   // which flashes white and resets its scroll position.
-  if (el.preview.srcdoc !== data.html) el.preview.srcdoc = data.html;
-  el.proofEmpty.hidden = true;
-  setText(el.proofTo, data.to);
-  setText(el.proofSubject, data.subject);
-  setText(el.proofIndex, `${data.index + 1} / ${data.total}`);
-  setText(el.proofImages, plural(data.inline, 'inline image'));
-  setText(el.proofTotal, [
-    `${data.willSend} to send`,
-    `${data.skipped} already sent`,
-    data.suppressed ? `${data.suppressed} suppressed` : null,
-    data.truncated ? `${data.truncated} held back by limit` : null,
+  if (ui.preview.srcdoc !== data.html) ui.preview.srcdoc = data.html;
+  setHidden(ui.proofEmpty, true);
+  setText(ui.proofTo, data.to);
+  setText(ui.proofSubject, data.subject);
+  setText(ui.proofIndex, (data.index + 1) + ' / ' + data.total);
+  setText(ui.proofImages, plural(data.inline, 'inline image'));
+  setText(ui.proofTotal, [
+    data.willSend + ' to send',
+    data.skipped + ' already sent',
+    data.suppressed ? data.suppressed + ' suppressed' : null,
+    data.truncated ? data.truncated + ' held back by limit' : null,
   ].filter(Boolean).join(' · '));
 
-  markRosterCurrent(data.index);
+  ui.prevBtn.disabled = data.index <= 0;
+  ui.nextBtn.disabled = data.index >= data.total - 1;
 
-  setText(el.slipNo, el.campaign.value.trim() || 'no campaign');
-  setText(el.sendBtn, data.willSend ? `Send ${plural(data.willSend, 'message')}` : 'Nothing left to send');
-  el.sendBtn.disabled = state.sending || data.willSend === 0;
-  el.scheduleBtn.disabled = data.willSend === 0;
-
-  el.prevBtn.disabled = data.index <= 0;
-  el.nextBtn.disabled = data.index >= data.total - 1;
+  renderPlaceholders(data.placeholders || []);
+  renderTokens();
+  markRosterCurrent();
+  renderDraft();
 }
 
-// ── Mailbox settings ─────────────────────────────────────────────────
-async function openSettings({ firstRun = false } = {}) {
-  state.firstRun = firstRun && !state.setup.configured;
+// ── Recipients: source tabs, roster and columns ──────────────────────
+function activeRosterKey() {
+  return state.tab === 'upload' ? 'upload' : state.mode;
+}
 
-  el.settingsTitle.textContent = state.firstRun ? 'Connect your mailbox' : 'Mailbox settings';
-  el.settingsLead.textContent = state.firstRun
-    ? 'Mailroom sends through your own SMTP account, so mail comes from your address and lands in your sent folder. Nothing is shared with anyone else.'
-    : 'Change where Mailroom sends from. The password is never shown again once saved.';
-  el.settingsCancel.hidden = state.firstRun;
-  el.settingsStatus.textContent = '';
-  el.settingsStatus.className = 'settings__status';
-  el.settingsPath.textContent = state.setup.configPath
-    ? `Saved to ${state.setup.configPath}`
-    : '';
-
-  el.settingsModal.hidden = false;
-
-  try {
-    const settings = await api('/api/settings');
-    el.setHost.value = settings.host || '';
-    el.setPort.value = settings.port || 465;
-    el.setUser.value = settings.user || '';
-    el.setFrom.value = settings.from || '';
-    el.setPass.value = '';
-    el.setPass.placeholder = settings.passwordSet ? 'Saved — leave blank to keep it' : '16 characters';
-    el.setPassHint.textContent = settings.passwordSet
-      ? 'A password is already saved. Leave blank unless you are changing it.'
-      : 'Gmail needs an App Password, not your login password.';
-  } catch (err) {
-    toast(err.message, 'bad');
+function setTab(tab, { focus = false, quiet = false } = {}) {
+  state.tab = tab;
+  for (const button of ui.sourceTabs.querySelectorAll('[role="tab"]')) {
+    const on = button.dataset.tab === tab;
+    setAttr(button, 'aria-selected', String(on));
+    button.tabIndex = on ? 0 : -1;
+    setHidden(ui['panel' + button.dataset.tab[0].toUpperCase() + button.dataset.tab.slice(1)], !on);
+    if (on && focus) button.focus();
   }
-
-  (el.setHost.value ? el.setUser : el.setHost).focus();
+  if (quiet) return;
+  if (tab === 'saved' || tab === 'paste') setMode(tab);
+  else renderRoster();
 }
 
-function closeSettings() {
-  if (state.firstRun) return; // setup cannot be skipped
-  el.settingsModal.hidden = true;
+function setMode(mode, { refresh = true } = {}) {
+  const next = mode === 'paste' ? 'paste' : 'saved';
+  const changed = next !== state.mode;
+  state.mode = next;
+  store.set('mode', next);
+  if (!changed && !refresh) return;
+
+  if (next === 'paste') validatePaste();
+  else loadRoster();
+  renderRoster();
+  if (refresh) refreshPreview({ resetIndex: true });
 }
 
-function settingsPayload() {
-  return {
-    host: el.setHost.value.trim(),
-    port: Number(el.setPort.value) || undefined,
-    user: el.setUser.value.trim(),
-    pass: el.setPass.value,
-    from: el.setFrom.value.trim(),
+async function loadRoster() {
+  if (state.mode !== 'saved') return;
+  if (!ui.csv.value) {
+    state.rosters.saved = null;
+    state.rosterErrors.saved = '';
+    renderRoster();
+    return;
+  }
+  const seq = ++state.rosterSeq;
+  try {
+    const data = await api('/api/roster', { csv: ui.csv.value, campaign: ui.campaign.value.trim(), limit: currentLimit() });
+    if (seq !== state.rosterSeq) return;
+    state.rosters.saved = data;
+    state.rosterErrors.saved = '';
+    state.columns = data.columns || [];
+    renderTokens();
+    renderDraft();
+  } catch (err) {
+    if (seq !== state.rosterSeq) return;
+    state.rosters.saved = null;
+    state.rosterErrors.saved = err.message;
+  }
+  renderRoster();
+  renderDraft();
+}
+
+const looksLikeCsv = (text) => {
+  const first = text.split(/\r?\n/).find((line) => line.trim() && !line.trim().startsWith('#')) || '';
+  return !first.includes('@') && /(^|[,;\t])\s*"?e-?mail/i.test(first);
+};
+
+async function validatePaste() {
+  const text = ui.pasteBox.value;
+  const seq = ++state.pasteSeq;
+  if (!text.trim()) {
+    state.rosters.paste = null;
+    state.rosterErrors.paste = '';
+    setText(ui.pasteCount, 'One address per line; name and company optional.');
+    renderRoster();
+    return;
+  }
+  try {
+    const data = await api('/api/recipients', { text, dryRun: true });
+    if (seq !== state.pasteSeq) return;
+    state.rosters.paste = data;
+    state.rosterErrors.paste = '';
+    const parts = [plural(data.total, 'address', 'addresses')];
+    if (data.duplicates) parts.push(plural(data.duplicates, 'duplicate'));
+    if (data.invalid) parts.push(data.invalid + ' unusable');
+    if (looksLikeCsv(text)) parts.push('this looks like a CSV with a header row: use Upload CSV to keep its columns');
+    setText(ui.pasteCount, parts.join(' · '));
+  } catch (err) {
+    if (seq !== state.pasteSeq) return;
+    state.rosters.paste = null;
+    state.rosterErrors.paste = err.message;
+    setText(ui.pasteCount, err.message);
+  }
+  renderRoster();
+}
+
+const ROLE_LABEL = { email: 'Email address', name: 'Name', company: 'Company', field: 'Merge field' };
+
+function mergeFieldsFor(column) {
+  const alias = column.role === 'field' ? null : column.role;
+  return [alias, column.name === alias ? null : column.name].filter(Boolean).map((field) => '{{' + field + '}}').join('  ');
+}
+
+function renderColumns(columns) {
+  setHidden(ui.columnsWrap, columns.length === 0);
+  setHidden(ui.columnsEmpty, columns.length > 0);
+  reconcile(ui.columnsBody, columns, (c) => c.name,
+    () => h('tr', {}, h('th', { scope: 'row', class: 'mono' }), h('td'), h('td', { class: 'mono' })),
+    (tr, c) => {
+      setText(tr.children[0], c.name);
+      setText(tr.children[1], ROLE_LABEL[c.role]);
+      setText(tr.children[2], mergeFieldsFor(c));
+    });
+  setText(ui.columnsNote, columns.length && !columns.some((c) => c.role === 'email')
+    ? 'No email column found. Name the column email (or e-mail, email address) so Mailroom can find the addresses.'
+    : '');
+}
+
+function renderRoster() {
+  const key = activeRosterKey();
+  const data = state.rosters[key];
+  const error = state.rosterErrors[key];
+  const selectable = key !== 'upload';
+
+  const sources = {
+    saved: baseName(data?.path || ui.csv.value || 'No list selected'),
+    paste: 'Pasted list, not saved',
+    upload: state.upload ? state.upload.name + ' (not saved yet)' : 'No file chosen',
   };
-}
+  setText(ui.rosterSource, sources[key]);
+  setHidden(ui.rosterPreviewLink, !selectable || !data);
 
-function setSettingsStatus(text, kind = '') {
-  el.settingsStatus.textContent = text;
-  el.settingsStatus.className = `settings__status${kind ? ` is-${kind}` : ''}`;
-}
-
-async function testSettings() {
-  el.settingsTestBtn.disabled = true;
-  el.settingsSaveBtn.disabled = true;
-  setSettingsStatus('Connecting…');
-  try {
-    const data = await api('/api/settings/test', settingsPayload());
-    if (data.ok) {
-      setSettingsStatus(`Connected to ${data.smtp.host}:${data.smtp.port} as ${data.smtp.user || 'local'}`, 'ok');
-      setStamp('ok', 'connection ok');
-    } else {
-      setSettingsStatus(data.error || 'Connection failed', 'bad');
-    }
-  } catch (err) {
-    setSettingsStatus(err.message, 'bad');
-  } finally {
-    el.settingsTestBtn.disabled = false;
-    el.settingsSaveBtn.disabled = false;
+  const stats = [];
+  if (data) {
+    stats.push({ kind: 'total', text: plural(data.total, 'address', 'addresses'), state: data.total ? 'ok' : 'warn' });
+    if (data.sentCount) stats.push({ kind: 'sent', text: data.sentCount + ' already sent', state: 'warn' });
+    if (data.truncated) stats.push({ kind: 'limit', text: data.truncated + ' held by limit', state: 'warn' });
+    if (data.duplicates) stats.push({ kind: 'dupes', text: plural(data.duplicates, 'duplicate'), state: 'warn' });
+    if (data.invalid) stats.push({ kind: 'invalid', text: data.invalid + ' unusable', state: 'bad' });
   }
+  reconcile(ui.rosterStats, stats, (s) => s.kind,
+    () => h('span', { class: 'pill' }),
+    (node, s) => { setText(node, s.text); setAttr(node, 'data-state', s.state); });
+
+  const rows = data ? data.recipients : [];
+  const position = new Map(rows.map((rec, i) => [rec.email.toLowerCase(), i]));
+  reconcile(ui.rosterList, rows, (rec) => rec.email.toLowerCase(),
+    () => h('li', {}, h('button', { type: 'button', class: 'rrow' },
+      h('span', { class: 'rrow__no' }),
+      h('span', { class: 'rrow__main' }, h('span', { class: 'rrow__mail' }), h('span', { class: 'rrow__meta' })),
+      h('span', { class: 'tag' }, 'sent'))),
+    (li, rec) => {
+      const row = li.firstElementChild;
+      const i = position.get(rec.email.toLowerCase());
+      row.dataset.index = String(i);
+      row.disabled = !selectable;
+      setAttr(row, 'title', rec.email);
+      setText(row.children[0], pad2(i + 1));
+      setText(row.children[1].children[0], rec.email);
+      setText(row.children[1].children[1], [rec.name, rec.company].filter(Boolean).join(' · '));
+      setClass(row, 'is-sent', Boolean(rec.sent));
+    });
+
+  const empty = !rows.length;
+  setHidden(ui.rosterEmpty, !empty);
+  if (empty) {
+    const titles = {
+      saved: ui.csv.value ? 'No recipients found' : 'No list selected',
+      paste: 'Nothing pasted yet',
+      upload: 'No file chosen',
+    };
+    const texts = {
+      saved: ui.csv.value ? 'This list has no valid email addresses.' : 'Choose a saved list, paste addresses or upload a CSV.',
+      paste: 'Paste one address per line and they appear here as you type.',
+      upload: 'Choose a CSV file to check it before saving.',
+    };
+    setText(ui.rosterEmptyTitle, error ? 'Could not read this list' : titles[key]);
+    setText(ui.rosterEmptyText, error || texts[key]);
+  }
+
+  renderColumns(data ? data.columns || [] : []);
+  markRosterCurrent();
 }
 
-async function saveSettings() {
-  el.settingsSaveBtn.disabled = true;
-  el.settingsTestBtn.disabled = true;
-  setSettingsStatus('Checking the connection…');
-  try {
-    const data = await api('/api/settings', settingsPayload());
-    if (!data.ok) {
-      setSettingsStatus(data.error || 'Those settings did not work', 'bad');
-      return;
+function markRosterCurrent() {
+  const selectable = activeRosterKey() !== 'upload';
+  let active = null;
+  for (const li of ui.rosterList.children) {
+    const row = li.firstElementChild;
+    const current = selectable && Number(row.dataset.index) === state.index;
+    setClass(row, 'is-current', current);
+    if (current) {
+      setAttr(row, 'aria-current', 'true');
+      active = row;
+    } else if (row.hasAttribute('aria-current')) {
+      row.removeAttribute('aria-current');
     }
-    state.firstRun = false;
-    el.settingsModal.hidden = true;
-    el.setPass.value = '';
-    setStamp('ok', 'connection ok');
-    toast('Mailbox connected — settings saved.', 'ok');
+  }
+  // One tab stop for the whole list; arrow keys move within it.
+  const stop = active || ui.rosterList.querySelector('.rrow');
+  for (const li of ui.rosterList.children) {
+    const row = li.firstElementChild;
+    const want = row === stop ? 0 : -1;
+    if (row.tabIndex !== want) row.tabIndex = want;
+  }
+  // Only follow the preview when it moved; otherwise every refresh would
+  // yank a list the reader has scrolled elsewhere back to the current row.
+  if (active && state.rosterMarked !== state.index) active.scrollIntoView({ block: 'nearest' });
+  state.rosterMarked = state.index;
+}
 
+// Saving a pasted or uploaded list makes it a saved list and selects it.
+async function saveList({ text, name, format, button, label }) {
+  button.disabled = true;
+  button.textContent = 'Saving…';
+  try {
+    const data = await api('/api/recipients', { text, name, format });
     await loadState();
-    await refreshPreview({ resetIndex: true });
-    if (state.mode === 'saved') await loadRoster();
-  } catch (err) {
-    setSettingsStatus(err.message, 'bad');
-  } finally {
-    el.settingsSaveBtn.disabled = false;
-    el.settingsTestBtn.disabled = false;
-  }
-}
-
-async function signOut() {
-  try { await api('/api/logout', {}); } catch { /* already signed out */ }
-  window.location.replace('/login.html');
-}
-
-// ── Connection check ─────────────────────────────────────────────────
-async function verify() {
-  el.verifyBtn.disabled = true;
-  setStamp('wait', 'checking');
-  try {
-    const data = await api('/api/verify', {});
-    if (data.ok) {
-      setStamp('ok', 'connection ok');
-      toast(`Signed in to ${data.smtp.host}:${data.smtp.port} as ${data.smtp.user || 'local'}`, 'ok');
-    } else {
-      setStamp('bad', 'failed');
-      toast(data.error || 'Connection failed', 'bad');
-    }
-  } catch (err) {
-    setStamp('bad', 'failed');
-    toast(err.message, 'bad');
-  } finally {
-    el.verifyBtn.disabled = false;
-  }
-}
-
-function setStamp(kind, text) {
-  el.stamp.dataset.state = kind;
-  el.stamp.textContent = text;
-}
-
-// ── Test send ────────────────────────────────────────────────────────
-async function sendTest() {
-  const to = el.testTo.value.trim();
-  if (!to) { el.testTo.focus(); toast('Enter an address for the test message', 'bad'); return; }
-  if (state.sending) return;
-
-  el.testBtn.disabled = true;
-  el.testBtn.textContent = 'Sending test…';
-  try {
-    const data = await api('/api/test', body({ to }));
-    if (data.ok) {
-      toast(`Test delivered to ${to}`, 'ok');
-      addLine({ n: 'test', tag: 'sent', tagLabel: 'test', addr: to, note: `${data.inline} inline` });
-    } else {
-      toast(data.error, 'bad');
-      addLine({ n: 'test', tag: 'failed', tagLabel: 'test', addr: to, note: data.error });
-    }
-  } catch (err) {
-    toast(err.message, 'bad');
-  } finally {
-    el.testBtn.disabled = false;
-    el.testBtn.textContent = 'Send test';
-  }
-}
-
-// ── Save a pasted list into data/ ────────────────────────────────────
-async function savePastedList() {
-  const text = el.pasteBox.value.trim();
-  if (!text) { el.pasteBox.focus(); toast('Paste some addresses first', 'bad'); return; }
-  if (!inspectPaste(text).valid) { toast('No usable addresses in that list yet', 'bad'); return; }
-
-  el.saveCsvBtn.disabled = true;
-  el.saveCsvBtn.textContent = 'Saving…';
-  try {
-    const data = await api('/api/recipients', { text, name: el.campaign.value.trim() });
-    await loadState();
-
-    setMode('saved', { refresh: false });
     if (state.csvs.some((c) => c.path === data.path)) {
-      el.csv.value = data.path;
+      ui.csv.value = data.path;
       store.set('csv', data.path);
     }
     describeCsv();
-
-    el.pasteBox.value = '';
-    updatePasteCount();
-    toast(`Saved ${plural(data.recipients, 'address', 'addresses')} to ${data.path}`, 'ok');
-    await refreshPreview({ resetIndex: true });
-    await loadRoster();
+    toast('Saved ' + plural(data.recipients, 'address', 'addresses') + ' to ' + data.path, 'ok');
+    return true;
   } catch (err) {
     toast(err.message, 'bad');
+    return false;
   } finally {
-    el.saveCsvBtn.disabled = false;
-    el.saveCsvBtn.textContent = 'Save as CSV';
+    button.textContent = label;
+    button.disabled = false;
   }
 }
 
-// ── Ledger ───────────────────────────────────────────────────────────
-function clearLedger() {
-  el.ledger.innerHTML = '';
+async function savePastedList() {
+  const text = ui.pasteBox.value.trim();
+  if (!text) { ui.pasteBox.focus(); toast('Paste some addresses first.', 'bad'); return; }
+  const saved = await saveList({
+    text,
+    name: ui.pasteName.value.trim() || ui.campaign.value.trim(),
+    format: looksLikeCsv(text) ? 'csv' : 'lines',
+    button: ui.saveCsvBtn,
+    label: 'Save as list',
+  });
+  if (!saved) return;
+  ui.pasteBox.value = '';
+  ui.pasteName.value = '';
+  state.rosters.paste = null;
+  setText(ui.pasteCount, 'One address per line; name and company optional.');
+  setTab('saved');
+  await loadRoster();
 }
 
-function addLine({ n, tag, tagLabel, addr, note }) {
-  const idle = el.ledger.querySelector('.ledger__idle');
-  if (idle) idle.remove();
+const MAX_UPLOAD = 1.5 * 1024 * 1024;
 
-  const li = document.createElement('li');
-  const num = document.createElement('span');
-  num.className = 'n';
-  num.textContent = n;
+async function handleFile(file) {
+  if (!file) return;
+  state.upload = null;
+  state.rosters.upload = null;
+  ui.uploadSaveBtn.disabled = true;
+  setText(ui.dropTitle, file.name);
 
-  const label = document.createElement('span');
-  label.className = `tag tag--${tag}`;
-  label.textContent = tagLabel;
+  const fail = (message) => {
+    setText(ui.uploadStatus, message);
+    setClass(ui.uploadStatus, 'is-bad', true);
+    setClass(ui.uploadStatus, 'is-ok', false);
+    renderRoster();
+  };
 
-  const who = document.createElement('span');
-  who.className = 'addr';
-  who.textContent = addr;
+  if (file.size > MAX_UPLOAD) { fail('That file is larger than 1.5 MB. Split it into smaller lists.'); return; }
+  let text;
+  try { text = await file.text(); } catch { fail('Could not read that file.'); return; }
 
-  const extra = document.createElement('span');
-  extra.className = tag === 'failed' ? 'err' : '';
-  extra.textContent = note || '';
+  state.upload = { name: file.name, text };
+  setClass(ui.uploadStatus, 'is-bad', false);
+  setClass(ui.uploadStatus, 'is-ok', false);
+  setText(ui.uploadStatus, 'Checking ' + file.name + '…');
+  renderRoster();
+  try {
+    const data = await api('/api/recipients', { text, format: 'csv', dryRun: true });
+    state.rosters.upload = data;
+    const parts = [plural(data.total, 'valid address', 'valid addresses')];
+    if (data.duplicates) parts.push(plural(data.duplicates, 'duplicate'));
+    if (data.invalid) parts.push(data.invalid + ' unusable');
+    setText(ui.uploadStatus, parts.join(' · '));
+    setClass(ui.uploadStatus, 'is-ok', data.total > 0);
+    setClass(ui.uploadStatus, 'is-bad', data.total === 0);
+    ui.uploadSaveBtn.disabled = data.total === 0;
+    renderRoster();
+  } catch (err) {
+    fail(err.message);
+  }
+}
 
-  li.append(num, label, who, extra);
+async function saveUpload() {
+  if (!state.upload) return;
+  const base = state.upload.name.replace(/\.[^.]+$/, '');
+  const saved = await saveList({
+    text: state.upload.text,
+    name: ui.uploadName.value.trim() || base,
+    format: 'csv',
+    button: ui.uploadSaveBtn,
+    label: 'Save and use',
+  });
+  if (!saved) return;
+
+  state.upload = null;
+  state.rosters.upload = null;
+  ui.fileInput.value = '';
+  ui.uploadName.value = '';
+  setText(ui.dropTitle, 'Choose a CSV file or drop it here');
+  setText(ui.uploadStatus, '');
+  ui.uploadSaveBtn.disabled = true;
+  setTab('saved');
+  await loadRoster();
+  await refreshPreview({ resetIndex: true });
+}
+
+// ── Connection check and test send ───────────────────────────────────
+async function verify() {
+  for (const button of [ui.verifyBtn, ui.verifyBtn2]) button.disabled = true;
+  setConn('wait');
+  try {
+    const data = await api('/api/verify', {});
+    if (data.ok) {
+      setConn('ok');
+      toast('Signed in to ' + data.smtp.host + ':' + data.smtp.port + ' as ' + (data.smtp.user || 'local'), 'ok');
+    } else {
+      setConn('bad');
+      toast(data.error || 'Connection failed', 'bad');
+    }
+  } catch (err) {
+    setConn('bad');
+    toast(err.message, 'bad');
+  } finally {
+    for (const button of [ui.verifyBtn, ui.verifyBtn2]) button.disabled = state.sending;
+  }
+}
+
+function setTestResult(text, kind = '') {
+  setText(ui.testResult, text);
+  setClass(ui.testResult, 'is-ok', kind === 'ok');
+  setClass(ui.testResult, 'is-bad', kind === 'bad');
+}
+
+async function sendTest() {
+  const to = ui.testTo.value.trim();
+  if (!to) { ui.testTo.focus(); setTestResult('Enter an address for the test message.', 'bad'); return; }
+  if (state.sending) return;
+
+  ui.testBtn.disabled = true;
+  ui.testBtn.textContent = 'Sending test…';
+  setTestResult('Sending…');
+  try {
+    const data = await api('/api/test', body({ to }));
+    if (data.ok) {
+      state.tested = true;
+      setTestResult('Test delivered to ' + to + ' (' + plural(data.inline, 'inline image') + ').', 'ok');
+      toast('Test delivered to ' + to, 'ok');
+      setConn('ok');
+      renderDraft();
+    } else {
+      setTestResult(data.error || 'The test message was not sent.', 'bad');
+      toast(data.error || 'The test message was not sent.', 'bad');
+    }
+  } catch (err) {
+    setTestResult(err.message, 'bad');
+    toast(err.message, 'bad');
+  } finally {
+    ui.testBtn.disabled = state.sending;
+    ui.testBtn.textContent = 'Send test';
+  }
+}
+
+// ── Campaign progress ────────────────────────────────────────────────
+const LEDGER_LIMIT = 400;
+
+function clearLedger() {
+  ui.ledger.replaceChildren();
+  setHidden(ui.ledgerEmpty, false);
+}
+
+function addLine({ n, tag, tagLabel, addr, note, bad = false }) {
+  setHidden(ui.ledgerEmpty, true);
+  const li = h('li', {},
+    h('span', { class: 'n' }, n),
+    h('span', { class: 'tag tag--' + tag }, tagLabel),
+    h('div', {}, h('span', { class: 'addr' }, addr), note ? h('span', { class: 'note' + (bad ? ' is-bad' : '') }, note) : null));
   appendToLedger(li);
 }
 
 function addSummary(text) {
-  const li = document.createElement('li');
-  li.className = 'ledger__summary';
-  li.textContent = text;
-  appendToLedger(li);
+  setHidden(ui.ledgerEmpty, true);
+  appendToLedger(h('li', { class: 'ledger__summary' }, text));
 }
 
 // Follow new lines only while the reader is at the bottom; someone scrolled
 // up to read an earlier failure must not be dragged down on every message.
 function appendToLedger(li) {
-  const list = el.ledger;
+  const list = ui.ledger;
   const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 24;
   list.append(li);
+  while (list.children.length > LEDGER_LIMIT) list.firstElementChild.remove();
   if (atBottom) list.scrollTop = list.scrollHeight;
 }
 
-const COUNT_NAMES = ['sent', 'failed', 'skipped'];
-
-// The three counters are built once and updated in place, so a progress
-// event changes one number instead of replacing the whole row.
-function setCounts({ sent = 0, failed = 0, skipped = 0 }) {
-  if (el.runCounts.children.length !== COUNT_NAMES.length) {
-    el.runCounts.replaceChildren(...COUNT_NAMES.map((name) => {
-      const span = document.createElement('span');
-      span.append(`${name} `, document.createElement('b'));
-      return span;
-    }));
+function renderRun() {
+  const { total, sent, failed, skipped } = state.run;
+  const done = sent + failed + skipped;
+  for (const bar of [ui.runProgress, ui.liveProgress]) {
+    if (bar.max !== Math.max(total, 1)) bar.max = Math.max(total, 1);
+    if (bar.value !== done) bar.value = done;
   }
-  const values = { sent, failed, skipped };
-  COUNT_NAMES.forEach((name, i) => {
-    const span = el.runCounts.children[i];
-    setText(span.lastChild, String(values[name]));
-    span.classList.toggle('is-bad', name === 'failed' && failed > 0);
-  });
+
+  const label = state.run.label || (total ? done + ' of ' + total + ' processed' : 'Starting…');
+  setText(ui.runLabel, label);
+  setText(ui.liveText, 'Sending' + (state.run.campaign ? ' “' + state.run.campaign + '”' : '') + ' — ' + (total ? done + ' of ' + total : 'starting'));
+
+  const counts = [['sent', sent], ['failed', failed], ['skipped', skipped]];
+  reconcile(ui.runCounts, counts, ([name]) => name,
+    ([name]) => h('span', {}, name + ' ', h('b')),
+    (node, [name, value]) => {
+      setText(node.lastElementChild, String(value));
+      setClass(node, 'is-bad', name === 'failed' && value > 0);
+    });
 }
 
-// ── Send ─────────────────────────────────────────────────────────────
-function openConfirm() {
-  if (!state.lastPreview) return;
-  const p = state.lastPreview;
-  el.modalBody.innerHTML = '';
-  const lead = document.createElement('p');
-  lead.append('This sends ');
-  const count = document.createElement('strong');
-  count.textContent = plural(p.willSend, 'message');
-  lead.append(count, ` from ${state.smtp.from} through ${state.smtp.host}, starting with ${p.to}.`);
-  const note = document.createElement('p');
-  const held = [
-    p.skipped ? `${p.skipped} already logged for this campaign` : null,
-    p.suppressed ? `${p.suppressed} on the suppression list` : null,
-  ].filter(Boolean);
-  note.textContent = held.length
-    ? `${held.join(' and ')} will be skipped.`
-    : 'Every recipient in this selection will receive it.';
-
-  el.modalBody.append(lead, note);
-  el.modalCheck.checked = false;
-  el.modalConfirm.disabled = true;
-  el.modal.hidden = false;
-  el.modalCheck.focus();
-}
-
-function closeConfirm() {
-  el.modal.hidden = true;
+function setRunState(kind, text) {
+  setAttr(ui.runState, 'data-state', kind);
+  setText(ui.runState, text);
 }
 
 function lockControls() {
   state.sending = true;
-  el.sendBtn.disabled = true;
-  el.testBtn.disabled = true;
-  el.verifyBtn.disabled = true;
-  el.cancelBtn.hidden = false;
-  el.cancelBtn.disabled = false;
-  el.cancelBtn.textContent = 'Stop after this one';
+  ui.sendBtn.disabled = true;
+  ui.testBtn.disabled = true;
+  ui.verifyBtn.disabled = true;
+  ui.verifyBtn2.disabled = true;
+  setHidden(ui.cancelBtn, false);
+  ui.cancelBtn.disabled = false;
+  ui.cancelBtn.textContent = 'Stop after this one';
   clearLedger();
-  setCounts({});
+  state.run = { total: 0, sent: 0, failed: 0, skipped: 0, label: '', campaign: '' };
+  setRunState('run', 'Sending');
+  setHidden(ui.liveBar, false);
+  setHidden(ui.navSendBadge, false);
+  renderRun();
+}
+
+function unlockControls() {
+  state.sending = false;
+  state.jobId = null;
+  ui.testBtn.disabled = false;
+  ui.verifyBtn.disabled = false;
+  ui.verifyBtn2.disabled = false;
+  setHidden(ui.cancelBtn, true);
+  setHidden(ui.liveBar, true);
+  setHidden(ui.navSendBadge, true);
+  renderDraft();
 }
 
 async function startSend() {
-  closeConfirm();
-  if (state.sending) return;
+  const p = state.lastPreview;
+  if (!p || state.sending) return;
+
+  const total = p.willSend * currentDelay();
+  const details = h('dl', { class: 'facts' },
+    h('div', {}, h('dt', {}, 'From'), h('dd', {}, state.smtp.from)),
+    h('div', {}, h('dt', {}, 'Subject'), h('dd', {}, p.subject)),
+    h('div', {}, h('dt', {}, 'Campaign'), h('dd', {}, ui.campaign.value.trim() || 'No campaign name')),
+    h('div', {}, h('dt', {}, 'Starts with'), h('dd', {}, p.to)),
+    h('div', {}, h('dt', {}, 'Takes about'), h('dd', {}, formatDuration(total))));
+  const held = [
+    p.skipped ? p.skipped + ' already logged for this campaign' : null,
+    p.suppressed ? p.suppressed + ' on the suppression list' : null,
+  ].filter(Boolean);
+
+  const ok = await confirmDialog({
+    title: 'Send this campaign for real?',
+    body: [
+      h('p', { class: 'dialog__count' }, h('strong', {}, String(p.willSend)), p.willSend === 1 ? 'recipient will get this message' : 'recipients will get this message'),
+      details,
+      h('p', { class: 'muted' }, held.length ? held.join(' and ') + ' will be skipped.' : 'Every recipient in this selection will receive it.'),
+    ],
+    confirmLabel: 'Send ' + plural(p.willSend, 'message') + ' now',
+    danger: true,
+    check: 'I understand these messages go out immediately to real inboxes.',
+  });
+  if (!ok) return;
 
   lockControls();
-
   try {
     const data = await api('/api/send', body({ confirm: true, delay: currentDelay() }));
     listen(data.jobId);
@@ -775,7 +1152,7 @@ async function startSend() {
   }
 }
 
-/** Re-attach to a campaign that survived a page reload. */
+/** Re-attach to a campaign that survived a page reload or was started by the scheduler. */
 async function resumeActiveJob({ quiet = false } = {}) {
   if (state.sending) return;
   try {
@@ -783,38 +1160,39 @@ async function resumeActiveJob({ quiet = false } = {}) {
     if (!active?.jobId) return;
     lockControls();
     listen(active.jobId);
-    if (!quiet) {
-      toast(`Showing a campaign that is still sending${active.total ? ` (${active.total} recipients)` : ''}.`, 'ok');
-    }
+    if (!quiet) toast('Showing a campaign that is still sending' + (active.total ? ' (' + plural(active.total, 'recipient') + ')' : '') + '.', 'ok');
   } catch { /* nothing running, or server restarting */ }
 }
 
 function listen(jobId, attempt = 0) {
   if (state.stream) state.stream.close();
-  const stream = new EventSource(`/api/jobs/${jobId}/events`);
+  const stream = new EventSource('/api/jobs/' + jobId + '/events');
   state.stream = stream;
   state.jobId = jobId;
 
-  let counts = { sent: 0, failed: 0, skipped: 0 };
   let finished = false;
 
   stream.onmessage = (event) => {
     let data;
     try { data = JSON.parse(event.data); } catch { return; }
+    const run = state.run;
 
     if (data.type === 'start') {
+      run.total = data.total;
+      run.campaign = data.campaign || '';
       addLine({ n: '—', tag: 'run', tagLabel: 'start', addr: plural(data.total, 'recipient'), note: data.campaign || 'untagged' });
+      ui.runAnnounce.textContent = 'Campaign started: ' + plural(data.total, 'recipient') + '.';
     } else if (data.type === 'progress') {
-      if (data.status === 'sent') counts.sent++;
-      if (data.status === 'failed') counts.failed++;
-      if (data.status === 'skip') counts.skipped++;
-      setCounts(counts);
+      if (data.status === 'sent') run.sent++;
+      if (data.status === 'failed') run.failed++;
+      if (data.status === 'skip') run.skipped++;
       addLine({
         n: String(data.index).padStart(2, '0'),
         tag: data.status,
-        tagLabel: data.status === 'skip' ? 'skip' : data.status,
+        tagLabel: data.status,
         addr: data.email,
         note: data.error || (data.reason === 'suppressed' ? 'suppressed' : ''),
+        bad: data.status === 'failed',
       });
     } else if (data.type === 'throttle') {
       addLine({
@@ -822,22 +1200,26 @@ function listen(jobId, attempt = 0) {
         tag: 'run',
         tagLabel: 'wait',
         addr: data.email,
-        note: `${data.scope === 'hour' ? 'hourly send ceiling' : `${data.scope} ceiling`} reached, resuming in about ${Math.ceil(data.waitMs / 60000)} min`,
+        note: (data.scope === 'hour' ? 'hourly send ceiling' : data.scope + ' ceiling') + ' reached, resuming in about ' + Math.ceil(data.waitMs / 60000) + ' min',
       });
     } else if (data.type === 'fatal') {
-      addLine({ n: '!!', tag: 'failed', tagLabel: 'halt', addr: data.email, note: data.error });
+      addLine({ n: '!!', tag: 'failed', tagLabel: 'halt', addr: data.email, note: data.error, bad: true });
     } else if (data.type === 'error') {
-      addLine({ n: '!!', tag: 'failed', tagLabel: 'error', addr: '', note: data.error });
+      addLine({ n: '!!', tag: 'failed', tagLabel: 'error', addr: data.error, bad: true });
     } else if (data.type === 'done') {
       finished = true;
-      state.jobId = null;
       const s = data.summary || {};
-      addSummary(s.error
-        ? `Stopped — ${s.error}`
-        : `${s.stopped ? 'Stopped' : 'Done'} — sent ${s.sent || 0}, failed ${s.failed || 0}, skipped ${s.skipped || 0}.${s.failed ? ' Failures are in the log.' : ''}`);
-      finishSend(s);
+      const text = s.error
+        ? 'Stopped — ' + s.error
+        : (s.stopped ? 'Stopped' : 'Done') + ' — sent ' + (s.sent || 0) + ', failed ' + (s.failed || 0) + ', skipped ' + (s.skipped || 0) + '.' + (s.failed ? ' Failures are in the log.' : '');
+      addSummary(text);
+      run.label = text;
+      setRunState(s.error ? 'bad' : s.stopped ? 'warn' : 'ok', s.error ? 'Failed' : s.stopped ? 'Stopped' : 'Finished');
+      ui.runAnnounce.textContent = text;
       stream.close();
+      finishSend(s);
     }
+    renderRun();
   };
 
   stream.onerror = async () => {
@@ -859,169 +1241,163 @@ function listen(jobId, attempt = 0) {
     }
 
     unlockControls();
+    setRunState('bad', 'Disconnected');
     toast('Lost the progress stream — check the send log before re-running.', 'bad');
   };
-}
-
-function unlockControls() {
-  state.sending = false;
-  state.jobId = null;
-  el.testBtn.disabled = false;
-  el.verifyBtn.disabled = false;
-  el.cancelBtn.hidden = true;
-  if (state.lastPreview) {
-    setText(el.sendBtn, state.lastPreview.willSend ? `Send ${plural(state.lastPreview.willSend, 'message')}` : 'Nothing left to send');
-    el.sendBtn.disabled = state.lastPreview.willSend === 0;
-  }
 }
 
 async function finishSend(summary) {
   unlockControls();
   if (summary.error) toast(summary.error, 'bad');
-  else if (summary.failed) toast(`${summary.failed} message${summary.failed === 1 ? '' : 's'} failed — see the ledger and log.`, 'bad');
-  else if (summary.stopped) toast(`Stopped after ${plural(summary.sent || 0, 'message')} sent.`, 'ok');
-  else toast(`Campaign finished: ${plural(summary.sent || 0, 'message')} sent.`, 'ok');
+  else if (summary.failed) toast(plural(summary.failed, 'message') + ' failed — see the log on the Send page.', 'bad');
+  else if (summary.stopped) toast('Stopped after ' + plural(summary.sent || 0, 'message') + ' sent.', 'ok');
+  else toast('Campaign finished: ' + plural(summary.sent || 0, 'message') + ' sent.', 'ok');
 
   try {
     await loadState();
     await refreshPreview({ resetIndex: true });
     await loadRoster();
+    await loadQueue();
   } catch { /* the summary above is enough */ }
 }
 
 async function cancelSend() {
   if (!state.jobId) return;
-  el.cancelBtn.disabled = true;
-  el.cancelBtn.textContent = 'Stopping…';
+  ui.cancelBtn.disabled = true;
+  ui.cancelBtn.textContent = 'Stopping…';
   try {
-    await api(`/api/jobs/${state.jobId}/cancel`, {});
+    await api('/api/jobs/' + state.jobId + '/cancel', {});
   } catch (err) {
     toast(err.message, 'bad');
-    el.cancelBtn.disabled = false;
-    el.cancelBtn.textContent = 'Stop after this one';
+    ui.cancelBtn.disabled = false;
+    ui.cancelBtn.textContent = 'Stop after this one';
   }
 }
 
-// ── Scheduling ───────────────────────────────────────────────────────
-const pad2 = (n) => String(n).padStart(2, '0');
-
-function toLocalInput(date) {
-  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}T${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+// ── Schedule ─────────────────────────────────────────────────────────
+function renderScheduleSummary() {
+  const p = state.lastPreview;
+  const others = p ? p.willSend - 1 : 0;
+  setText(ui.scheduleSummary, p
+    ? plural(p.willSend, 'message') + ' to ' + p.to + (others > 0 ? ' and ' + others + ' more' : '') + ' — “' + p.subject + '”.'
+    : 'Choose a template, subject and recipients first. The campaign you are drafting is what gets scheduled.');
 }
 
-function formatWhen(iso) {
-  return new Date(iso).toLocaleString(undefined, {
-    weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-  });
+function prepareScheduleForm() {
+  setText(ui.scheduleZone, 'Times are ' + Intl.DateTimeFormat().resolvedOptions().timeZone + '.');
+  const current = ui.scheduleAt.value ? Date.parse(ui.scheduleAt.value) : NaN;
+  if (!Number.isFinite(current) || current < Date.now()) {
+    ui.scheduleAt.value = toLocalInput(new Date(Date.now() + 60 * 60 * 1000));
+  }
+  renderScheduleSummary();
 }
 
-function relative(iso) {
-  const diff = Date.parse(iso) - Date.now();
-  if (diff <= 0) return 'due now';
-  const minutes = Math.round(diff / 60000);
-  if (minutes < 60) return `in ${minutes} min`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 24) return `in ${hours} h`;
-  return `in ${Math.round(hours / 24)} d`;
+function setScheduleStatus(text, kind = '') {
+  setText(ui.scheduleStatus, text);
+  setClass(ui.scheduleStatus, 'is-bad', kind === 'bad');
+  setClass(ui.scheduleStatus, 'is-ok', kind === 'ok');
 }
+
+async function submitSchedule(event) {
+  event.preventDefault();
+  const when = ui.scheduleAt.value ? new Date(ui.scheduleAt.value) : null;
+  if (!when || Number.isNaN(when.getTime())) { setScheduleStatus('Pick a date and time.', 'bad'); return; }
+
+  ui.scheduleBtn.disabled = true;
+  setScheduleStatus('Scheduling…');
+  try {
+    const data = await api('/api/schedule', body({ at: when.toISOString(), delay: currentDelay() }));
+    setScheduleStatus('Scheduled for ' + formatWhen(when.toISOString()) + ' (' + plural(data.total, 'recipient') + ').', 'ok');
+    toast('Scheduled for ' + formatWhen(when.toISOString()) + '.', 'ok');
+    await loadQueue();
+  } catch (err) {
+    setScheduleStatus(err.message, 'bad');
+  } finally {
+    renderDraft();
+  }
+}
+
+const QUEUE_LABEL = { pending: 'scheduled' };
 
 async function loadQueue() {
   try {
     const data = await api('/api/schedule');
     state.queue = data.entries || [];
-    const active = state.queue.filter((e) => e.status === 'pending' || e.status === 'sending').length;
-    setText(el.queueCount, String(active));
-    el.queueCount.hidden = active === 0;
-    if (!el.queueModal.hidden) renderQueue();
+    setText(ui.queueError, '');
+    renderQueue();
+    setText(ui.scheduleGrace, data.graceMs
+      ? 'If Mailroom is not running at the scheduled time, a campaign up to ' + formatDuration(data.graceMs) + ' late still goes out. Later than that it is held here for you to decide.'
+      : '');
     return data;
-  } catch {
+  } catch (err) {
+    setText(ui.queueError, 'Could not load the schedule: ' + err.message);
     return null;
   }
 }
 
-function queueStatusLabel(status) {
-  return status === 'pending' ? 'scheduled' : status;
+function queueActive() {
+  return (state.queue || []).filter((e) => e.status === 'pending' || e.status === 'sending');
 }
 
 function renderQueue() {
-  // The poll re-renders every 15 s; rebuilding an unchanged list would drop
-  // hover and keyboard focus on its buttons each time.
-  const sig = JSON.stringify([state.queue, state.queue.map((e) => (e.status === 'pending' ? relative(e.at) : ''))]);
-  if (sig === state.queueSig) return;
-  state.queueSig = sig;
+  const entries = state.queue || [];
+  const active = queueActive();
+  setText(ui.navScheduleBadge, String(active.length));
+  setHidden(ui.navScheduleBadge, active.length === 0);
+  setText(ui.statScheduled, active.length);
+  const next = active.find((e) => e.status === 'pending');
+  setText(ui.statScheduledSub, next ? 'Next ' + formatWhen(next.at) : 'Nothing queued');
+  setText(ui.queueTotal, entries.length ? active.length + ' active · ' + entries.length + ' total' : '');
+  setHidden(ui.queueEmpty, entries.length > 0);
 
-  el.queueList.replaceChildren();
-  el.queueEmpty.hidden = state.queue.length > 0;
+  reconcile(ui.queueList, entries, (e) => e.id,
+    (e) => h('li', {},
+      h('div', {},
+        h('div', { class: 'queue__line' }, h('span', { class: 'queue__when' }), h('span', { class: 'tag' }), h('span', { class: 'queue__meta' })),
+        h('div', { class: 'queue__meta' }),
+        h('div', { class: 'queue__note' })),
+      h('div', { class: 'queue__actions' })),
+    (li, e) => {
+      const [main, actions] = li.children;
+      const [line, meta, note] = main.children;
+      setText(line.children[0], formatWhen(e.at));
+      setText(line.children[1], QUEUE_LABEL[e.status] || e.status);
+      setAttr(line.children[1], 'class', 'tag tag--' + e.status);
+      setText(line.children[2], e.status === 'pending' ? relative(e.at) : '');
+      setText(meta, [e.campaign || 'No campaign name', plural(e.recipients, 'recipient'), e.subject].filter(Boolean).join(' · '));
+      const text = e.error || (e.result ? 'Sent ' + e.result.sent + ', failed ' + e.result.failed + ', skipped ' + e.result.skipped : '');
+      setText(note, text);
+      setHidden(note, !text);
+      setClass(note, 'is-bad', Boolean(e.error));
 
-  for (const entry of state.queue) {
-    const li = document.createElement('li');
-
-    const content = document.createElement('div');
-    content.className = 'queue__content';
-
-    const line = document.createElement('div');
-    line.className = 'queue__line';
-    const when = document.createElement('span');
-    when.className = 'queue__when';
-    when.textContent = formatWhen(entry.at);
-    const chip = document.createElement('span');
-    chip.className = `tag-status tag-status--${entry.status}`;
-    chip.textContent = queueStatusLabel(entry.status);
-    line.append(when, chip);
-
-    if (entry.status === 'pending') {
-      const rel = document.createElement('span');
-      rel.className = 'queue__meta';
-      rel.textContent = relative(entry.at);
-      line.append(rel);
-    }
-
-    const meta = document.createElement('div');
-    meta.className = 'queue__meta';
-    meta.textContent = [
-      entry.campaign || 'no campaign',
-      plural(entry.recipients, 'recipient'),
-      entry.subject,
-    ].filter(Boolean).join(' · ');
-
-    content.append(line, meta);
-
-    const note = entry.error
-      || (entry.result ? `sent ${entry.result.sent}, failed ${entry.result.failed}, skipped ${entry.result.skipped}` : '');
-    if (note) {
-      const noteEl = document.createElement('div');
-      noteEl.className = entry.error ? 'queue__error' : 'queue__meta';
-      noteEl.textContent = note;
-      content.append(noteEl);
-    }
-
-    const actions = document.createElement('div');
-    actions.className = 'queue__actions';
-
-    if (entry.status === 'pending' || entry.status === 'missed') {
-      const run = document.createElement('button');
-      run.type = 'button';
-      run.className = 'btn';
-      run.textContent = 'Send now';
-      run.addEventListener('click', () => runScheduled(entry.id));
-      actions.append(run);
-
-      const cancel = document.createElement('button');
-      cancel.type = 'button';
-      cancel.className = 'btn btn--quiet';
-      cancel.textContent = entry.status === 'missed' ? 'Discard' : 'Cancel';
-      cancel.addEventListener('click', () => cancelScheduled(entry.id));
-      actions.append(cancel);
-    }
-
-    li.append(content, actions);
-    el.queueList.append(li);
-  }
+      // Buttons depend only on status; rebuild them when it changes.
+      if (li.dataset.status === e.status) return;
+      li.dataset.status = e.status;
+      actions.replaceChildren();
+      if (e.status === 'pending' || e.status === 'missed') {
+        actions.append(
+          h('button', { type: 'button', class: 'btn btn--sm', dataset: { action: 'run' } }, 'Send now'),
+          h('button', { type: 'button', class: 'btn btn--sm btn--danger-quiet', dataset: { action: 'cancel' } }, e.status === 'missed' ? 'Discard' : 'Cancel'));
+      }
+    });
 }
 
 async function runScheduled(id) {
+  const entry = state.queue.find((e) => e.id === id);
+  if (!entry) return;
+  const ok = await confirmDialog({
+    title: 'Send this campaign now?',
+    body: [
+      h('p', { class: 'dialog__count' }, h('strong', {}, String(entry.recipients)), entry.recipients === 1 ? 'recipient will get this message' : 'recipients will get this message'),
+      h('p', {}, '“' + entry.subject + '” was scheduled for ' + formatWhen(entry.at) + '. Sending now skips the wait and mails real inboxes immediately.'),
+    ],
+    confirmLabel: 'Send ' + plural(entry.recipients, 'message') + ' now',
+    danger: true,
+    check: 'I understand these messages go out immediately to real inboxes.',
+  });
+  if (!ok) return;
   try {
-    await api(`/api/schedule/${id}/run`, {});
+    await api('/api/schedule/' + id + '/run', {});
     toast('Sending now.', 'ok');
     await loadQueue();
     await attachWhenStarted();
@@ -1039,13 +1415,23 @@ async function attachWhenStarted(attempts = 16) {
       listen(active.jobId);
       return;
     }
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    await sleep(250);
   }
 }
 
 async function cancelScheduled(id) {
+  const entry = state.queue.find((e) => e.id === id);
+  if (!entry) return;
+  const ok = await confirmDialog({
+    title: entry.status === 'missed' ? 'Discard this campaign?' : 'Cancel this scheduled campaign?',
+    body: h('p', {}, '“' + entry.subject + '” to ' + plural(entry.recipients, 'recipient') + ' will not be sent.'),
+    confirmLabel: entry.status === 'missed' ? 'Discard it' : 'Cancel campaign',
+    cancelLabel: 'Keep it',
+    danger: true,
+  });
+  if (!ok) return;
   try {
-    await api(`/api/schedule/${id}/cancel`, {});
+    await api('/api/schedule/' + id + '/cancel', {});
     toast('Scheduled campaign removed.');
     await loadQueue();
   } catch (err) {
@@ -1053,216 +1439,376 @@ async function cancelScheduled(id) {
   }
 }
 
-function openSchedule() {
-  const preview = state.lastPreview;
-  if (!preview) return;
+// ── Suppression list ─────────────────────────────────────────────────
+const SUPPRESS_SHOWN = 300;
 
-  const others = preview.willSend - 1;
-  el.scheduleSummary.textContent = `${plural(preview.willSend, 'message')} to ${preview.to}${others > 0 ? ` and ${others} more` : ''} — “${preview.subject}”.`;
-  el.scheduleAt.value = toLocalInput(new Date(Date.now() + 60 * 60 * 1000));
-  el.scheduleZone.textContent = `Times are ${Intl.DateTimeFormat().resolvedOptions().timeZone}.`;
-  el.scheduleStatus.textContent = '';
-  el.scheduleStatus.className = 'settings__status';
-  el.scheduleModal.hidden = false;
-  el.scheduleAt.focus();
-}
-
-function closeSchedule() {
-  el.scheduleModal.hidden = true;
-}
-
-async function submitSchedule() {
-  const when = el.scheduleAt.value ? new Date(el.scheduleAt.value) : null;
-  if (!when || Number.isNaN(when.getTime())) {
-    el.scheduleStatus.textContent = 'Pick a date and time';
-    el.scheduleStatus.className = 'settings__status is-bad';
-    return;
-  }
-
-  el.scheduleConfirm.disabled = true;
-  el.scheduleStatus.textContent = 'Scheduling…';
-  el.scheduleStatus.className = 'settings__status';
+async function loadSuppression() {
   try {
-    await api('/api/schedule', body({ at: when.toISOString(), delay: currentDelay() }));
-    closeSchedule();
-    toast(`Scheduled for ${formatWhen(when.toISOString())}.`, 'ok');
-    await loadQueue();
+    const data = await api('/api/suppression');
+    state.suppressed = data;
+    renderSuppression();
   } catch (err) {
-    el.scheduleStatus.textContent = err.message;
-    el.scheduleStatus.className = 'settings__status is-bad';
+    setText(ui.suppressNote, 'Could not load the list: ' + err.message);
+  }
+}
+
+function renderSuppression() {
+  const data = state.suppressed;
+  if (!data) return;
+  const query = ui.suppressSearch.value.trim().toLowerCase();
+  const matches = query ? data.emails.filter((e) => e.includes(query)) : data.emails;
+  const shown = matches.slice(0, SUPPRESS_SHOWN);
+
+  setText(ui.suppressCount, plural(data.count, 'address', 'addresses'));
+  reconcile(ui.suppressList, shown, (email) => email, (email) => h('li'), (li, email) => setText(li, email));
+  setHidden(ui.suppressEmpty, shown.length > 0);
+  setText(ui.suppressEmptyTitle, data.count ? 'No matches' : 'No suppressed addresses');
+  setText(ui.suppressEmptyText, data.count ? 'Nothing on the list matches “' + ui.suppressSearch.value.trim() + '”.' : 'Addresses you add, or that unsubscribe, appear here.');
+  setText(ui.suppressNote, (matches.length > shown.length ? 'Showing the first ' + shown.length + ' of ' + matches.length + '. Filter to narrow it down. ' : '')
+    + 'To remove an address, edit ' + data.path + '.');
+}
+
+async function submitSuppress(event) {
+  event.preventDefault();
+  const emails = ui.suppressEmails.value.trim();
+  if (!emails) { ui.suppressEmails.focus(); setSuppressStatus('Enter at least one address.', 'bad'); return; }
+
+  ui.suppressBtn.disabled = true;
+  setSuppressStatus('Adding…');
+  try {
+    const data = await api('/api/suppress', { emails, reason: ui.suppressReason.value });
+    const parts = [];
+    if (data.added.length) parts.push(plural(data.added.length, 'address', 'addresses') + ' added');
+    if (data.already.length) parts.push(data.already.length + ' already on the list');
+    if (data.invalid.length) parts.push('not valid: ' + data.invalid.join(', '));
+    setSuppressStatus(parts.join(' · '), data.added.length ? 'ok' : data.invalid.length ? 'bad' : '');
+    if (data.added.length) {
+      toast(plural(data.added.length, 'address', 'addresses') + ' added to the suppression list.', 'ok');
+      ui.suppressEmails.value = '';
+    }
+    await loadSuppression();
+    await loadState();
+    refreshPreview();
+  } catch (err) {
+    setSuppressStatus(err.message, 'bad');
   } finally {
-    el.scheduleConfirm.disabled = false;
+    ui.suppressBtn.disabled = false;
   }
 }
 
-// ── Merge-field chips ────────────────────────────────────────────────
-function buildTokens() {
-  el.tokens.innerHTML = '';
-  for (const name of ['name', 'company', 'email']) {
-    const chip = document.createElement('button');
-    chip.type = 'button';
-    chip.className = 'token';
-    chip.textContent = `{{${name}}}`;
-    chip.addEventListener('click', () => insertToken(`{{${name}}}`));
-    el.tokens.append(chip);
+function setSuppressStatus(text, kind = '') {
+  setText(ui.suppressStatus, text);
+  setClass(ui.suppressStatus, 'is-ok', kind === 'ok');
+  setClass(ui.suppressStatus, 'is-bad', kind === 'bad');
+}
+
+// ── Settings ─────────────────────────────────────────────────────────
+async function loadSettingsForm() {
+  if (state.settingsDirty) return;
+  try {
+    const settings = await api('/api/settings');
+    if (state.settingsDirty) return;
+    ui.setHost.value = settings.host || '';
+    ui.setPort.value = settings.port || 465;
+    ui.setUser.value = settings.user || '';
+    ui.setFrom.value = settings.from || '';
+    ui.setPass.value = '';
+    ui.setPass.placeholder = settings.passwordSet ? 'Saved — leave blank to keep it' : '16 characters';
+    setText(ui.setPassHint, settings.passwordSet
+      ? 'A password is already saved. Leave blank unless you are changing it.'
+      : 'Gmail needs an App Password, not your login password.');
+  } catch (err) {
+    toast(err.message, 'bad');
   }
 }
 
-function insertToken(token) {
-  const input = el.subject;
-  const start = input.selectionStart ?? input.value.length;
-  const end = input.selectionEnd ?? input.value.length;
-  input.value = input.value.slice(0, start) + token + input.value.slice(end);
-  input.focus();
-  input.setSelectionRange(start + token.length, start + token.length);
-  store.set('subject', input.value);
-  refreshPreview();
-}
-
-// ── Events ───────────────────────────────────────────────────────────
-function debounce(fn, ms) {
-  let timer;
-  return (...args) => {
-    clearTimeout(timer);
-    timer = setTimeout(() => fn(...args), ms);
+function settingsPayload() {
+  return {
+    host: ui.setHost.value.trim(),
+    port: Number(ui.setPort.value) || undefined,
+    user: ui.setUser.value.trim(),
+    pass: ui.setPass.value,
+    from: ui.setFrom.value.trim(),
   };
 }
 
-el.verifyBtn.addEventListener('click', verify);
-el.queueBtn.addEventListener('click', async () => {
-  await loadQueue();
-  renderQueue();
-  el.queueModal.hidden = false;
-});
-el.queueClose.addEventListener('click', () => { el.queueModal.hidden = true; });
-el.queueModal.addEventListener('click', (event) => {
-  if (event.target === el.queueModal) el.queueModal.hidden = true;
-});
-
-el.scheduleBtn.addEventListener('click', openSchedule);
-el.scheduleCancel.addEventListener('click', closeSchedule);
-el.scheduleConfirm.addEventListener('click', submitSchedule);
-el.scheduleModal.addEventListener('click', (event) => {
-  if (event.target === el.scheduleModal) closeSchedule();
-});
-
-el.settingsBtn.addEventListener('click', () => openSettings());
-el.signOutBtn.addEventListener('click', signOut);
-el.settingsTestBtn.addEventListener('click', testSettings);
-el.settingsSaveBtn.addEventListener('click', saveSettings);
-el.settingsCancel.addEventListener('click', closeSettings);
-el.testBtn.addEventListener('click', sendTest);
-el.previewBtn.addEventListener('click', () => refreshPreview({ resetIndex: true }));
-el.prevBtn.addEventListener('click', () => { state.index--; refreshPreview(); });
-el.nextBtn.addEventListener('click', () => { state.index++; refreshPreview(); });
-el.sendBtn.addEventListener('click', openConfirm);
-el.modalCancel.addEventListener('click', closeConfirm);
-el.cancelBtn.addEventListener('click', cancelSend);
-
-el.modal.addEventListener('click', (event) => {
-  if (event.target === el.modal) closeConfirm();
-});
-
-el.settingsModal.addEventListener('click', (event) => {
-  if (event.target === el.settingsModal) closeSettings();
-});
-
-for (const input of [el.setHost, el.setPort, el.setUser, el.setPass, el.setFrom]) {
-  input.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') {
-      event.preventDefault();
-      saveSettings();
-    }
-  });
+function setSettingsStatus(text, kind = '') {
+  setText(ui.settingsStatus, text);
+  setClass(ui.settingsStatus, 'is-ok', kind === 'ok');
+  setClass(ui.settingsStatus, 'is-bad', kind === 'bad');
 }
 
-document.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape' && !el.modal.hidden) closeConfirm();
-  if (event.key === 'Escape' && !el.settingsModal.hidden) closeSettings();
-  if (event.key === 'Escape' && !el.scheduleModal.hidden) closeSchedule();
-  if (event.key === 'Escape' && !el.queueModal.hidden) el.queueModal.hidden = true;
-  if (event.key === 'Enter' && !el.scheduleModal.hidden) submitSchedule();
-  if (event.key === 'Enter' && !el.modal.hidden && !el.modalConfirm.disabled && document.activeElement === el.modalCheck) {
-    startSend();
+function settingsBusy(busy) {
+  ui.settingsTestBtn.disabled = busy;
+  ui.settingsSaveBtn.disabled = busy;
+}
+
+async function testSettings() {
+  settingsBusy(true);
+  setSettingsStatus('Connecting…');
+  try {
+    const data = await api('/api/settings/test', settingsPayload());
+    if (data.ok) {
+      setSettingsStatus('Connected to ' + data.smtp.host + ':' + data.smtp.port + ' as ' + (data.smtp.user || 'local') + '.', 'ok');
+    } else {
+      setSettingsStatus(data.error || 'Connection failed.', 'bad');
+    }
+  } catch (err) {
+    setSettingsStatus(err.message, 'bad');
+  } finally {
+    settingsBusy(false);
   }
+}
+
+async function saveSettings(event) {
+  event.preventDefault();
+  const firstRun = !state.setup.configured;
+  settingsBusy(true);
+  setSettingsStatus('Checking the connection…');
+  try {
+    const data = await api('/api/settings', settingsPayload());
+    if (!data.ok) {
+      setSettingsStatus(data.error || 'Those settings did not work.', 'bad');
+      return;
+    }
+    state.settingsDirty = false;
+    ui.setPass.value = '';
+    setSettingsStatus('Saved. Mailroom signed in successfully.', 'ok');
+    setConn('ok');
+    toast('Mailbox connected — settings saved.', 'ok');
+
+    await loadState();
+    await loadSettingsForm();
+    await refreshPreview({ resetIndex: true });
+    if (firstRun) go('compose');
+  } catch (err) {
+    setSettingsStatus(err.message, 'bad');
+  } finally {
+    settingsBusy(false);
+  }
+}
+
+async function signOut() {
+  try { await api('/api/logout', {}); } catch { /* already signed out */ }
+  window.location.replace('/login.html');
+}
+
+// ── Events ───────────────────────────────────────────────────────────
+window.addEventListener('hashchange', () => showRoute({ focus: true }));
+
+ui.nav.addEventListener('click', (event) => {
+  // Choosing the page you are on should still move focus to its heading.
+  const link = event.target.closest('a');
+  if (link && link.dataset.route === currentRoute().id) ui[currentRoute().heading].focus({ preventScroll: true });
 });
 
-el.modalCheck.addEventListener('change', () => {
-  el.modalConfirm.disabled = !el.modalCheck.checked;
+document.querySelector('.skip').addEventListener('click', (event) => {
+  event.preventDefault();
+  ui.main.focus();
 });
-el.modalConfirm.addEventListener('click', startSend);
 
-el.modeSaved.addEventListener('click', () => setMode('saved'));
-el.modePaste.addEventListener('click', () => setMode('paste', { focus: true }));
-el.saveCsvBtn.addEventListener('click', savePastedList);
+ui.retryBtn.addEventListener('click', () => { loadHealth(); refreshBackground(); });
 
-el.pasteBox.addEventListener('input', debounce(() => {
-  updatePasteCount();
-  refreshPreview({ resetIndex: true });
-}, 600));
+ui.verifyBtn.addEventListener('click', verify);
+ui.verifyBtn2.addEventListener('click', verify);
+ui.signOutBtn.addEventListener('click', signOut);
+ui.signOutBtn2.addEventListener('click', signOut);
 
-el.template.addEventListener('change', () => {
-  store.set('template', el.template.value);
+// Compose
+ui.template.addEventListener('change', () => {
+  store.set('template', ui.template.value);
   describeTemplate();
   refreshPreview({ resetIndex: true });
 });
+ui.subject.addEventListener('input', debounce(() => {
+  store.set('subject', ui.subject.value);
+  refreshPreview();
+}, 420));
+ui.campaign.addEventListener('input', () => {
+  store.set('campaign', ui.campaign.value);
+  renderDraft();
+  refreshForCampaign();
+});
+const refreshForCampaign = debounce(() => { refreshPreview(); loadRoster(); }, 450);
+ui.tokens.addEventListener('click', (event) => {
+  const chip = event.target.closest('[data-field]');
+  if (chip) insertToken('{{' + chip.dataset.field + '}}');
+});
+ui.previewBtn.addEventListener('click', () => refreshPreview({ resetIndex: true }));
+ui.prevBtn.addEventListener('click', () => { state.index--; refreshPreview(); });
+ui.nextBtn.addEventListener('click', () => { state.index++; refreshPreview(); });
+ui.composeForm.addEventListener('submit', (event) => event.preventDefault());
 
-el.csv.addEventListener('change', () => {
-  store.set('csv', el.csv.value);
+// Recipients
+ui.sourceTabs.addEventListener('click', (event) => {
+  const tab = event.target.closest('[role="tab"]');
+  if (tab) setTab(tab.dataset.tab);
+});
+ui.sourceTabs.addEventListener('keydown', (event) => {
+  const tabs = [...ui.sourceTabs.querySelectorAll('[role="tab"]')];
+  const at = tabs.indexOf(document.activeElement);
+  if (at === -1) return;
+  const next = { ArrowRight: (at + 1) % tabs.length, ArrowLeft: (at + tabs.length - 1) % tabs.length, Home: 0, End: tabs.length - 1 }[event.key];
+  if (next === undefined) return;
+  event.preventDefault();
+  setTab(tabs[next].dataset.tab, { focus: true });
+});
+ui.csv.addEventListener('change', () => {
+  store.set('csv', ui.csv.value);
   describeCsv();
   state.index = 0;
   refreshPreview({ resetIndex: true });
   loadRoster();
 });
-
-el.subject.addEventListener('input', debounce(() => {
-  store.set('subject', el.subject.value);
-  refreshPreview();
-}, 420));
-
-const refreshForCampaign = debounce(() => {
-  refreshPreview();
-  loadRoster();
-}, 450);
-
-el.campaign.addEventListener('input', () => {
-  store.set('campaign', el.campaign.value);
-  el.slipNo.textContent = el.campaign.value.trim() || 'no campaign';
-  refreshForCampaign();
-});
-
-el.limit.addEventListener('input', debounce(() => {
+ui.pasteBox.addEventListener('input', debounce(() => {
+  validatePaste();
+  refreshPreview({ resetIndex: true });
+}, 500));
+ui.saveCsvBtn.addEventListener('click', savePastedList);
+ui.limit.addEventListener('input', debounce(() => {
   refreshPreview({ resetIndex: true });
   loadRoster();
 }, 420));
-el.delay.addEventListener('change', () => store.set('delay', el.delay.value));
-el.testTo.addEventListener('input', () => store.set('test', el.testTo.value));
+ui.rosterList.addEventListener('click', (event) => {
+  const row = event.target.closest('.rrow');
+  if (!row || row.disabled) return;
+  state.index = Number(row.dataset.index);
+  markRosterCurrent();
+  refreshPreview();
+});
 
-// Restore fields saved from an earlier session, then load.
-el.subject.value = store.get('subject', el.subject.value);
-el.testTo.value = store.get('test', '');
-if (store.get('delay')) el.delay.value = store.get('delay');
-buildTokens();
-setMode(store.get('mode') === 'paste' ? 'paste' : 'saved', { refresh: false });
+ui.rosterList.addEventListener('keydown', (event) => {
+  const row = event.target.closest('.rrow');
+  if (!row) return;
+  const rows = [...ui.rosterList.querySelectorAll('.rrow')];
+  const at = rows.indexOf(row);
+  const next = { ArrowDown: at + 1, ArrowUp: at - 1, Home: 0, End: rows.length - 1 }[event.key];
+  if (next === undefined || !rows[next]) return;
+  event.preventDefault();
+  for (const other of rows) other.tabIndex = other === rows[next] ? 0 : -1;
+  rows[next].focus();
+});
 
-// The scheduler runs on the server; poll so the badge and queue stay honest
-// and progress from a scheduled send appears without a reload.
-setInterval(async () => {
+ui.fileInput.addEventListener('change', () => handleFile(ui.fileInput.files[0]));
+ui.uploadSaveBtn.addEventListener('click', saveUpload);
+for (const name of ['dragenter', 'dragover']) {
+  ui.dropzone.addEventListener(name, (event) => { event.preventDefault(); ui.dropzone.classList.add('is-over'); });
+}
+for (const name of ['dragleave', 'drop']) {
+  ui.dropzone.addEventListener(name, (event) => { event.preventDefault(); ui.dropzone.classList.remove('is-over'); });
+}
+ui.dropzone.addEventListener('drop', (event) => handleFile(event.dataTransfer?.files?.[0]));
+
+// Send
+ui.sendBtn.addEventListener('click', startSend);
+ui.testBtn.addEventListener('click', sendTest);
+ui.testTo.addEventListener('input', () => store.set('test', ui.testTo.value));
+ui.testTo.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') { event.preventDefault(); sendTest(); }
+});
+ui.delay.addEventListener('input', () => { ui.delay.dataset.touched = '1'; renderDraft(); });
+ui.delay.addEventListener('change', () => store.set('delay', ui.delay.value));
+ui.cancelBtn.addEventListener('click', cancelSend);
+
+// Schedule
+ui.scheduleForm.addEventListener('submit', submitSchedule);
+ui.queueList.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-action]');
+  if (!button) return;
+  const id = button.closest('li').dataset.key;
+  if (button.dataset.action === 'run') runScheduled(id);
+  else cancelScheduled(id);
+});
+
+// Suppression
+ui.suppressForm.addEventListener('submit', submitSuppress);
+ui.suppressSearch.addEventListener('input', debounce(renderSuppression, 150));
+
+// Settings
+ui.settingsForm.addEventListener('submit', saveSettings);
+ui.settingsForm.addEventListener('input', () => { state.settingsDirty = true; });
+ui.settingsTestBtn.addEventListener('click', testSettings);
+
+// Confirm dialog
+ui.confirmCheck.addEventListener('change', () => { ui.confirmOk.disabled = !ui.confirmCheck.checked; });
+ui.confirmCheck.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && ui.confirmCheck.checked) { event.preventDefault(); ui.confirmDialog.close('ok'); }
+});
+ui.confirmOk.addEventListener('click', () => ui.confirmDialog.close('ok'));
+ui.confirmCancel.addEventListener('click', () => ui.confirmDialog.close('cancel'));
+ui.confirmDialog.addEventListener('click', (event) => {
+  if (event.target === ui.confirmDialog) ui.confirmDialog.close('cancel');
+});
+ui.confirmDialog.addEventListener('close', () => {
+  const resolve = confirmResolve;
+  confirmResolve = null;
+  resolve?.(ui.confirmDialog.returnValue === 'ok');
+});
+
+// ── Background refresh ───────────────────────────────────────────────
+// The scheduler runs on the server; poll so counts, the queue and progress
+// from a scheduled send stay honest without a reload. Every poll patches in
+// place, so an idle page does not move.
+async function refreshBackground() {
+  try {
+    await loadState();
+    state.online = true;
+    setHidden(ui.offlineBar, true);
+  } catch {
+    state.online = false;
+    setHidden(ui.offlineBar, false);
+    return;
+  }
   await loadQueue();
-  if (!state.sending) await resumeActiveJob({ quiet: true });
-}, 15000);
+  if (currentRoute().id === 'suppression') await loadSuppression();
+  if (currentRoute().id === 'settings' || currentRoute().id === 'overview') await loadHealth();
+}
 
-loadState()
-  .then(async () => {
-    await refreshPreview({ resetIndex: true });
-    if (state.mode === 'saved') await loadRoster();
-    await loadQueue();
+let tick = 0;
+setInterval(async () => {
+  if (document.hidden) return;
+  tick++;
+  if (!state.sending) await resumeActiveJob({ quiet: true });
+  if (tick % 3 === 0) await refreshBackground();
+}, 5000);
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && state.loaded) { resumeActiveJob({ quiet: true }); refreshBackground(); }
+});
+
+// ── Boot ─────────────────────────────────────────────────────────────
+async function boot() {
+  // Restore the draft from an earlier session before anything renders.
+  ui.subject.value = store.get('subject', '');
+  ui.testTo.value = store.get('test', '');
+  if (store.get('delay')) ui.delay.value = store.get('delay');
+  state.mode = store.get('mode') === 'paste' ? 'paste' : 'saved';
+  state.tab = state.mode;
+  setTab(state.tab, { quiet: true });
+  showRoute();
+
+  try {
+    const data = await loadState();
+    state.loaded = true;
+    if (!data.setup.configured && !window.location.hash) {
+      history.replaceState(null, '', '#/settings');
+      showRoute();
+    }
+    renderTokens();
+    await Promise.all([
+      state.mode === 'saved' ? loadRoster() : validatePaste(),
+      refreshPreview({ resetIndex: true }),
+      loadQueue(),
+      loadHealth(),
+    ]);
     await resumeActiveJob({ quiet: true });
-    if (!state.setup.configured) openSettings({ firstRun: true });
-  })
-  .catch((err) => {
-    el.proofEmpty.hidden = false;
-    el.proofEmpty.textContent = `Could not reach the local server: ${err.message}`;
-    toast('Could not reach the local server. Is `npm run gui` still running?', 'bad');
-  })
-  .finally(() => document.body.classList.remove('is-loading'));
+  } catch (err) {
+    setText(ui.offlineText, 'Could not reach the Mailroom server: ' + err.message);
+    setHidden(ui.offlineBar, false);
+    toast('Could not reach the local server. Is it still running?', 'bad');
+  } finally {
+    document.body.classList.remove('is-loading');
+  }
+}
+
+boot();

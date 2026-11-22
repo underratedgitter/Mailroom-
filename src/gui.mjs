@@ -37,7 +37,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { randomUUID, randomBytes } from 'node:crypto';
 import { hashPassword, verifyPassword, parsePasswordHash } from './lib/auth.mjs';
-import { configIssue } from './lib/mailer.mjs';
+import { configIssue, unsubscribeUrlIssue, bareAddress } from './lib/mailer.mjs';
 import { loadConfig, saveConfig, resolveConfigPath, smtpFileValues, assertConfig } from './lib/config.mjs';
 import { readFileSync, writeFileSync, renameSync, rmSync, existsSync, readdirSync, statSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import { dirname, extname, join, resolve, sep } from 'node:path';
@@ -454,12 +454,23 @@ function delayFrom(value, fallback = 4000) {
   return Math.max(0, Math.min(10 * 60 * 1000, Math.floor(n)));
 }
 
+/** true is implicit TLS, false is STARTTLS; unspecified follows the saved mode, else the port. */
+function secureFrom(value, port) {
+  if (value === undefined) return resolveSmtpConfig({ ...process.env, SMTP_PORT: String(port) }).secure;
+  if (typeof value === 'boolean') return value;
+  if (value === 'true' || value === 'false') return value === 'true';
+  throw new Error('Invalid TLS mode: secure must be true (implicit TLS) or false (STARTTLS)');
+}
+
+/** A text setting from the form: not sent keeps what is saved, empty clears it. */
+const textSetting = (value, saved) => (value === undefined ? saved : String(value ?? '').trim());
+
 /** SMTP settings from a settings form, falling back to what is saved. */
 function smtpConfigFrom(body) {
   const current = resolveSmtpConfig();
   const host = String(body.host ?? current.host).trim();
   const port = Number(body.port ?? current.port) || 465;
-  const secure = body.secure === undefined ? port === 465 : Boolean(body.secure);
+  const secure = secureFrom(body.secure, port);
   const user = String(body.user ?? current.user).trim();
   const supplied = body.pass === undefined || body.pass === '' ? current.pass : String(body.pass);
   const pass = supplied.replace(/\s+/g, '');
@@ -474,9 +485,27 @@ function smtpConfigFrom(body) {
     user,
     pass,
     from,
+    replyTo: textSetting(body.replyTo, current.replyTo),
+    unsubscribeUrl: textSetting(body.unsubscribeUrl, current.unsubscribeUrl),
+    maxPerHour: textSetting(body.maxPerHour, process.env.MAX_PER_HOUR ?? ''),
     isLocal,
     configured: Boolean((user && pass) || isLocal),
   };
+}
+
+/** Why the optional delivery settings cannot be saved, or null. */
+function deliverySettingsIssue(cfg) {
+  if (cfg.replyTo && !emailRe.test(bareAddress(cfg.replyTo))) {
+    return 'Reply-To must be an email address such as help@example.com or Help <help@example.com>';
+  }
+  const url = unsubscribeUrlIssue(cfg.unsubscribeUrl);
+  if (url) return url;
+  try {
+    rateLimitsFromEnv({ MAX_PER_HOUR: cfg.maxPerHour });
+  } catch (err) {
+    return err.message;
+  }
+  return null;
 }
 
 function smtpState() {
@@ -487,6 +516,9 @@ function smtpState() {
     secure: cfg.secure,
     user: cfg.user,
     from: cfg.from,
+    replyTo: cfg.replyTo,
+    unsubscribeUrl: cfg.unsubscribeUrl,
+    maxPerHour: process.env.MAX_PER_HOUR ?? '',
     configured: cfg.configured,
     passwordSet: Boolean(cfg.pass),
   };
@@ -1056,6 +1088,9 @@ async function route(req, res) {
       secure: cfg.secure,
       user: cfg.user,
       from: cfg.from,
+      replyTo: cfg.replyTo,
+      unsubscribeUrl: cfg.unsubscribeUrl,
+      maxPerHour: process.env.MAX_PER_HOUR ?? '',
       passwordSet: Boolean(cfg.pass),
       configured: cfg.configured,
       configPath: rel(configFile.path),
@@ -1084,9 +1119,11 @@ async function route(req, res) {
     if (!cfg.from) return fail(res, 400, 'A From address is required');
     if (!cfg.configured) return fail(res, 400, 'Those settings are incomplete');
     // Each value becomes one line of the config file; a line break would add keys.
-    if ([cfg.host, cfg.user, cfg.from].some((value) => /[\r\n\0]/.test(value))) {
+    if ([cfg.host, cfg.user, cfg.from, cfg.replyTo, cfg.unsubscribeUrl, cfg.maxPerHour].some((value) => /[\r\n\0]/.test(value))) {
       return fail(res, 400, 'Settings cannot contain line breaks');
     }
+    const delivery = deliverySettingsIssue(cfg);
+    if (delivery) return fail(res, 400, delivery);
 
     let verified = false;
     let verifyError = null;

@@ -1519,8 +1519,12 @@ async function loadSettingsForm() {
     if (state.settingsDirty) return;
     ui.setHost.value = settings.host || '';
     ui.setPort.value = settings.port || 465;
+    ui.setSecure.value = String(Boolean(settings.secure));
     ui.setUser.value = settings.user || '';
     ui.setFrom.value = settings.from || '';
+    ui.setReplyTo.value = settings.replyTo || '';
+    ui.setUnsubUrl.value = settings.unsubscribeUrl || '';
+    ui.setMaxPerHour.value = settings.maxPerHour || '';
     ui.setPass.value = '';
     ui.setPass.placeholder = settings.passwordSet ? 'Saved — leave blank to keep it' : '16 characters';
     setText(ui.setPassHint, settings.passwordSet
@@ -1535,9 +1539,13 @@ function settingsPayload() {
   return {
     host: ui.setHost.value.trim(),
     port: Number(ui.setPort.value) || undefined,
+    secure: ui.setSecure.value === 'true',
     user: ui.setUser.value.trim(),
     pass: ui.setPass.value,
     from: ui.setFrom.value.trim(),
+    replyTo: ui.setReplyTo.value.trim(),
+    unsubscribeUrl: ui.setUnsubUrl.value.trim(),
+    maxPerHour: ui.setMaxPerHour.value.trim(),
   };
 }
 
@@ -1736,6 +1744,12 @@ ui.suppressSearch.addEventListener('input', debounce(renderSuppression, 150));
 // Settings
 ui.settingsForm.addEventListener('submit', saveSettings);
 ui.settingsForm.addEventListener('input', () => { state.settingsDirty = true; });
+// The two common ports each imply a mode; pick it so the selector starts right.
+ui.setPort.addEventListener('change', () => {
+  const port = Number(ui.setPort.value);
+  if (port === 465) ui.setSecure.value = 'true';
+  else if (port === 587 || port === 25) ui.setSecure.value = 'false';
+});
 ui.settingsTestBtn.addEventListener('click', testSettings);
 
 // Confirm dialog

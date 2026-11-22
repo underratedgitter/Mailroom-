@@ -335,3 +335,71 @@ test('a line break in a settings field cannot add keys to the config file', asyn
     : '';
   assert.doesNotMatch(saved, /attacker\.example/);
 });
+
+test('settings persist the TLS mode the page chooses, and keep it when it is not sent', async (t) => {
+  const server = await startServer();
+  t.after(server.stop);
+  const save = (body) => post(server.base, '/api/settings', {
+    host: '127.0.0.1', port: 2525, user: 'desk@local.test', pass: 'x', from: 'Desk <desk@local.test>', test: false, ...body,
+  });
+  const fileText = () => readFileSync(join(server.workDir, 'config.env'), 'utf8');
+
+  // Nothing saved and no mode sent: the port decides (465 is implicit TLS) and the guess is written down.
+  assert.equal((await save({ port: 465 })).status, 200);
+  assert.match(fileText(), /^SMTP_SECURE=true$/m);
+
+  assert.equal((await save({ secure: false })).status, 200);
+  assert.match(fileText(), /^SMTP_SECURE=false$/m);
+  assert.equal((await get(server.base, '/api/settings')).data.secure, false);
+
+  assert.equal((await save({ secure: true })).status, 200);
+  assert.match(fileText(), /^SMTP_SECURE=true$/m);
+  assert.equal((await get(server.base, '/api/settings')).data.secure, true);
+
+  // A mode that is not sent keeps the saved one, even if the port alone would suggest otherwise.
+  assert.equal((await save({ port: 587 })).status, 200);
+  assert.match(fileText(), /^SMTP_SECURE=true$/m);
+
+  const bad = await save({ secure: 'sometimes' });
+  assert.equal(bad.status, 400);
+  assert.match(bad.data.error, /TLS mode/);
+});
+
+test('settings save, validate and clear the reply-to, unsubscribe URL and hourly ceiling', async (t) => {
+  const server = await startServer();
+  t.after(server.stop);
+  const save = (body) => post(server.base, '/api/settings', {
+    host: '127.0.0.1', port: 2525, user: 'desk@local.test', pass: 'x', from: 'Desk <desk@local.test>', test: false, ...body,
+  });
+  const configPath = join(server.workDir, 'config.env');
+  const fileText = () => (existsSync(configPath) ? readFileSync(configPath, 'utf8') : '');
+
+  const ok = await save({ replyTo: 'Help <help@example.test>', unsubscribeUrl: 'https://example.test/u?e={email}', maxPerHour: '120' });
+  assert.equal(ok.status, 200, JSON.stringify(ok.data));
+  assert.match(fileText(), /^EMAIL_REPLY_TO="Help <help@example\.test>"$/m);
+  assert.match(fileText(), /^UNSUBSCRIBE_URL=\S+u\?e=\{email\}$/m);
+  assert.match(fileText(), /^MAX_PER_HOUR=120$/m);
+  const shown = (await get(server.base, '/api/settings')).data;
+  assert.deepEqual([shown.replyTo, shown.unsubscribeUrl, shown.maxPerHour], ['Help <help@example.test>', 'https://example.test/u?e={email}', '120']);
+
+  // Fields that are not sent are left alone; an empty one clears the setting.
+  assert.equal((await save({})).status, 200);
+  assert.match(fileText(), /^MAX_PER_HOUR=120$/m);
+  assert.equal((await save({ replyTo: '', unsubscribeUrl: '', maxPerHour: '' })).status, 200);
+  assert.doesNotMatch(fileText(), /EMAIL_REPLY_TO|UNSUBSCRIBE_URL|MAX_PER_HOUR/);
+
+  const refused = [
+    [{ unsubscribeUrl: 'http://example.test/u' }, /UNSUBSCRIBE_URL must be an https:\/\/ URL/],
+    [{ replyTo: 'not an address' }, /Reply-To/],
+    [{ maxPerHour: 'lots' }, /MAX_PER_HOUR must be a whole number/],
+    [{ replyTo: 'help@example.test\nSMTP_HOST=attacker.example' }, /line breaks/],
+    [{ unsubscribeUrl: 'https://example.test/u\nSMTP_HOST=attacker.example' }, /line breaks/],
+    [{ maxPerHour: '5\nSMTP_HOST=attacker.example' }, /line breaks/],
+  ];
+  for (const [body, message] of refused) {
+    const res = await save(body);
+    assert.equal(res.status, 400, JSON.stringify(body));
+    assert.match(res.data.error, message);
+  }
+  assert.doesNotMatch(fileText(), /attacker\.example/);
+});

@@ -63,15 +63,20 @@ export function resolveSmtpConfig(env = process.env) {
   };
 }
 
+/** Why an UNSUBSCRIBE_URL cannot be used, or null (empty means none). */
+export function unsubscribeUrlIssue(url) {
+  if (url && !/^https:\/\/[^\s<>]+$/i.test(url)) {
+    return 'UNSUBSCRIBE_URL must be an https:// URL with no spaces (RFC 8058 one-click needs HTTPS).';
+  }
+  return null;
+}
+
 /** Why this configuration cannot send compliant mail, or null when it can. */
 export function configIssue(cfg) {
   if (!addressDomain(cfg.from)) {
     return 'EMAIL_FROM must be a full address such as news@example.com: Message-ID and unsubscribe headers are built from its domain.';
   }
-  if (cfg.unsubscribeUrl && !/^https:\/\/[^\s<>]+$/i.test(cfg.unsubscribeUrl)) {
-    return 'UNSUBSCRIBE_URL must be an https:// URL with no spaces (RFC 8058 one-click needs HTTPS).';
-  }
-  return null;
+  return unsubscribeUrlIssue(cfg.unsubscribeUrl);
 }
 
 /**

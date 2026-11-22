@@ -175,6 +175,16 @@ status, counts, recent campaigns), **Compose**, **Recipients**, **Send**,
 **Schedule**, **Suppression** and **Settings**. It follows your light or dark
 system theme and works on a phone-sized screen.
 
+**Settings** — the mailbox (host, port, app password, From line), the
+**connection security** (implicit TLS, `SMTP_SECURE=true`, usually port 465, or
+STARTTLS, `SMTP_SECURE=false`, usually 587 or 25; the page picks one when you
+type 465 or 587 and writes the choice to the settings file), and three optional
+delivery settings: Reply-To (`EMAIL_REPLY_TO`), an https unsubscribe link
+(`UNSUBSCRIBE_URL`, `{email}` replaced) and a messages-per-hour ceiling
+(`MAX_PER_HOUR`). They are validated like the environment variables (a line break,
+an `http://` unsubscribe URL or a non-numeric ceiling is refused) and a blank
+field removes the setting.
+
 **Compose** — every `templates/*.html` file is offered as a template. A folder
 next to it named `<template>-assets/` (for example, `bcci-connect-v2-assets/`) is
 picked up automatically and its images attached inline with `cid:` (Gmail blocks

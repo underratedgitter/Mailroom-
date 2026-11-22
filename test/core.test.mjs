@@ -753,3 +753,11 @@ test('the default log and suppression paths belong to the install, not the worki
     rmSync(elsewhere, { recursive: true, force: true });
   }
 });
+
+test('parseCsv refuses an unclosed quote instead of swallowing the rows after it', () => {
+  const csv = 'email,name\na@b.co,Ann\nb@b.co,"Bob\nc@b.co,Cy\nd@b.co,Di\n';
+  assert.throws(() => parseCsv(csv), /Unclosed quote starting on line 3/);
+  assert.throws(() => parseRecipients(csv), /Unclosed quote starting on line 3/);
+  // A quote that closes after spanning lines is fine.
+  assert.equal(parseCsv('email,note\na@b.co,"one\ntwo"\nb@b.co,x\n').length, 2);
+});

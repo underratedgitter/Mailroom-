@@ -1376,7 +1376,7 @@ function handleRequest(req, res) {
       res.end();
       return;
     }
-    const code = err.status || (/not allowed|not found|required|invalid|no valid|no data rows|expected|too long/i.test(err.message) ? 400 : 500);
+    const code = err.status || (/not allowed|not found|required|invalid|no valid|no data rows|unclosed quote|expected|too long/i.test(err.message) ? 400 : 500);
     if (code >= 500) console.error('[gui] request failed:', err.message);
     fail(res, code, err.message);
   });

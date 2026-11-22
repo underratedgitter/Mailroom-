@@ -380,6 +380,8 @@ What stays with you, because it cannot be done from inside the app:
   older than the kept history is no longer skipped on a re-run, so raise
   `SEND_LOG_KEEP` if you resume very old campaigns. `schedule.json` is bounded
   separately (finished entries are dropped after 60 days).
+- A CSV with an unclosed quote is rejected (`Unclosed quote starting on line
+  N`) instead of silently dropping every row after it.
 - A subject line is not HTML: `&` and apostrophes reach the recipient as typed,
   while the body is escaped so a name cannot break the markup.
 

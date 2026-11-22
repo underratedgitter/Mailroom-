@@ -26,9 +26,12 @@ export function parseCsv(raw) {
   let row = [];
   let field = '';
   let quoted = false;
+  let line = 1;
+  let quoteLine = 0;
 
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
+    if (ch === '\n') line++;
     if (quoted) {
       if (ch === '"') {
         if (text[i + 1] === '"') { field += '"'; i++; }
@@ -36,7 +39,7 @@ export function parseCsv(raw) {
       } else field += ch;
       continue;
     }
-    if (ch === '"') { quoted = true; continue; }
+    if (ch === '"') { quoted = true; quoteLine = line; continue; }
     if (ch === delimiter) { row.push(field); field = ''; continue; }
     if (ch === '\n') {
       row.push(field); field = '';
@@ -46,6 +49,8 @@ export function parseCsv(raw) {
     }
     if (ch !== '\r') field += ch;
   }
+  // An open quote would otherwise absorb every remaining row into one field.
+  if (quoted) throw new Error(`Unclosed quote starting on line ${quoteLine}`);
   row.push(field);
   if (row.some((c) => c.trim() !== '')) rows.push(row);
 

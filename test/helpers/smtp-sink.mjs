@@ -3,8 +3,9 @@
 import net from 'node:net';
 
 // `mail(address)` / `rcpt(address)` may return an SMTP reply line to refuse that
-// sender / recipient. `stall(envelope)` returning true keeps the message but
-// never answers it, as a server that hangs after taking the DATA does.
+// sender / recipient. `stall(envelope)` makes the sink keep the message but
+// never answer it (true) or drop the connection ('drop'), as a server that
+// fails after taking the DATA does.
 export function startSmtpSink({ mail, rcpt, stall } = {}) {
   const messages = [];
   const connections = new Set();
@@ -36,6 +37,7 @@ export function startSmtpSink({ mail, rcpt, stall } = {}) {
           const hold = stall?.(envelope);
           envelope = { from: null, to: [] };
           data = '';
+          if (hold === 'drop') sock.destroy();
           if (hold) return;
           sock.write('250 2.0.0 OK queued\r\n');
           continue;

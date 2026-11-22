@@ -261,8 +261,9 @@ try {
     onEvent: (event) => {
       if (event.type === 'progress') {
         const n = `[${event.index}/${event.total}]`;
-        if (event.status === 'skip') console.log(`${n} skip   ${event.email} (${event.reason === 'suppressed' ? 'suppressed' : 'already sent'})`);
+        if (event.status === 'skip') console.log(`${n} skip   ${event.email} (${{ suppressed: 'suppressed', uncertain: 'earlier attempt unconfirmed' }[event.reason] || 'already sent'})`);
         else if (event.status === 'sent') console.log(`${n} sent   ${event.email}`);
+        else if (event.status === 'uncertain') console.log(`${n} UNCONFIRMED ${event.email} — ${event.error}`);
         else console.log(`${n} FAILED ${event.email} — ${event.error}`);
       } else if (event.type === 'throttle') {
         const minutes = Math.ceil(event.waitMs / 60000);
@@ -284,11 +285,18 @@ console.log('────');
 console.log(`  sent    ${summary.sent}`);
 console.log(`  failed  ${summary.failed}`);
 console.log(`  skipped ${summary.skipped}`);
+if (summary.uncertain.length) console.log(`  unconfirmed ${summary.uncertain.length} (no reply after the message was sent; it may have been delivered)`);
 if (summary.suppressed) console.log(`  suppressed ${summary.suppressed} (on the suppression list)`);
 console.log(`  log     ${values.log}`);
 if (summary.failures.length) {
   console.log('\nFailures');
   for (const f of summary.failures) console.log(`  ${f.email} — ${f.error}`);
+  process.exitCode = 1;
+}
+if (summary.uncertain.length) {
+  console.log('\nUnconfirmed: the server may have accepted these, so they are not retried or mailed again on resume.');
+  console.log('Check your Sent folder; to mail one again anyway, use a new --campaign name.');
+  for (const u of summary.uncertain) console.log(`  ${u.email} — ${u.error}`);
   process.exitCode = 1;
 }
 if (summary.stopped) process.exitCode = 1;

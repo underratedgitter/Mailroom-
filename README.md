@@ -339,8 +339,17 @@ What stays with you, because it cannot be done from inside the app:
 - One campaign at a time; a second start is refused rather than double-mailing.
 - 4 s between messages by default (and at most `MAX_PER_HOUR` per hour), one message in flight at a time over a
   pooled SMTP connection, retries with backoff on transient errors.
-- Quota, `5.4.5` and authentication errors stop the run so the mailbox is not
-  locked, and 10 connection failures in a row stop it too.
+- Quota, `5.4.5` and authentication errors reported for the account (sign-in,
+  sender or message stage) stop the run so the mailbox is not locked; a refusal
+  of one recipient (an over-quota or disabled mailbox, an unknown user) only
+  fails that recipient. 10 connection failures in a row stop the run too.
+- **Unconfirmed sends.** The SMTP socket timeout is 120 s. If the connection
+  drops or times out after the message body was sent and before the server
+  replied, the server may have accepted it, so Mailroom does not retry it: the
+  address is logged as `uncertain`, shown as *unconfirmed* in the run summary
+  (CLI exit code 1), and skipped on every resume of that campaign. Check your
+  Sent folder, then mail it again with a new campaign name if it never went
+  out.
 - `Ctrl+C` (SIGINT) or SIGTERM during a campaign, in the CLI and in the
   browser server alike, finishes and logs the message in flight, starts no
   more, prints how many recipients were not attempted and how to resume, and

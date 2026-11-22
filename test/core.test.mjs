@@ -577,3 +577,70 @@ test('a sender-stage quota refusal still stops the run', async () => {
   assert.equal(summary.failed, 1);
   assert.equal(messages.length, 0);
 });
+
+test('a timeout after the message was streamed is logged as uncertain, never retried, and skipped on resume', async () => {
+  const dir = workDir();
+  const logPath = join(dir, 'sent.jsonl');
+  const sink = await startSmtpSink({ stall: (envelope) => envelope.to.some((to) => to.includes('hung')) });
+  const mailer = createMailer({ host: '127.0.0.1', port: sink.port, secure: false, requireTLS: false, from: 'me@x.co', socketTimeout: 400 });
+  const events = [];
+  const options = {
+    recipients: ['hung@example.test', 'ok@example.test'].map(recipient),
+    templateHtml: 'x',
+    subjectTemplate: 'x',
+    campaignId: 'c1',
+    delayMs: 0,
+    retryDelay: 1,
+    limits: { perHour: 0, perDomainPerHour: 0 },
+    mailer,
+    logPath,
+    suppressionPath: join(dir, 'suppressed.csv'),
+    onEvent: (event) => events.push(event),
+  };
+  try {
+    const first = await runCampaign(options);
+    // The server took the message of "hung" and never answered; sending it again would duplicate it.
+    assert.equal(sink.messages.filter((m) => m.to.some((to) => to.includes('hung'))).length, 1);
+    assert.equal(first.sent, 1);
+    assert.equal(first.failed, 0);
+    assert.deepEqual(first.uncertain.map((u) => u.email), ['hung@example.test']);
+    assert.equal(first.remaining, 0);
+    assert.ok(events.some((e) => e.type === 'progress' && e.status === 'uncertain' && e.email === 'hung@example.test'));
+    assert.deepEqual(readLog(logPath).filter((e) => e.status === 'uncertain').map((e) => e.email), ['hung@example.test']);
+
+    const again = await runCampaign({ ...options, alreadySent: sentAddresses(readLog(logPath), 'c1') });
+    assert.equal(sink.messages.filter((m) => m.to.some((to) => to.includes('hung'))).length, 1);
+    assert.equal(again.sent, 0);
+    assert.equal(again.skipped, 2);
+    assert.ok(events.some((e) => e.type === 'progress' && e.status === 'skip' && e.reason === 'uncertain'));
+  } finally {
+    mailer.close();
+    await sink.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a timeout before the message was streamed is still retried', async () => {
+  let attempts = 0;
+  const summary = await runCampaign({
+    recipients: [recipient('a@b.co')],
+    templateHtml: 'x',
+    subjectTemplate: 'x',
+    delayMs: 0,
+    retryDelay: 1,
+    mailer: { send: async () => { attempts++; return { success: false, error: 'Timeout', code: 'ETIMEDOUT' }; } },
+    onEvent: () => {},
+  });
+  assert.equal(attempts, 3);
+  assert.equal(summary.failed, 1);
+  assert.deepEqual(summary.uncertain, []);
+});
+
+test('the socket timeout is long enough for a slow server to answer the DATA command', () => {
+  const mailer = createMailer({ host: '127.0.0.1', port: 1, secure: false, requireTLS: false, from: 'me@x.co' });
+  try {
+    assert.ok(mailer.getTransport().transporter.options.socketTimeout >= 120000);
+  } finally {
+    mailer.close();
+  }
+});

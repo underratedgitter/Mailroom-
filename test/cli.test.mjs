@@ -183,3 +183,16 @@ test('--send stops before connecting when the compliance settings are unusable',
   assert.match(from.stderr, /EMAIL_FROM must be a full address/);
   assert.equal(sink.messages.length, 0);
 });
+
+test('--send reports a message the server may have accepted as unconfirmed and never resends it', async (t) => {
+  const sink = await startSmtpSink({ stall: (envelope) => (envelope.to[0].startsWith('<b@') ? 'drop' : false) });
+  t.after(() => sink.close());
+  const res = await runCli([...SEND_ARGS, '--send', '--campaign', 'c1'], { env: smtpEnv(sink) });
+
+  assert.equal(res.status, 1, res.stdout + res.stderr);
+  assert.equal(sink.messages.filter((m) => m.to[0] === '<b@example.com>').length, 1);
+  assert.match(res.stdout, /UNCONFIRMED b@example\.com/);
+  assert.match(res.stdout, /unconfirmed\s+1/);
+  assert.match(res.stdout, /sent\s+2/);
+  assert.match(res.stdout, /failed\s+0/);
+});

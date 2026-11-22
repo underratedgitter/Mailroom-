@@ -812,6 +812,7 @@ async function fireScheduled(entry) {
       sent: summary?.sent || 0,
       failed: summary?.failed || 0,
       skipped: summary?.skipped || 0,
+      ...(summary?.uncertain?.length ? { uncertain: summary.uncertain.length } : {}),
     };
     if (job.cancelled && summary?.remaining > 0) {
       // Stopped part-way. A shutdown puts the entry back in line so the next

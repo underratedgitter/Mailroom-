@@ -1034,6 +1034,8 @@ function clearLedger() {
   setHidden(ui.ledgerEmpty, false);
 }
 
+const UNSENT_REASON = { suppressed: 'suppressed', uncertain: 'earlier attempt unconfirmed; not mailed again' };
+
 function addLine({ n, tag, tagLabel, addr, note, bad = false }) {
   setHidden(ui.ledgerEmpty, true);
   const li = h('li', {},
@@ -1059,8 +1061,8 @@ function appendToLedger(li) {
 }
 
 function renderRun() {
-  const { total, sent, failed, skipped } = state.run;
-  const done = sent + failed + skipped;
+  const { total, sent, failed, skipped, uncertain } = state.run;
+  const done = sent + failed + skipped + uncertain;
   for (const bar of [ui.runProgress, ui.liveProgress]) {
     if (bar.max !== Math.max(total, 1)) bar.max = Math.max(total, 1);
     if (bar.value !== done) bar.value = done;
@@ -1070,12 +1072,12 @@ function renderRun() {
   setText(ui.runLabel, label);
   setText(ui.liveText, 'Sending' + (state.run.campaign ? ' “' + state.run.campaign + '”' : '') + ' — ' + (total ? done + ' of ' + total : 'starting'));
 
-  const counts = [['sent', sent], ['failed', failed], ['skipped', skipped]];
+  const counts = [['sent', sent], ['failed', failed], ['skipped', skipped], ...(uncertain ? [['unconfirmed', uncertain]] : [])];
   reconcile(ui.runCounts, counts, ([name]) => name,
     ([name]) => h('span', {}, name + ' ', h('b')),
     (node, [name, value]) => {
       setText(node.lastElementChild, String(value));
-      setClass(node, 'is-bad', name === 'failed' && value > 0);
+      setClass(node, 'is-bad', (name === 'failed' || name === 'unconfirmed') && value > 0);
     });
 }
 
@@ -1094,7 +1096,7 @@ function lockControls() {
   ui.cancelBtn.disabled = false;
   ui.cancelBtn.textContent = 'Stop after this one';
   clearLedger();
-  state.run = { total: 0, sent: 0, failed: 0, skipped: 0, label: '', campaign: '' };
+  state.run = { total: 0, sent: 0, failed: 0, skipped: 0, uncertain: 0, label: '', campaign: '' };
   setRunState('run', 'Sending');
   setHidden(ui.liveBar, false);
   setHidden(ui.navSendBadge, false);
@@ -1185,14 +1187,17 @@ function listen(jobId, attempt = 0) {
     } else if (data.type === 'progress') {
       if (data.status === 'sent') run.sent++;
       if (data.status === 'failed') run.failed++;
+      if (data.status === 'uncertain') run.uncertain++;
       if (data.status === 'skip') run.skipped++;
       addLine({
         n: String(data.index).padStart(2, '0'),
         tag: data.status,
         tagLabel: data.status,
         addr: data.email,
-        note: data.error || (data.reason === 'suppressed' ? 'suppressed' : ''),
-        bad: data.status === 'failed',
+        note: data.status === 'uncertain'
+          ? 'no reply after the message was sent, so it may have been delivered; not retried (' + data.error + ')'
+          : data.error || UNSENT_REASON[data.reason] || '',
+        bad: data.status === 'failed' || data.status === 'uncertain',
       });
     } else if (data.type === 'throttle') {
       addLine({
@@ -1211,7 +1216,10 @@ function listen(jobId, attempt = 0) {
       const s = data.summary || {};
       const text = s.error
         ? 'Stopped — ' + s.error
-        : (s.stopped ? 'Stopped' : 'Done') + ' — sent ' + (s.sent || 0) + ', failed ' + (s.failed || 0) + ', skipped ' + (s.skipped || 0) + '.' + (s.failed ? ' Failures are in the log.' : '');
+        : (s.stopped ? 'Stopped' : 'Done') + ' — sent ' + (s.sent || 0) + ', failed ' + (s.failed || 0) + ', skipped ' + (s.skipped || 0)
+          + (s.uncertain?.length ? ', unconfirmed ' + s.uncertain.length : '') + '.'
+          + (s.failed ? ' Failures are in the log.' : '')
+          + (s.uncertain?.length ? ' Unconfirmed messages may have been delivered; check your Sent folder before mailing them again.' : '');
       addSummary(text);
       run.label = text;
       setRunState(s.error ? 'bad' : s.stopped ? 'warn' : 'ok', s.error ? 'Failed' : s.stopped ? 'Stopped' : 'Finished');
@@ -1250,6 +1258,7 @@ async function finishSend(summary) {
   unlockControls();
   if (summary.error) toast(summary.error, 'bad');
   else if (summary.failed) toast(plural(summary.failed, 'message') + ' failed — see the log on the Send page.', 'bad');
+  else if (summary.uncertain?.length) toast(plural(summary.uncertain.length, 'message') + ' may or may not have been delivered — check your Sent folder before re-sending.', 'bad');
   else if (summary.stopped) toast('Stopped after ' + plural(summary.sent || 0, 'message') + ' sent.', 'ok');
   else toast('Campaign finished: ' + plural(summary.sent || 0, 'message') + ' sent.', 'ok');
 
@@ -1365,7 +1374,7 @@ function renderQueue() {
       setAttr(line.children[1], 'class', 'tag tag--' + e.status);
       setText(line.children[2], e.status === 'pending' ? relative(e.at) : '');
       setText(meta, [e.campaign || 'No campaign name', plural(e.recipients, 'recipient'), e.subject].filter(Boolean).join(' · '));
-      const text = e.error || (e.result ? 'Sent ' + e.result.sent + ', failed ' + e.result.failed + ', skipped ' + e.result.skipped : '');
+      const text = e.error || (e.result ? 'Sent ' + e.result.sent + ', failed ' + e.result.failed + ', skipped ' + e.result.skipped + (e.result.uncertain ? ', unconfirmed ' + e.result.uncertain : '') : '');
       setText(note, text);
       setHidden(note, !text);
       setClass(note, 'is-bad', Boolean(e.error));

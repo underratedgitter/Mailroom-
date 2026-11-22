@@ -383,6 +383,18 @@ export function sentAddresses(entries, campaignId = '') {
   return set;
 }
 
+/** Addresses whose last attempt ended with an unknown outcome; they are not mailed again. */
+export function uncertainAddresses(entries, campaignId = '') {
+  const id = String(campaignId || '').trim();
+  const set = new Set();
+  for (const entry of entries) {
+    if (entry.status !== 'uncertain') continue;
+    if (id && entry.campaign !== id) continue;
+    set.add(String(entry.email).toLowerCase());
+  }
+  return set;
+}
+
 export function campaignSummaries(entries) {
   const byId = new Map();
   for (const entry of entries) {
@@ -412,7 +424,7 @@ export const SIGNAL_EXIT = { SIGINT: 130, SIGTERM: 143 };
 
 /** The message printed when a signal stopped a campaign part-way. */
 export function describeInterruption(signal, summary, { campaign = '', resume } = {}) {
-  const done = summary.sent + summary.failed + summary.skipped;
+  const done = summary.sent + summary.failed + summary.skipped + (summary.uncertain?.length || 0);
   const label = campaign ? `campaign "${campaign}"` : 'the campaign';
   return [
     `Interrupted by ${signal}: ${label} stopped after ${done} of ${summary.total} recipient(s); ${summary.remaining} recipient(s) were not attempted.`,
@@ -523,6 +535,10 @@ export function createRateLimiter({ perHour = 0, perDomainPerHour = 0, history =
 }
 
 // ── SMTP ─────────────────────────────────────────────────────────────
+// A server can take minutes to answer the end of DATA while it scans the
+// message; a shorter limit abandons a message it is about to accept.
+const SOCKET_TIMEOUT_MS = 120000;
+
 export function createMailer(cfg = resolveSmtpConfig()) {
   let transport = null;
 
@@ -540,9 +556,23 @@ export function createMailer(cfg = resolveSmtpConfig()) {
       },
       connectionTimeout: 10000,
       greetingTimeout: 10000,
-      socketTimeout: 15000,
+      socketTimeout: cfg.socketTimeout ?? SOCKET_TIMEOUT_MS,
       pool: true,
       maxConnections: 3,
+    });
+    // Tells send() the moment the message body starts to stream, which is when
+    // the server can no longer be assumed not to have it.
+    transport.use('stream', (mail, done) => {
+      const onDataStart = mail.data.onDataStart;
+      if (typeof onDataStart === 'function') {
+        const open = mail.message.createReadStream.bind(mail.message);
+        mail.message.createReadStream = () => {
+          const stream = open();
+          stream.once('resume', onDataStart);
+          return stream;
+        };
+      }
+      done();
     });
     return transport;
   }
@@ -559,6 +589,7 @@ export function createMailer(cfg = resolveSmtpConfig()) {
 
   async function send({ to, subject, html, assetsDir }) {
     const attachments = attachmentsFor(html, assetsDir);
+    let dataStarted = false;
     try {
       const info = await getTransport().sendMail({
         from: cfg.from,
@@ -568,12 +599,16 @@ export function createMailer(cfg = resolveSmtpConfig()) {
         text: htmlToText(html),
         attachments,
         ...bulkFields(cfg, to),
+        onDataStart: () => { dataStarted = true; },
       });
       return { success: true, messageId: info.messageId, inline: attachments.length };
     } catch (err) {
       // Fresh socket on the next attempt — pooled connections can go stale.
       transport = null;
-      return { success: false, error: err.message, code: err.code, command: err.command, response: err.response, responseCode: err.responseCode };
+      // Without a reply after the body went out (timeout, dropped link) the
+      // server may well have accepted the message: the outcome is unknown.
+      const uncertain = dataStarted && !Number.isInteger(err.responseCode);
+      return { success: false, error: err.message, code: err.code, command: err.command, response: err.response, responseCode: err.responseCode, uncertain };
     }
   }
 
@@ -618,8 +653,10 @@ export function isFatal(failure) {
  * and the GUI so resume, retry and kill-switch rules are identical.
  *
  * onEvent receives:
- *   { type: 'progress', index, total, status: 'sent'|'skip'|'failed', email, error?, reason? }
- *       (a skip's reason is 'already-sent' or 'suppressed')
+ *   { type: 'progress', index, total, status: 'sent'|'skip'|'failed'|'uncertain', email, error?, reason? }
+ *       (a skip's reason is 'already-sent', 'suppressed' or 'uncertain'; 'uncertain'
+ *       means the server may have accepted the message, so it is neither retried
+ *       nor mailed again on resume)
  *   { type: 'throttle', email, waitMs, scope }   waiting for the hourly ceiling
  *   { type: 'fatal', email, error }
  *   { type: 'done', summary }
@@ -656,11 +693,14 @@ export async function runCampaign({
 
   const total = recipients.length;
 
+  const priorEntries = logPath ? readLog(logPath) : [];
+  const unresolved = uncertainAddresses(priorEntries, campaignId);
+
   // Sends from earlier runs in the last hour count against the ceiling too.
   const hourAgo = Date.now() - HOUR_MS;
   const limiter = createRateLimiter({
     ...limits,
-    history: (logPath ? readLog(logPath) : [])
+    history: priorEntries
       .filter((e) => e.status === 'sent' && Date.parse(e.at) > hourAgo)
       .map((e) => ({ at: e.at, domain: addressDomain(e.email) })),
   });
@@ -672,6 +712,7 @@ export async function runCampaign({
   let transportFailures = 0;
   const MAX_TRANSPORT_FAILURES = 10;
   const failures = [];
+  const uncertain = [];
 
   for (let i = 0; i < total && !stopped; i++) {
     if (shouldStop()) { stopped = true; break; }
@@ -682,11 +723,12 @@ export async function runCampaign({
     const skip = (reason) => {
       skipped++;
       if (reason === 'suppressed') suppressed++;
-      if (logPath) appendLog(logPath, { email: addr, status: 'skipped', ...(reason === 'suppressed' ? { reason } : {}), at: new Date().toISOString(), campaign: campaignId || null });
+      if (logPath) appendLog(logPath, { email: addr, status: 'skipped', ...(reason === 'already-sent' ? {} : { reason }), at: new Date().toISOString(), campaign: campaignId || null });
       onEvent({ type: 'progress', index: i + 1, total, status: 'skip', email: addr, reason });
     };
 
     if (alreadySent.has(addr.toLowerCase())) { skip('already-sent'); continue; }
+    if (unresolved.has(addr.toLowerCase())) { skip('uncertain'); continue; }
     // Checked afresh for every message: an unsubscribe that arrives mid-run counts.
     if (isSuppressed(suppressionPath, addr)) { skip('suppressed'); continue; }
 
@@ -705,6 +747,7 @@ export async function runCampaign({
     for (let attempt = 1; attempt <= 3; attempt++) {
       result = await mailer.send({ to: addr, subject, html, assetsDir });
       if (result.success) break;
+      if (result.uncertain) break;
       if (isFatal(result)) {
         if (logPath) appendLog(logPath, { email: addr, status: 'failed', error: result.error, at: new Date().toISOString(), campaign: campaignId || null });
         failed++;
@@ -727,12 +770,13 @@ export async function runCampaign({
       if (logPath) appendLog(logPath, { email: addr, status: 'sent', messageId: result.messageId || null, at: new Date().toISOString(), campaign: campaignId || null });
       onEvent({ type: 'progress', index: i + 1, total, status: 'sent', email: addr });
     } else {
-      failed++;
-      failures.push({ email: addr, error: result.error });
-      if (logPath) appendLog(logPath, { email: addr, status: 'failed', error: result.error, at: new Date().toISOString(), campaign: campaignId || null });
-      onEvent({ type: 'progress', index: i + 1, total, status: 'failed', email: addr, error: result.error });
+      const status = result.uncertain ? 'uncertain' : 'failed';
+      if (result.uncertain) uncertain.push({ email: addr, error: result.error });
+      else { failed++; failures.push({ email: addr, error: result.error }); }
+      if (logPath) appendLog(logPath, { email: addr, status, error: result.error, at: new Date().toISOString(), campaign: campaignId || null });
+      onEvent({ type: 'progress', index: i + 1, total, status, email: addr, error: result.error });
 
-      if (isTransient(result)) {
+      if (result.uncertain || isTransient(result)) {
         transportFailures++;
         if (transportFailures >= MAX_TRANSPORT_FAILURES) {
           stopped = true;
@@ -751,8 +795,8 @@ export async function runCampaign({
     if (i < total - 1 && delayMs) await pause(delayMs);
   }
 
-  const remaining = total - sent - failed - skipped;
-  const summary = { sent, failed, skipped, suppressed, failures, stopped, total, remaining, logPath: logPath || null };
+  const remaining = total - sent - failed - skipped - uncertain.length;
+  const summary = { sent, failed, skipped, suppressed, failures, uncertain, stopped, total, remaining, logPath: logPath || null };
   onEvent({ type: 'done', summary });
   return summary;
 }

@@ -5,7 +5,7 @@
  *   mailroom                  → http://127.0.0.1:4173
  *   mailroom --port 5000 --open
  *   GUI_HOST=0.0.0.0 MAILROOM_TLS_CERT=cert.pem MAILROOM_TLS_KEY=key.pem
- *   GUI_HOST=0.0.0.0 MAILROOM_ALLOW_INSECURE=1 (plain HTTP behind a TLS proxy)
+ *   GUI_HOST=0.0.0.0 MAILROOM_ALLOW_INSECURE=1 MAILROOM_TRUST_PROXY=1 (plain HTTP behind a TLS proxy)
  *
  * A single process serving one page and a small JSON API, driving the same
  * engine as the CLI (src/lib/core.mjs). SMTP details live in a config file
@@ -16,7 +16,7 @@
  *   GET  /api/state            setup status, CSV/template inventory, log summary
  *   POST /api/settings         save SMTP settings (tests first when asked)
  *   POST /api/settings/test    authenticate with unsaved settings
- *   POST /api/login|logout     password session when MAILROOM_PASSWORD is set
+ *   POST /api/login|logout     password session when MAILROOM_PASSWORD or MAILROOM_PASSWORD_HASH is set
  *   POST /api/preview          render one recipient, with images inlined
  *   POST /api/verify           SMTP connect + auth check
  *   POST /api/test             send one real message to one address
@@ -30,8 +30,10 @@
 
 import http from 'node:http';
 import https from 'node:https';
-import { randomUUID, randomBytes, timingSafeEqual } from 'node:crypto';
-import { loadConfig, saveConfig, resolveConfigPath, smtpFileValues } from './lib/config.mjs';
+import { randomUUID, randomBytes } from 'node:crypto';
+import { hashPassword, verifyPassword, parsePasswordHash } from './lib/auth.mjs';
+import { configIssue } from './lib/mailer.mjs';
+import { loadConfig, saveConfig, resolveConfigPath, smtpFileValues, assertConfig } from './lib/config.mjs';
 import { readFileSync, writeFileSync, renameSync, rmSync, existsSync, readdirSync, statSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import { dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -45,13 +47,20 @@ import {
   inlineForPreview,
   attachmentsFor,
   readLog,
+  loadSuppressed,
+  addSuppressed,
+  isSuppressed,
+  rateLimitsFromEnv,
   sentAddresses,
   campaignSummaries,
   createMailer,
   runCampaign,
   resolveSmtpConfig,
   emailRe,
+  SIGNAL_EXIT,
+  describeInterruption,
 } from './lib/core.mjs';
+import { missingSmtpFields } from './lib/mailer.mjs';
 
 // Read the product config before anything looks at process.env.
 const configFile = loadConfig();
@@ -68,6 +77,7 @@ const PUBLIC_DIR = join(ROOT, 'public');
 const DATA_DIR = join(ROOT, 'data');
 const TEMPLATE_DIR = join(ROOT, 'templates');
 const LOG_PATH = resolve(process.env.SEND_LOG || join(ROOT, 'logs', 'sent.jsonl'));
+const SUPPRESSION_PATH = resolve(process.env.SUPPRESSION_FILE || join(DATA_DIR, 'suppressed.csv'));
 const SCHEDULE_PATH = resolve(process.env.SCHEDULE_FILE || join(ROOT, 'logs', 'schedule.json'));
 // A schedule that came due while the server was off is sent if it is at most
 // this late; later than that it is parked as "missed" for a human to decide.
@@ -108,6 +118,7 @@ function tlsOptions() {
 }
 
 function assertBindingIsSafe(host) {
+  if (hashError) throw hashError;
   if (isLoopbackHost(host)) return;
   if (!TLS_ON && !ALLOW_INSECURE) {
     throw new Error([
@@ -121,13 +132,10 @@ function assertBindingIsSafe(host) {
     throw new Error([
       `Refusing to serve Mailroom on ${host} without a password.`,
       'Anyone who can reach this port could send mail with your SMTP account.',
-      'Set MAILROOM_PASSWORD to a long passphrase before binding beyond loopback.',
+      'Set MAILROOM_PASSWORD_HASH (or MAILROOM_PASSWORD) to a long passphrase before binding beyond loopback.',
     ].join('\n  '));
   }
 }
-
-mkdirSync(dirname(LOG_PATH), { recursive: true });
-mkdirSync(dirname(SCHEDULE_PATH), { recursive: true });
 
 // Loopback addresses the page is allowed to arrive through. Anything else is
 // a DNS-rebinding attempt: a public hostname pointed at 127.0.0.1 would let a
@@ -148,22 +156,56 @@ const ALLOWED_HOSTS = new Set([
 const ALLOWED_ORIGINS = new Set([...ALLOWED_HOSTS].flatMap((h) => [`http://${h}`, `https://${h}`]));
 
 // ── Optional password gate ───────────────────────────────────────────
-// Loopback-only installs need none. A Docker or LAN install must set
-// MAILROOM_PASSWORD or anyone on the network can send with these credentials.
+// Loopback-only installs need none. A Docker or LAN install must set a
+// password or anyone on the network can send with these credentials.
+// MAILROOM_PASSWORD_HASH (see src/lib/auth.mjs) keeps only a salted scrypt
+// hash on disk; a plaintext MAILROOM_PASSWORD still works so existing configs
+// keep running, and is hashed in memory with a fresh salt before any comparison.
 const PASSWORD = String(process.env.MAILROOM_PASSWORD || '');
-const AUTH_ON = PASSWORD.length > 0;
+const PASSWORD_HASH = String(process.env.MAILROOM_PASSWORD_HASH || '').trim();
+const AUTH_ON = PASSWORD_HASH.length > 0 || PASSWORD.length > 0;
+const MAX_PASSWORD_LENGTH = 1024;
+
+let hashError = null;
+if (PASSWORD_HASH) {
+  try { parsePasswordHash(PASSWORD_HASH); } catch (err) { hashError = err; }
+}
+
+let memoryHash = null;
+const storedHash = () => PASSWORD_HASH || (memoryHash ??= hashPassword(PASSWORD));
+
+// Behind a reverse proxy that terminates TLS, the proxy's X-Forwarded-* headers
+// say how the browser really connected. They are honoured only when asked for:
+// otherwise any client could claim to be on HTTPS or spoof its address.
+const TRUST_PROXY = /^(1|true|yes)$/i.test(String(process.env.MAILROOM_TRUST_PROXY || '').trim());
+const lastForwarded = (req, name) => String(req.headers[name] || '').split(',').pop().trim();
+const firstForwarded = (req, name) => String(req.headers[name] || '').split(',')[0].trim();
+
+const isSecureRequest = (req) => TLS_ON || (TRUST_PROXY && firstForwarded(req, 'x-forwarded-proto').toLowerCase() === 'https');
+const clientIp = (req) => (TRUST_PROXY && lastForwarded(req, 'x-forwarded-for')) || req.socket.remoteAddress || 'local';
+
 const COOKIE = 'mr_session';
-const COOKIE_SECURE = TLS_ON ? '; Secure' : '';
-const SESSION_TTL = 7 * 24 * 60 * 60 * 1000;
+const DEFAULT_SESSION_SECONDS = 12 * 60 * 60;
+const configuredTtl = Number(process.env.MAILROOM_SESSION_TTL_SECONDS);
+const SESSION_SECONDS = Number.isFinite(configuredTtl) && configuredTtl > 0 ? Math.floor(configuredTtl) : DEFAULT_SESSION_SECONDS;
+const SESSION_TTL = SESSION_SECONDS * 1000;
+const MAX_SESSIONS = 100;
 // Sessions live in memory only: restarting the server signs everyone out.
 const sessions = new Map();
 
 function createSession() {
   const now = Date.now();
   for (const [token, expiry] of sessions) if (expiry < now) sessions.delete(token);
+  // Maps iterate in insertion order, so the oldest sessions go first.
+  while (sessions.size >= MAX_SESSIONS) sessions.delete(sessions.keys().next().value);
   const token = randomBytes(32).toString('hex');
   sessions.set(token, now + SESSION_TTL);
   return token;
+}
+
+function sessionCookie(req, token, maxAgeSeconds) {
+  const secure = isSecureRequest(req) ? '; Secure' : '';
+  return `${COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAgeSeconds}${secure}`;
 }
 
 function cookies(req) {
@@ -172,7 +214,10 @@ function cookies(req) {
   for (const part of header.split(';')) {
     const eq = part.indexOf('=');
     if (eq === -1) continue;
-    out[part.slice(0, eq).trim()] = decodeURIComponent(part.slice(eq + 1).trim());
+    const name = part.slice(0, eq).trim();
+    const raw = part.slice(eq + 1).trim();
+    // A malformed escape must read as "no such session", not crash the request.
+    try { out[name] = decodeURIComponent(raw); } catch { out[name] = raw; }
   }
   return out;
 }
@@ -194,20 +239,75 @@ function isAuthed(req) {
 }
 
 const loginAttempts = new Map();
+const ATTEMPT_WINDOW = 60_000;
+const MAX_ATTEMPTS = 8;
+
+function recentAttempts(ip) {
+  const now = Date.now();
+  const recent = (loginAttempts.get(ip) || []).filter((t) => now - t < ATTEMPT_WINDOW);
+  if (recent.length) loginAttempts.set(ip, recent);
+  else loginAttempts.delete(ip);
+  return recent;
+}
 
 function tooManyAttempts(ip) {
-  const now = Date.now();
-  const recent = (loginAttempts.get(ip) || []).filter((t) => now - t < 60_000);
-  loginAttempts.set(ip, recent);
-  return recent.length >= 8;
+  return recentAttempts(ip).length >= MAX_ATTEMPTS;
 }
 
 function noteAttempt(ip, ok) {
   if (ok) return loginAttempts.delete(ip);
-  const now = Date.now();
-  const recent = (loginAttempts.get(ip) || []).filter((t) => now - t < 60_000);
-  recent.push(now);
+  const recent = recentAttempts(ip);
+  recent.push(Date.now());
   loginAttempts.set(ip, recent);
+}
+
+// Scripts and styles come from our own files only. Styles also allow inline
+// rules because the preview iframe is a srcdoc frame, which inherits this
+// policy and shows an email whose own <style> blocks and inlined images must
+// render; its sandbox attribute (no allow-scripts) is what keeps it inert.
+const CSP = [
+  "default-src 'none'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: https:",
+  "font-src 'self' data: https:",
+  "connect-src 'self'",
+  "base-uri 'none'",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+  "object-src 'none'",
+].join('; ');
+
+function setSecurityHeaders(req, res) {
+  res.setHeader('Content-Security-Policy', CSP);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()');
+  if (isSecureRequest(req)) res.setHeader('Strict-Transport-Security', 'max-age=31536000');
+}
+
+// SameSite=Strict already keeps the session cookie off cross-site requests;
+// these checks stop a forged request from reaching the handlers at all.
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+function crossSiteReason(req) {
+  const origin = String(req.headers.origin || '').toLowerCase();
+  if (origin) {
+    let originHost = null;
+    try { originHost = new URL(origin).host; } catch { /* "null" and junk are foreign */ }
+    const ownHost = String((TRUST_PROXY && firstForwarded(req, 'x-forwarded-host')) || req.headers.host || '').toLowerCase();
+    if (!ALLOWED_ORIGINS.has(origin) && !(originHost && originHost === ownHost)) return 'Cross-origin request refused';
+  }
+  // Modern browsers label every request; same-site (a sibling subdomain) is
+  // still not us.
+  const site = String(req.headers['sec-fetch-site'] || '').toLowerCase();
+  if (!SAFE_METHODS.has(req.method) && site && site !== 'same-origin' && site !== 'none') {
+    return 'Cross-site request refused';
+  }
+  return null;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -227,15 +327,22 @@ async function readJson(req, limit = 2 * 1024 * 1024) {
   const chunks = [];
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > limit) throw new Error('Request body too large');
+    if (size > limit) throw Object.assign(new Error('Request body too large'), { status: 413 });
     chunks.push(chunk);
   }
   if (!chunks.length) return {};
+  let body;
   try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
   } catch {
     throw new Error('Invalid JSON body');
   }
+  // Every route reads fields off the result, so null, arrays and scalars
+  // would surface as a TypeError and a 500.
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    throw new Error('Invalid JSON body: expected an object');
+  }
+  return body;
 }
 
 /** Real path of a root, whether or not the directory already exists. */
@@ -289,6 +396,7 @@ function listCsvs() {
   if (!existsSync(DATA_DIR)) return [];
   return readdirSync(DATA_DIR)
     .filter((name) => name.toLowerCase().endsWith('.csv'))
+    .filter((name) => join(DATA_DIR, name) !== SUPPRESSION_PATH)
     .filter((name) => !lstatSync(join(DATA_DIR, name)).isSymbolicLink())
     .sort()
     .map((name) => {
@@ -374,6 +482,16 @@ function smtpState() {
   };
 }
 
+/** Why a send cannot go out compliantly (bad ceiling, From or unsubscribe URL), or null. */
+function complianceIssue(cfg) {
+  try {
+    rateLimitsFromEnv();
+  } catch (err) {
+    return err.message;
+  }
+  return configIssue(cfg);
+}
+
 /** Shared input resolution for preview / test / send. */
 function resolveInput(body) {
   const templatePath = safePath(body.html, { roots: [TEMPLATE_DIR], ext: ['.html', '.htm'] });
@@ -429,6 +547,9 @@ function nextCsvPath(name) {
 function previewFor(input, index = 0) {
   const i = Math.max(0, Math.min(input.parsed.recipients.length - 1, Number(index) || 0));
   const rec = input.parsed.recipients[i];
+  const held = (r) => !input.alreadySent.has(r._email.toLowerCase()) && isSuppressed(SUPPRESSION_PATH, r._email);
+  const suppressed = input.parsed.recipients.filter(held).length;
+  const skipped = input.parsed.recipients.filter((r) => input.alreadySent.has(r._email.toLowerCase())).length;
   const raw = render(input.templateHtml, rec);
   return {
     index: i,
@@ -441,8 +562,9 @@ function previewFor(input, index = 0) {
     alreadySent: input.alreadySent.has(rec._email.toLowerCase()),
     source: input.source,
     html: inlineForPreview(raw, input.assetsDir),
-    willSend: input.parsed.recipients.filter((r) => !input.alreadySent.has(r._email.toLowerCase())).length,
-    skipped: input.parsed.recipients.filter((r) => input.alreadySent.has(r._email.toLowerCase())).length,
+    willSend: input.parsed.recipients.length - skipped - suppressed,
+    skipped,
+    suppressed,
     invalid: input.parsed.invalid,
     duplicates: input.parsed.duplicates,
     truncated: input.parsed.truncated,
@@ -458,7 +580,15 @@ function runningJob() {
   return job && !job.done ? job : null;
 }
 
+// Set by the signal handler; no new campaign may start once it is true.
+let shuttingDown = false;
+
 function createJob() {
+  if (shuttingDown) {
+    const err = new Error('Mailroom is shutting down');
+    err.status = 503;
+    throw err;
+  }
   // One campaign at a time: two runs would double-send whatever they share.
   if (runningJob()) {
     const err = new Error('A campaign is already running — wait for it to finish');
@@ -517,6 +647,8 @@ function startCampaign(input, { delay = 0 } = {}) {
   (async () => {
     const mailer = createMailer(cfg);
     try {
+      const issue = complianceIssue(cfg);
+      if (issue) throw new Error(issue);
       const verify = await mailer.verify();
       if (!verify.ok) {
         emit(job, { type: 'error', error: `Connection failed: ${verify.error}` });
@@ -537,6 +669,7 @@ function startCampaign(input, { delay = 0 } = {}) {
         assetsDir: input.assetsDir,
         campaignId: input.campaignId,
         alreadySent: input.alreadySent,
+        suppressionPath: SUPPRESSION_PATH,
         delayMs: delay,
         mailer,
         logPath: LOG_PATH,
@@ -604,11 +737,12 @@ function templateFor(entry) {
 }
 
 /** Runs one due entry; the caller has already marked it "sending". */
-async function fireScheduled(entry, list) {
+async function fireScheduled(entry) {
   try {
     const template = templateFor(entry);
     const campaignId = String(entry.campaign || '');
     const recipients = (entry.recipients || []).map((r) => ({
+      ...r.fields,
       _email: r.email,
       _name: r.name || '',
       _company: r.company || '',
@@ -624,6 +758,7 @@ async function fireScheduled(entry, list) {
       campaignId,
       alreadySent: sentAddresses(readLog(LOG_PATH), campaignId),
     }, { delay: delayFrom(entry.delay) });
+    job.scheduleId = entry.id;
 
     const summary = await job.finished;
     entry.result = {
@@ -631,13 +766,31 @@ async function fireScheduled(entry, list) {
       failed: summary?.failed || 0,
       skipped: summary?.skipped || 0,
     };
-    entry.status = summary?.error || (!summary?.sent && summary?.failed) ? 'failed' : 'sent';
+    if (job.cancelled && summary?.remaining > 0) {
+      // Stopped part-way. A shutdown puts the entry back in line so the next
+      // start resumes it (the log skips whoever was already mailed); a person
+      // pressing Stop means it is over.
+      entry.status = shuttingDown ? 'pending' : 'cancelled';
+      if (shuttingDown) entry.result = null;
+    } else {
+      entry.status = summary?.error || (!summary?.sent && summary?.failed) ? 'failed' : 'sent';
+    }
     if (summary?.error) entry.error = summary.error;
   } catch (err) {
     entry.status = 'failed';
     entry.error = err.message;
   } finally {
-    writeSchedule(list);
+    // A send can run for hours, during which schedules are added and
+    // cancelled. Write this entry's outcome into the file as it is now rather
+    // than overwriting it with the copy read before the send began.
+    const current = readSchedule();
+    const stored = current.find((e) => e.id === entry.id);
+    if (stored) {
+      stored.status = entry.status;
+      stored.error = entry.error ?? null;
+      stored.result = entry.result ?? null;
+      writeSchedule(current);
+    }
   }
 }
 
@@ -645,7 +798,7 @@ let schedulerTimer = null;
 let ticking = false;
 
 async function tick() {
-  if (ticking) return;
+  if (ticking || shuttingDown) return;
   ticking = true;
   try {
     const list = readSchedule();
@@ -680,7 +833,7 @@ async function tick() {
 
     due.status = 'sending';
     writeSchedule(list);
-    await fireScheduled(due, list);
+    await fireScheduled(due);
   } catch (err) {
     console.error('[schedule] tick failed:', err.message);
   } finally {
@@ -721,6 +874,8 @@ const STATIC = {
   '/styles.css': ['styles.css', 'text/css; charset=utf-8'],
   '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
   '/login.html': ['login.html', 'text/html; charset=utf-8'],
+  '/login.css': ['login.css', 'text/css; charset=utf-8'],
+  '/login.js': ['login.js', 'text/javascript; charset=utf-8'],
   '/favicon.svg': ['favicon.svg', 'image/svg+xml'],
 };
 
@@ -741,9 +896,7 @@ function serveStatic(res, pathname) {
 
 // ── Routes ───────────────────────────────────────────────────────────
 async function route(req, res) {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Referrer-Policy', 'no-referrer');
-  res.setHeader('X-Frame-Options', 'DENY');
+  setSecurityHeaders(req, res);
 
   // Reject requests that did not arrive on a loopback name. Without this a
   // public DNS entry pointing at 127.0.0.1 could drive this server from a
@@ -753,10 +906,8 @@ async function route(req, res) {
     return fail(res, 403, 'Unexpected Host header');
   }
 
-  const origin = String(req.headers.origin || '').toLowerCase();
-  if (origin && !ALLOWED_ORIGINS.has(origin)) {
-    return fail(res, 403, 'Cross-origin request refused');
-  }
+  const crossSite = crossSiteReason(req);
+  if (crossSite) return fail(res, 403, crossSite);
 
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   const pathname = url.pathname;
@@ -778,27 +929,28 @@ async function route(req, res) {
     const body = await readJson(req);
     if (!AUTH_ON) return json(res, 200, { ok: true });
 
-    const ip = req.socket.remoteAddress || 'local';
+    const ip = clientIp(req);
     if (tooManyAttempts(ip)) return fail(res, 429, 'Too many attempts — wait a minute');
 
-    const given = Buffer.from(String(body.password || ''));
-    const ok = given.length === Buffer.byteLength(PASSWORD)
-      && timingSafeEqual(given, Buffer.from(PASSWORD));
+    const given = typeof body.password === 'string' ? body.password : '';
+    const ok = given.length > 0 && given.length <= MAX_PASSWORD_LENGTH
+      && await verifyPassword(given, await storedHash());
     noteAttempt(ip, ok);
     if (!ok) return fail(res, 401, 'Wrong password');
 
-    const token = createSession();
-    res.setHeader('Set-Cookie', `${COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800${COOKIE_SECURE}`);
+    // A new login replaces the session it was made from.
+    sessions.delete(sessionOf(req));
+    res.setHeader('Set-Cookie', sessionCookie(req, createSession(), SESSION_SECONDS));
     return json(res, 200, { ok: true });
   }
 
   if (req.method === 'POST' && pathname === '/api/logout') {
     sessions.delete(sessionOf(req));
-    res.setHeader('Set-Cookie', `${COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${COOKIE_SECURE}`);
+    res.setHeader('Set-Cookie', sessionCookie(req, '', 0));
     return json(res, 200, { ok: true });
   }
 
-  const publicPath = pathname === '/login.html' || pathname === '/favicon.svg';
+  const publicPath = ['/login.html', '/login.css', '/login.js', '/favicon.svg'].includes(pathname);
   if (AUTH_ON && !publicPath && !isAuthed(req)) {
     if (pathname.startsWith('/api/')) return fail(res, 401, 'Sign in required');
     res.statusCode = 302;
@@ -827,6 +979,7 @@ async function route(req, res) {
         entries: entries.length,
         campaigns: campaignSummaries(entries).slice(0, 12),
       },
+      suppression: { path: rel(SUPPRESSION_PATH), count: loadSuppressed(SUPPRESSION_PATH).size },
       defaults: { delay: 4000, campaign: suggestedCampaign() },
       platform: process.platform,
     });
@@ -863,9 +1016,15 @@ async function route(req, res) {
     const cfg = smtpConfigFrom(body);
 
     if (!cfg.host) return fail(res, 400, 'SMTP host is required');
-    if (!cfg.user) return fail(res, 400, 'Mailbox address is required');
-    if (!cfg.pass) return fail(res, 400, 'An app password is required');
+    // A relay on this machine needs no sign-in, only a From address to send as.
+    if (!cfg.isLocal && !cfg.user) return fail(res, 400, 'Mailbox address is required');
+    if (!cfg.isLocal && !cfg.pass) return fail(res, 400, 'An app password is required');
+    if (!cfg.from) return fail(res, 400, 'A From address is required');
     if (!cfg.configured) return fail(res, 400, 'Those settings are incomplete');
+    // Each value becomes one line of the config file; a line break would add keys.
+    if ([cfg.host, cfg.user, cfg.from].some((value) => /[\r\n\0]/.test(value))) {
+      return fail(res, 400, 'Settings cannot contain line breaks');
+    }
 
     let verified = false;
     let verifyError = null;
@@ -964,8 +1123,11 @@ async function route(req, res) {
     const input = resolveInput(body);
     const to = String(body.to || '').trim();
     if (!emailRe.test(to)) return fail(res, 400, 'Enter a valid test address');
+    if (isSuppressed(SUPPRESSION_PATH, to)) return fail(res, 400, `${to} is on the suppression list`);
     const cfg = resolveSmtpConfig();
     if (!cfg.configured) return fail(res, 400, 'SMTP credentials are not set');
+    const issue = complianceIssue(cfg);
+    if (issue) return fail(res, 400, issue);
 
     const rec = { ...input.parsed.recipients[0], _email: to };
     const mailer = createMailer(cfg);
@@ -996,6 +1158,8 @@ async function route(req, res) {
     const input = resolveInput(body);
     const cfg = resolveSmtpConfig();
     if (!cfg.configured) return fail(res, 400, 'SMTP credentials are not set');
+    const issue = complianceIssue(cfg);
+    if (issue) return fail(res, 400, issue);
 
     const delay = delayFrom(body.delay);
     let job;
@@ -1005,6 +1169,26 @@ async function route(req, res) {
       return fail(res, err.status || 409, err.message);
     }
     return json(res, 202, { jobId: job.id, total: input.parsed.recipients.length, skipped: input.alreadySent.size });
+  }
+
+  // ── Suppression list ──────────────────────────────────────────────
+  if (req.method === 'GET' && pathname === '/api/suppression') {
+    const emails = [...loadSuppressed(SUPPRESSION_PATH)].sort();
+    return json(res, 200, { path: rel(SUPPRESSION_PATH), count: emails.length, emails });
+  }
+
+  // Body: { emails: "a@x.com\nb@x.com" | ["a@x.com"], reason?: "unsubscribe" }
+  if (req.method === 'POST' && pathname === '/api/suppress') {
+    const body = await readJson(req);
+    const list = typeof body.emails === 'string' ? body.emails.split(/[\s,;]+/) : body.emails;
+    if (!Array.isArray(list) || list.some((item) => typeof item !== 'string')) {
+      return fail(res, 400, 'emails must be a string or an array of strings');
+    }
+    const emails = list.map((item) => item.trim()).filter(Boolean);
+    if (!emails.length) return fail(res, 400, 'Give at least one address to suppress');
+    const result = addSuppressed(SUPPRESSION_PATH, emails, typeof body.reason === 'string' ? body.reason : 'manual');
+    if (!result.added.length && !result.already.length) return fail(res, 400, `Not an email address: ${result.invalid.join(', ')}`);
+    return json(res, 200, { ...result, count: loadSuppressed(SUPPRESSION_PATH).size });
   }
 
   // ── Scheduled campaigns ───────────────────────────────────────────
@@ -1020,6 +1204,10 @@ async function route(req, res) {
   if (req.method === 'POST' && pathname === '/api/schedule') {
     const body = await readJson(req);
     const input = resolveInput(body);
+    // Queueing before SMTP is set up is allowed; the run re-checks when it fires.
+    const smtp = resolveSmtpConfig();
+    const issue = smtp.configured ? complianceIssue(smtp) : null;
+    if (issue) return fail(res, 400, issue);
 
     const at = Date.parse(String(body.at || ''));
     if (!Number.isFinite(at)) return fail(res, 400, 'Pick a date and time');
@@ -1041,6 +1229,9 @@ async function route(req, res) {
         email: r._email,
         name: r._name,
         company: r._company,
+        // The other CSV columns, so {{column}} in the template and subject
+        // renders the same when the entry fires as it did in the preview.
+        fields: Object.fromEntries(Object.entries(r).filter(([key]) => !key.startsWith('_'))),
       })),
       status: 'pending',
       error: null,
@@ -1172,6 +1363,13 @@ let started = null;
 export function startServer({ port = PORT, host = HOST } = {}) {
   if (started) return Promise.resolve(started);
   try {
+    assertConfig(process.env, {
+      templatesDir: TEMPLATE_DIR,
+      writableDirs: [
+        { label: 'log folder', path: dirname(LOG_PATH) },
+        { label: 'schedule folder', path: dirname(SCHEDULE_PATH) },
+      ],
+    });
     assertBindingIsSafe(host);
     server = createServer();
   } catch (err) {
@@ -1202,8 +1400,10 @@ function banner() {
   console.log(`\n  Mailroom ${APP_VERSION}`);
   console.log(`  ─────────────`);
   console.log(`  url       ${TLS_ON ? 'https' : 'http'}://${HOST}:${PORT}`);
-  console.log(`  smtp      ${cfg.host}:${cfg.port} ${cfg.configured ? '(configured)' : '(set it up in the browser)'}`);
+  const missing = missingSmtpFields(cfg);
+  console.log(`  smtp      ${cfg.host}:${cfg.port} ${cfg.configured ? '(configured)' : `(missing ${missing.join(', ')}; set it up in the browser)`}`);
   console.log(`  config    ${rel(configFile.path)}`);
+  if (PASSWORD && !PASSWORD_HASH) console.log('  password  stored in plaintext (MAILROOM_PASSWORD); switch to MAILROOM_PASSWORD_HASH: node src/lib/auth.mjs');
   console.log(`  log       ${rel(LOG_PATH)}`);
   if (!LOOPBACK) {
     if (!TLS_ON) console.log('  transport plain HTTP (MAILROOM_ALLOW_INSECURE=1)');
@@ -1224,28 +1424,53 @@ if (isMain) {
     });
 }
 
-let shuttingDown = false;
+const SHUTDOWN_WAIT_MS = 8000;
 
-for (const signal of ['SIGINT', 'SIGTERM']) {
+/** Stops the running campaign cleanly, reports it, and returns the exit code. */
+async function shutDown(signal) {
+  if (schedulerTimer) clearInterval(schedulerTimer);
+
+  // The message in flight finishes and is logged; the rest are never started.
+  // A scheduled entry goes back to "pending" and resumes on the next start.
+  const job = runningJob();
+  if (job) job.cancelled = true;
+
+  const deadline = Date.now() + SHUTDOWN_WAIT_MS;
+  while ((runningJob() || ticking) && Date.now() < deadline) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+  }
+  if (!job) return 0;
+
+  const start = job.events.find((event) => event.type === 'start') || {};
+  const campaign = start.campaign || '';
+  const resume = job.scheduleId
+    ? 'The scheduled entry is back in the queue and resumes when Mailroom starts again (or use Run now).'
+    : 'Start the same campaign again to resume; addresses already sent are skipped.';
+
+  if (!job.done) {
+    console.error(`\n  Interrupted by ${signal}: ${campaign ? `campaign "${campaign}"` : 'the campaign'} did not stop within ${SHUTDOWN_WAIT_MS / 1000}s.`);
+    console.error('  The message in flight may or may not have been delivered; check the send log before running it again.\n');
+    return SIGNAL_EXIT[signal];
+  }
+  if (job.summary?.remaining > 0) {
+    console.error(`\n  ${describeInterruption(signal, job.summary, { campaign, resume }).replace(/\n/g, '\n  ')}\n`);
+    return SIGNAL_EXIT[signal];
+  }
+  return 0;
+}
+
+for (const signal of Object.keys(SIGNAL_EXIT)) {
   process.on(signal, async () => {
-    if (shuttingDown) process.exit(1); // second Ctrl+C is a hard stop
+    if (shuttingDown) {
+      console.error('\n  Second signal: exiting now. A message in flight may not have been recorded.\n');
+      process.exit(SIGNAL_EXIT[signal]);
+    }
     shuttingDown = true;
 
-    if (schedulerTimer) clearInterval(schedulerTimer);
-
-    // Stop cleanly: the message in flight finishes and is logged, the rest
-    // are never started. A scheduled entry stays pending and fires on the
-    // next start if it is still within the grace window.
-    for (const job of jobs.values()) job.cancelled = true;
-
-    const deadline = Date.now() + 8000;
-    while (runningJob() && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-
-    server?.close(() => process.exit(0));
-    if (!server) process.exit(0);
-    setTimeout(() => process.exit(0), 500).unref();
+    const code = await shutDown(signal);
+    server?.close(() => process.exit(code));
+    if (!server) process.exit(code);
+    setTimeout(() => process.exit(code), 500).unref();
   });
 }
 

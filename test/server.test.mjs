@@ -66,6 +66,38 @@ test('a symlink inside data/ cannot read a file outside it', async (t) => {
   assert.match(response.data.error, /Not allowed/);
 });
 
+test('settings save accepts a local relay without credentials and still requires them elsewhere', async (t) => {
+  const sink = await startSmtpSink();
+  const server = await startServer();
+  t.after(async () => { await server.stop(); await sink.close(); });
+  const base = server.base;
+
+  const local = await post(base, '/api/settings', {
+    host: '127.0.0.1', port: sink.port, secure: false, user: '', pass: '', from: 'Desk <desk@local.test>',
+  });
+  assert.equal(local.status, 200, JSON.stringify(local.data));
+  assert.equal(local.data.ok, true);
+  assert.equal(local.data.saved, true);
+  assert.equal(local.data.smtp.configured, true);
+  assert.equal(local.data.smtp.passwordSet, false);
+
+  const state = await get(base, '/api/state');
+  assert.equal(state.data.setup.configured, true);
+
+  // A relay on loopback still needs a From address, since there is no mailbox to fall back to.
+  const noFrom = await post(base, '/api/settings', { host: 'localhost', port: sink.port, user: '', pass: '', from: '' });
+  assert.equal(noFrom.status, 400);
+  assert.match(noFrom.data.error, /From address/);
+
+  // Any other host still needs both credentials.
+  const noPass = await post(base, '/api/settings', { host: 'smtp.example.test', port: 587, user: 'desk@example.test', pass: '' });
+  assert.equal(noPass.status, 400);
+  assert.match(noPass.data.error, /app password is required/);
+  const noUser = await post(base, '/api/settings', { host: 'smtp.example.test', port: 587, user: '', pass: 'x' });
+  assert.equal(noUser.status, 400);
+  assert.match(noUser.data.error, /Mailbox address is required/);
+});
+
 test('setup saves SMTP settings, then preview, roster and send work', async (t) => {
   const sink = await startSmtpSink();
   const server = await startServer();
@@ -258,4 +290,48 @@ test('MAILROOM_PASSWORD gates the whole app', async (t) => {
 
   await post(base, '/api/logout', {}, { cookie: session });
   assert.equal((await get(base, '/api/state', { cookie: session })).status, 401);
+});
+
+test('a malformed session cookie is just signed out, not a server error', async (t) => {
+  const server = await startServer({ env: { MAILROOM_PASSWORD: 'secret-pass' } });
+  t.after(server.stop);
+
+  const res = await get(server.base, '/api/state', { cookie: 'mr_session=%E0%A4%A' });
+  assert.equal(res.status, 401);
+  assert.doesNotMatch(server.output(), /request failed/);
+});
+
+test('a request body that is not a JSON object or is too large is a client error', async (t) => {
+  const server = await startServer();
+  t.after(server.stop);
+  const send = (body) => fetch(`${server.base}/api/preview`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body,
+  });
+
+  for (const body of ['null', '[]', '"text"', '42']) {
+    const res = await send(body);
+    assert.equal(res.status, 400, `body ${body}`);
+  }
+
+  const big = await send(JSON.stringify({ subject: 'x'.repeat(3 * 1024 * 1024) }));
+  assert.equal(big.status, 413);
+  assert.doesNotMatch(server.output(), /request failed/);
+});
+
+test('a line break in a settings field cannot add keys to the config file', async (t) => {
+  const server = await startServer();
+  t.after(server.stop);
+
+  const res = await post(server.base, '/api/settings', {
+    host: '127.0.0.1', port: 2525, user: 'desk@local.test', pass: 'x', test: false,
+    from: 'Desk <desk@local.test>\nSMTP_HOST=attacker.example',
+  });
+  assert.equal(res.status, 400);
+
+  const saved = existsSync(join(server.workDir, 'config.env'))
+    ? readFileSync(join(server.workDir, 'config.env'), 'utf8')
+    : '';
+  assert.doesNotMatch(saved, /attacker\.example/);
 });

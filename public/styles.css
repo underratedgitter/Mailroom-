@@ -33,6 +33,7 @@ body {
     linear-gradient(rgba(28, 27, 22, 0.045) 1px, transparent 1px),
     linear-gradient(90deg, rgba(28, 27, 22, 0.045) 1px, transparent 1px);
   background-size: 22px 22px;
+  font-variant-numeric: tabular-nums;
   display: flex;
   flex-direction: column;
 }
@@ -92,7 +93,10 @@ h2 { font-size: 13px; font-weight: 600; letter-spacing: 0.02em; }
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 34ch;
+  /* Fixed width: the columns beside it must not slide when the real value
+     replaces the placeholder dash. */
+  width: 30ch;
+  max-width: 100%;
 }
 
 .waybill__stamp { display: flex; align-items: center; gap: 12px; }
@@ -107,6 +111,9 @@ h2 { font-size: 13px; font-weight: 600; letter-spacing: 0.02em; }
   transform: rotate(-3deg);
   opacity: 0;
   white-space: nowrap;
+  /* Wide enough for "connection ok" so the buttons beside it stay put. */
+  min-width: 128px;
+  text-align: center;
 }
 .stamp[data-state="ok"] { color: #7fe0a8; opacity: 1; animation: stamp-in 0.32s ease-out; }
 .stamp[data-state="bad"] { color: #ff9c92; opacity: 1; animation: stamp-in 0.32s ease-out; }
@@ -118,6 +125,13 @@ h2 { font-size: 13px; font-weight: 600; letter-spacing: 0.02em; }
 }
 
 /* ── Desk layout ────────────────────────────────────────────────── */
+/* Hidden until the first state arrives, so the form is not seen growing as
+   its lists, hints and roster fill in, nor the header values sliding. */
+body.is-loading .desk,
+body.is-loading .waybill__meta,
+body.is-loading .waybill__stamp { visibility: hidden; animation: unveil 0s 3s forwards; }
+@keyframes unveil { to { visibility: visible; } } /* failsafe if the script never finishes */
+
 .desk {
   flex: 1;
   min-height: 0;
@@ -142,6 +156,7 @@ h2 { font-size: 13px; font-weight: 600; letter-spacing: 0.02em; }
   gap: 14px;
   padding: 14px 16px 16px;
   overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .slip__head {
@@ -158,7 +173,8 @@ h2 { font-size: 13px; font-weight: 600; letter-spacing: 0.02em; }
   font-size: 10px;
   letter-spacing: 0.06em;
   color: var(--ink-soft);
-  max-width: 22ch;
+  width: 22ch;
+  text-align: right;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -199,6 +215,8 @@ select:focus-visible,
   outline-offset: 1px;
   border-color: var(--blue);
 }
+
+#templateHint { min-height: 2.7em; } /* the two lines it usually fills */
 
 .hint {
   margin: 5px 0 0;
@@ -266,6 +284,7 @@ select:focus-visible,
   padding: 0;
   max-height: 158px;
   overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .roster__row {
@@ -317,6 +336,7 @@ select:focus-visible,
 .roster__tag[hidden] { display: none; }
 
 .paste { display: flex; flex-direction: column; gap: 6px; }
+.paste[hidden] { display: none; }
 
 .paste textarea {
   font-family: var(--mono);
@@ -383,7 +403,8 @@ select:focus-visible,
   line-height: 15px;
   text-align: center;
 }
-.badge[hidden] { display: none; }
+/* Keeps its width while empty so "Scheduled" does not grow when a count arrives. */
+.badge[hidden] { display: inline-block; visibility: hidden; }
 
 .queue {
   list-style: none;
@@ -391,6 +412,7 @@ select:focus-visible,
   padding: 0;
   max-height: 330px;
   overflow-y: auto;
+  scrollbar-gutter: stable;
   border: 1px solid var(--rule);
   border-radius: 2px;
   background: var(--paper-2);
@@ -504,6 +526,7 @@ select:focus-visible,
 .proof__who { min-width: 0; display: flex; flex-direction: column; }
 #proofTo { font-family: var(--mono); font-size: 12px; }
 .proof__subject {
+  min-height: 1.45em;
   font-size: 11.5px;
   color: var(--ink-soft);
   white-space: nowrap;
@@ -569,6 +592,7 @@ select:focus-visible,
   align-items: center;
   gap: 14px;
   padding: 9px 14px;
+  min-height: 55px; /* same height with or without the Stop button */
   border-bottom: 1px solid var(--rule);
 }
 .run__counts { display: flex; gap: 12px; flex: 1; font-family: var(--mono); font-size: 11px; color: var(--ink-soft); }
@@ -581,6 +605,7 @@ select:focus-visible,
   padding: 4px 0;
   list-style: none;
   overflow-y: auto;
+  scrollbar-gutter: stable;
   flex: 1;
   min-height: 0;
   font-family: var(--mono);

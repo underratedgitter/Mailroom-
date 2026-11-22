@@ -22,8 +22,11 @@ process.once('exit', () => rmSync(fixtureDir, { recursive: true, force: true }))
 // The developer's own settings must never leak into a test.
 const INHERITED_ENV = [
   'SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM', 'EMAIL_FROM', 'SMTP_SECURE',
-  'MAILROOM_PASSWORD', 'MAILROOM_TLS_CERT', 'MAILROOM_TLS_KEY', 'MAILROOM_ALLOW_INSECURE',
+  'MAILROOM_PASSWORD', 'MAILROOM_PASSWORD_HASH', 'MAILROOM_TRUST_PROXY',
+  'MAILROOM_SESSION_TTL_SECONDS', 'MAILROOM_TLS_CERT', 'MAILROOM_TLS_KEY', 'MAILROOM_ALLOW_INSECURE',
   'GUI_ALLOWED_HOSTS', 'SCHEDULE_FILE', 'SCHEDULER_INTERVAL_MS', 'SCHEDULE_GRACE_MS',
+  'SEND_LOG_MAX_BYTES', 'SEND_LOG_KEEP',
+  'SUPPRESSION_FILE', 'MAX_PER_HOUR', 'MAX_PER_DOMAIN_PER_HOUR', 'EMAIL_REPLY_TO', 'UNSUBSCRIBE_MAILTO', 'UNSUBSCRIBE_URL',
 ];
 
 function serverEnv(workDir, port, env) {
@@ -35,6 +38,7 @@ function serverEnv(workDir, port, env) {
     MAILROOM_CONFIG: join(workDir, 'config.env'),
     SEND_LOG: join(workDir, 'sent.jsonl'),
     SCHEDULE_FILE: join(workDir, 'schedule.json'),
+    SUPPRESSION_FILE: join(workDir, 'suppressed.csv'),
     ...env,
   });
 }

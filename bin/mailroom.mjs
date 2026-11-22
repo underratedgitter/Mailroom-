@@ -48,8 +48,15 @@ for (let i = 0; i < args.length; i++) {
   }
   if (arg === '--no-open') { opts.open = false; continue; }
   if (arg === '--open') { opts.open = true; continue; }
-  if (arg === '--port') { process.env.GUI_PORT = args[++i]; continue; }
-  if (arg === '--host') { process.env.GUI_HOST = args[++i]; continue; }
+  if (arg === '--port' || arg === '--host') {
+    const value = args[++i];
+    if (value === undefined || value.startsWith('--')) {
+      console.error(`${arg} needs a value (try --help)`);
+      process.exit(1);
+    }
+    process.env[arg === '--port' ? 'GUI_PORT' : 'GUI_HOST'] = value;
+    continue;
+  }
   console.error(`Unknown option: ${arg} (try --help)`);
   process.exit(1);
 }

@@ -761,3 +761,16 @@ test('parseCsv refuses an unclosed quote instead of swallowing the rows after it
   // A quote that closes after spanning lines is fine.
   assert.equal(parseCsv('email,note\na@b.co,"one\ntwo"\nb@b.co,x\n').length, 2);
 });
+
+test('a saved recipient list cannot carry a spreadsheet formula, and reads back unchanged', () => {
+  const originals = [
+    { _email: '+tag@example.com', _name: '=HYPERLINK("http://evil.example","click")', _company: '@SUM(A1:A9)' },
+    { _email: 'b@example.com', _name: '-2+3', _company: 'Plain Co' },
+  ];
+  const csv = recipientsToCsv(originals);
+  for (const row of parseCsv(csv)) {
+    for (const value of Object.values(row)) assert.doesNotMatch(value, /^[=+\-@]/, value);
+  }
+  const { recipients } = parseRecipients(csv);
+  assert.deepEqual(recipients.map((r) => [r._email, r._name, r._company]), originals.map((r) => [r._email, r._name, r._company]));
+});

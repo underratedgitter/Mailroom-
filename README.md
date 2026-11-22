@@ -381,7 +381,10 @@ What stays with you, because it cannot be done from inside the app:
   `SEND_LOG_KEEP` if you resume very old campaigns. `schedule.json` is bounded
   separately (finished entries are dropped after 60 days).
 - A CSV with an unclosed quote is rejected (`Unclosed quote starting on line
-  N`) instead of silently dropping every row after it.
+  N`) instead of silently dropping every row after it. Lists Mailroom saves
+  from the paste box prefix any name, company or address that starts with `=`,
+  `+`, `-` or `@` with an apostrophe so a spreadsheet does not run it as a
+  formula; the apostrophe is removed when the list is read back.
 - A subject line is not HTML: `&` and apostrophes reach the recipient as typed,
   while the body is escaped so a name cannot break the markup.
 

@@ -118,9 +118,9 @@ export function parseRecipients(raw, { limit = Infinity } = {}) {
   const rows = parseCsv(raw);
   const records = rows.map((row) => ({
     ...row,
-    _email: pick(row, EMAIL_KEYS),
-    _name: pick(row, NAME_KEYS),
-    _company: pick(row, COMPANY_KEYS),
+    _email: restore(pick(row, EMAIL_KEYS)),
+    _name: restore(pick(row, NAME_KEYS)),
+    _company: restore(pick(row, COMPANY_KEYS)),
   }));
   return { ...finishRecords(records, limit), columns: Object.keys(rows[0]) };
 }
@@ -163,10 +163,20 @@ export function recipientsFromFile(csvPath, options = {}) {
   return parseRecipients(readFileSync(csvPath, 'utf8'), options);
 }
 
+// A cell that starts with = + - @ is run as a formula when the file is opened in
+// a spreadsheet. The saved list marks such cells with a leading apostrophe,
+// which spreadsheets show as plain text, and reading the list takes it off.
+const FORMULA_START = /^[=+\-@\t\r]/;
+const neutralise = (value) => {
+  const text = String(value ?? '');
+  return FORMULA_START.test(text) ? `'${text}` : text;
+};
+const restore = (value) => (/^'[=+\-@\t\r]/.test(value) ? value.slice(1) : value);
+
 /** Writes recipients back out as a CSV the sender (and Excel) can read. */
 export function recipientsToCsv(recipients) {
   const cell = (value) => {
-    const text = String(value ?? '');
+    const text = neutralise(value);
     return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
   };
   const lines = ['email,name,company'];

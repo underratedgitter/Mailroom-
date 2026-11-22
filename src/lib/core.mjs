@@ -573,7 +573,7 @@ export function createMailer(cfg = resolveSmtpConfig()) {
     } catch (err) {
       // Fresh socket on the next attempt — pooled connections can go stale.
       transport = null;
-      return { success: false, error: err.message, code: err.code, responseCode: err.responseCode };
+      return { success: false, error: err.message, code: err.code, command: err.command, response: err.response, responseCode: err.responseCode };
     }
   }
 
@@ -600,9 +600,15 @@ export function isTransient(failure) {
   return /timeout|timed out|ECONN|ETIMEDOUT|EAI_AGAIN|ESOCKET|EPIPE|socket hang up|connection closed|connection lost|421|450|451|452|try again|rate/i.test(error || '');
 }
 
+/** A refusal of one recipient says nothing about the account sending it. */
+const isRecipientStage = ({ code, command }) => command === 'RCPT TO' || (code === 'EENVELOPE' && command !== 'MAIL FROM');
+
 export function isFatal(failure) {
-  const { error, code } = typeof failure === 'object' && failure ? failure : { error: failure };
+  const { error, code, command } = typeof failure === 'object' && failure ? failure : { error: failure };
   if (code === 'EAUTH') return true;
+  // "over quota" or "account disabled" in a RCPT reply (or in the address it
+  // echoes) is about that recipient: halting would stop every resume on them.
+  if (isRecipientStage({ code, command })) return false;
   return /daily user sending limit|5\.4\.5|quota|account.*disabled|authentication/i.test(error || '');
 }
 

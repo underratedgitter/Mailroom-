@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, symlinkSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, symlinkSync, readdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -504,4 +504,76 @@ test('an address the mailer would split or rewrite is invalid, not mailed to som
   const parsed = parseRecipients('email,name\n"a,b@x.com",A\nok@x.com,Ok\n');
   assert.deepEqual(parsed.recipients.map((r) => r._email), ['ok@x.com']);
   assert.equal(parsed.invalid, 1);
+});
+
+/** Runs a campaign through a real mailer against a local SMTP sink; resolves what the run left behind. */
+async function campaignAgainstSink({ sink: sinkOptions, addresses, run = {} }) {
+  const sink = await startSmtpSink(sinkOptions);
+  const mailer = createMailer({ host: '127.0.0.1', port: sink.port, secure: false, requireTLS: false, from: 'me@x.co', ...run.cfg });
+  const dir = workDir();
+  const logPath = join(dir, 'sent.jsonl');
+  const suppressionPath = join(dir, 'suppressed.csv');
+  try {
+    const summary = await runCampaign({
+      recipients: addresses.map(recipient),
+      templateHtml: 'x',
+      subjectTemplate: 'x',
+      delayMs: 0,
+      retryDelay: 1,
+      limits: { perHour: 0, perDomainPerHour: 0 },
+      mailer,
+      logPath,
+      suppressionPath,
+      onEvent: () => {},
+      ...run.options,
+    });
+    return {
+      summary,
+      messages: sink.messages,
+      connections: sink.connectionCount(),
+      log: readLog(logPath),
+      suppressed: existsSync(suppressionPath) ? readFileSync(suppressionPath, 'utf8') : '',
+    };
+  } finally {
+    mailer.close();
+    await sink.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('a refused recipient is judged on its own and never halts the campaign', async () => {
+  // Each reply mentions words the old text match treated as account-level.
+  const replies = [
+    (addr) => `452 4.2.2 <${addr}> mailbox over quota`,
+    (addr) => `550 5.2.1 <${addr}> account disabled`,
+    (addr) => `550 5.7.1 <${addr}> authentication required`,
+  ];
+  for (const reply of replies) {
+    const { summary, messages } = await campaignAgainstSink({
+      sink: { rcpt: (addr) => (addr.includes('full') ? reply(addr) : null) },
+      addresses: ['full@example.test', 'ok@example.test'],
+    });
+    assert.equal(summary.stopped, false, reply('x'));
+    assert.deepEqual([summary.sent, summary.failed], [1, 1]);
+    assert.equal(messages.length, 1);
+  }
+});
+
+test('an address with "quota" or "disabled" in it does not stop the run when it is refused', async () => {
+  const { summary } = await campaignAgainstSink({
+    sink: { rcpt: (addr) => (addr.includes('quota') ? `550 5.1.1 <${addr}> no such user` : null) },
+    addresses: ['quota-account-disabled@example.test', 'ok@example.test'],
+  });
+  assert.equal(summary.stopped, false);
+  assert.equal(summary.sent, 1);
+});
+
+test('a sender-stage quota refusal still stops the run', async () => {
+  const { summary, messages } = await campaignAgainstSink({
+    sink: { mail: () => '550 5.4.5 Daily user sending quota exceeded' },
+    addresses: ['a@example.test', 'b@example.test'],
+  });
+  assert.equal(summary.stopped, true);
+  assert.equal(summary.failed, 1);
+  assert.equal(messages.length, 0);
 });

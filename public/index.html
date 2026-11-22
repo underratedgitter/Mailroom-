@@ -4,8 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Mailroom — send mail from your own mailbox</title>
-<meta name="description" content="Self-hosted bulk mail for your own SMTP account: pick a template, paste recipients, preview, send. No tracking, no third parties.">
-<meta name="theme-color" content="#1c1b16">
+<meta name="description" content="Self-hosted bulk mail for your own SMTP account: pick a template, add recipients, preview, send or schedule. No tracking, no third parties.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f5f6f8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0e1116" media="(prefers-color-scheme: dark)">
 <meta property="og:title" content="Mailroom">
 <meta property="og:description" content="Self-hosted bulk mail for your own SMTP account.">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
@@ -13,252 +15,633 @@
 </head>
 <body class="is-loading">
 
-<header class="waybill">
-  <div class="mark">
-    <svg class="mark__logo" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
-      <rect x="2" y="2" width="28" height="28" rx="4" fill="currentColor"></rect>
-      <path d="M8.5 11.5h15v9h-15z" fill="none" stroke="#fbf8f0" stroke-width="2" stroke-linejoin="round"></path>
-      <path d="M8.5 11.5l7.5 5.5 7.5-5.5" fill="none" stroke="#fbf8f0" stroke-width="2" stroke-linejoin="round"></path>
-    </svg>
-    <span class="mark__name">Mailroom</span>
-    <span class="mark__place">self-hosted</span>
-  </div>
+<a class="skip" href="#main">Skip to content</a>
 
-  <dl class="waybill__meta">
-    <div><dt>Sending from</dt><dd id="metaFrom">—</dd></div>
-    <div><dt>Server</dt><dd id="metaServer">—</dd></div>
-    <div><dt>Log</dt><dd id="metaLog">—</dd></div>
-  </dl>
+<svg class="sprite" width="0" height="0" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="i-overview" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></symbol>
+    <symbol id="i-compose" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></symbol>
+    <symbol id="i-users" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2l-7 20-4-9-9-4Z"/></symbol>
+    <symbol id="i-calendar" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></symbol>
+    <symbol id="i-ban" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="m5.6 5.6 12.8 12.8"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></symbol>
+    <symbol id="i-circle" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+    <symbol id="i-upload" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5"/><path d="M12 3v12"/></symbol>
+    <symbol id="i-logout" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></symbol>
+    <symbol id="i-left" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></symbol>
+    <symbol id="i-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-15.5 6.2L3 16"/><path d="M3 12A9 9 0 0 1 18.5 5.8L21 8"/><path d="M21 3v5h-5M3 21v-5h5"/></symbol>
+    <symbol id="i-plug" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5"/><path d="M9 8V2M15 8V2"/><path d="M18 8v5a6 6 0 0 1-12 0V8Z"/></symbol>
+  </defs>
+</svg>
 
-  <div class="waybill__stamp">
-    <button id="queueBtn" class="btn btn--quiet btn--topbar" type="button">
-      Scheduled <span class="badge" id="queueCount" hidden>0</span>
-    </button>
-    <button id="settingsBtn" class="btn btn--quiet btn--topbar" type="button">Settings</button>
-    <button id="signOutBtn" class="btn btn--quiet btn--topbar" type="button" hidden>Sign out</button>
-    <button id="verifyBtn" class="btn btn--stamp" type="button">Check connection</button>
-    <span id="stampResult" class="stamp" data-state="idle" aria-live="polite"></span>
-  </div>
-</header>
+<div class="app">
 
-<main class="desk">
+  <!-- ── Navigation ───────────────────────────────────────────── -->
+  <header class="sidebar">
+    <a class="brand" href="#/overview" aria-label="Mailroom, overview">
+      <svg class="brand__logo" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+        <rect width="32" height="32" rx="8" class="brand__tile"></rect>
+        <path d="M8.5 11.5h15v9h-15z" fill="none" stroke="#fff" stroke-width="2" stroke-linejoin="round"></path>
+        <path d="M8.5 11.5l7.5 5.5 7.5-5.5" fill="none" stroke="#fff" stroke-width="2" stroke-linejoin="round"></path>
+      </svg>
+      <span class="brand__name">Mailroom</span>
+      <span class="brand__tag">self-hosted</span>
+    </a>
 
-  <!-- ── Dispatch slip ─────────────────────────────────────────── -->
-  <form class="slip" id="compose" autocomplete="off">
-    <div class="slip__head">
-      <h1>Compose</h1>
-      <span class="slip__no" id="slipNo">no campaign</span>
+    <nav class="nav" id="nav" aria-label="Main">
+        <a class="nav__link" href="#/overview" data-route="overview"><svg class="icon nav__icon" aria-hidden="true" focusable="false"><use href="#i-overview"></use></svg><span class="nav__label">Overview</span></a>
+        <a class="nav__link" href="#/compose" data-route="compose"><svg class="icon nav__icon" aria-hidden="true" focusable="false"><use href="#i-compose"></use></svg><span class="nav__label">Compose</span></a>
+        <a class="nav__link" href="#/recipients" data-route="recipients"><svg class="icon nav__icon" aria-hidden="true" focusable="false"><use href="#i-users"></use></svg><span class="nav__label">Recipients</span></a>
+        <a class="nav__link" href="#/send" data-route="send"><svg class="icon nav__icon" aria-hidden="true" focusable="false"><use href="#i-send"></use></svg><span class="nav__label">Send</span><span class="badge badge--live" id="navSendBadge" hidden>Live</span></a>
+        <a class="nav__link" href="#/schedule" data-route="schedule"><svg class="icon nav__icon" aria-hidden="true" focusable="false"><use href="#i-calendar"></use></svg><span class="nav__label">Schedule</span><span class="badge" id="navScheduleBadge" hidden>0</span></a>
+        <a class="nav__link" href="#/suppression" data-route="suppression"><svg class="icon nav__icon" aria-hidden="true" focusable="false"><use href="#i-ban"></use></svg><span class="nav__label">Suppression</span></a>
+        <a class="nav__link" href="#/settings" data-route="settings"><svg class="icon nav__icon" aria-hidden="true" focusable="false"><use href="#i-gear"></use></svg><span class="nav__label">Settings</span></a>
+    </nav>
+
+    <div class="sidebar__foot">
+      <div class="conn" id="sidebarConn" data-state="idle">
+        <span class="conn__dot" aria-hidden="true"></span>
+        <span class="conn__text">
+          <span class="conn__title" id="connTitle">Mailbox</span>
+          <span class="conn__sub" id="connSub">Loading…</span>
+        </span>
+      </div>
+      <button class="btn btn--ghost btn--block" id="signOutBtn" type="button" hidden><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-logout"></use></svg>Sign out</button>
+    </div>
+  </header>
+
+  <!-- ── Content ──────────────────────────────────────────────── -->
+  <main class="main" id="main" tabindex="-1">
+
+    <div class="banner banner--bad" id="offlineBar" role="alert" hidden>
+      <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-alert"></use></svg>
+      <span id="offlineText">Cannot reach the Mailroom server. Is it still running?</span>
+      <button class="btn btn--sm" id="retryBtn" type="button">Retry</button>
     </div>
 
-    <div class="field">
-      <label for="template">Template</label>
-      <select id="template"></select>
-      <p class="hint" id="templateHint"></p>
-    </div>
+    <a class="banner banner--live" id="liveBar" href="#/send" hidden>
+      <span class="live__dot" aria-hidden="true"></span>
+      <span class="live__text" id="liveText">Campaign sending</span>
+      <progress class="live__bar" id="liveProgress" value="0" max="1" aria-label="Campaign progress"></progress>
+      <span class="live__link">View progress</span>
+    </a>
 
-    <div class="field">
-      <div class="field__head">
-        <label for="csv">Recipients</label>
-        <div class="seg" role="group" aria-label="Where the recipients come from">
-          <button type="button" class="seg__btn is-on" id="modeSaved">Saved list</button>
-          <button type="button" class="seg__btn" id="modePaste">Paste emails</button>
+    <!-- Overview -->
+    <section class="view" id="viewOverview" aria-labelledby="hOverview" hidden>
+      <header class="view__head">
+        <div>
+          <h1 id="hOverview" tabindex="-1">Overview</h1>
+          <p class="lead">Your mailbox, lists and recent campaigns at a glance.</p>
+        </div>
+        <div class="view__actions">
+          <button class="btn" id="verifyBtn" type="button"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-plug"></use></svg>Check connection</button>
+        </div>
+      </header>
+
+      <div class="callout" id="setupCallout" hidden>
+        <svg class="icon callout__icon" aria-hidden="true" focusable="false"><use href="#i-info"></use></svg>
+        <div class="callout__text">
+          <strong>Connect your mailbox to start sending.</strong>
+          <span>Mailroom sends through your own SMTP account, so mail comes from your address.</span>
+        </div>
+        <a class="btn btn--primary" href="#/settings">Connect mailbox</a>
+      </div>
+
+      <div class="stats" id="stats">
+        <a class="stat" href="#/settings">
+          <span class="stat__label">Mailbox</span>
+          <strong class="stat__value" id="statMailbox">—</strong>
+          <span class="stat__sub" id="statServer">—</span>
+          <span class="pill" id="connPill" data-state="idle">Not checked</span>
+        </a>
+        <a class="stat" href="#/recipients">
+          <span class="stat__label">Recipient lists</span>
+          <strong class="stat__value" id="statLists">—</strong>
+          <span class="stat__sub" id="statListsSub">—</span>
+        </a>
+        <a class="stat" href="#/compose">
+          <span class="stat__label">Templates</span>
+          <strong class="stat__value" id="statTemplates">—</strong>
+          <span class="stat__sub" id="statTemplatesSub">—</span>
+        </a>
+        <a class="stat" href="#/schedule">
+          <span class="stat__label">Scheduled</span>
+          <strong class="stat__value" id="statScheduled">—</strong>
+          <span class="stat__sub" id="statScheduledSub">—</span>
+        </a>
+        <a class="stat" href="#/suppression">
+          <span class="stat__label">Suppressed</span>
+          <strong class="stat__value" id="statSuppressed">—</strong>
+          <span class="stat__sub">Never mailed</span>
+        </a>
+        <a class="stat" href="#/send">
+          <span class="stat__label">Send log</span>
+          <strong class="stat__value" id="statLog">—</strong>
+          <span class="stat__sub" id="statLogSub">—</span>
+        </a>
+      </div>
+
+      <div class="split split--even">
+        <section class="card" aria-labelledby="hSteps">
+          <h2 class="card__title" id="hSteps">Get ready to send</h2>
+          <ol class="steps" id="steps">
+            <li class="step" data-step="mailbox" data-state="todo">
+              <span class="step__mark" aria-hidden="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-check"></use></svg></span>
+              <span class="step__body"><a href="#/settings">Connect your mailbox</a><span class="step__sub" id="stepMailbox">—</span></span>
+            </li>
+            <li class="step" data-step="compose" data-state="todo">
+              <span class="step__mark" aria-hidden="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-check"></use></svg></span>
+              <span class="step__body"><a href="#/compose">Pick a template and write a subject</a><span class="step__sub" id="stepCompose">—</span></span>
+            </li>
+            <li class="step" data-step="recipients" data-state="todo">
+              <span class="step__mark" aria-hidden="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-check"></use></svg></span>
+              <span class="step__body"><a href="#/recipients">Choose your recipients</a><span class="step__sub" id="stepRecipients">—</span></span>
+            </li>
+            <li class="step" data-step="test" data-state="todo">
+              <span class="step__mark" aria-hidden="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-check"></use></svg></span>
+              <span class="step__body"><a href="#/send">Send yourself a test</a><span class="step__sub" id="stepTest">—</span></span>
+            </li>
+          </ol>
+        </section>
+
+        <section class="card card--table" aria-labelledby="hCampaigns">
+          <h2 class="card__title" id="hCampaigns">Recent campaigns</h2>
+          <div class="table-wrap" id="campaignsWrap">
+            <table class="table">
+              <thead><tr><th scope="col">Campaign</th><th scope="col" class="num">Sent</th><th scope="col" class="num">Failed</th><th scope="col" class="num">Skipped</th><th scope="col">Last activity</th></tr></thead>
+              <tbody id="campaignsBody"></tbody>
+            </table>
+          </div>
+          <div class="empty" id="campaignsEmpty">
+            <svg class="icon empty__icon" aria-hidden="true" focusable="false"><use href="#i-send"></use></svg>
+            <p class="empty__title">No campaigns yet</p>
+            <p class="empty__text">Sent campaigns show up here with their results.</p>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <!-- Compose -->
+    <section class="view" id="viewCompose" aria-labelledby="hCompose" hidden>
+      <header class="view__head">
+        <div>
+          <h1 id="hCompose" tabindex="-1">Compose</h1>
+          <p class="lead">Pick a template, write the subject and check the preview.</p>
+        </div>
+        <div class="view__actions">
+          <a class="btn btn--primary" href="#/recipients">Next: Recipients<svg class="icon" aria-hidden="true" focusable="false"><use href="#i-right"></use></svg></a>
+        </div>
+      </header>
+
+      <div class="split">
+        <form class="card form" id="composeForm" autocomplete="off" novalidate>
+          <h2 class="card__title">Message</h2>
+
+          <div class="field">
+            <label for="template">Template</label>
+            <select id="template"></select>
+            <p class="hint" id="templateHint"></p>
+          </div>
+
+          <div class="field">
+            <label for="subject">Subject line</label>
+            <input id="subject" type="text" placeholder="e.g. Invitation to our November meetup" spellcheck="false" aria-describedby="tokensLabel">
+            <div class="tokens">
+              <span class="tokens__label" id="tokensLabel">Insert merge field</span>
+              <span class="chips" id="tokens" role="group" aria-labelledby="tokensLabel"></span>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="campaign">Campaign name</label>
+            <input id="campaign" type="text" spellcheck="false" placeholder="e.g. connect-nov-2026">
+            <p class="hint">A re-run of the same campaign skips addresses it already sent to.</p>
+          </div>
+
+          <div class="field">
+            <span class="label" id="placeholdersLabel">Merge fields in this message</span>
+            <div class="chips" id="placeholders" role="list" aria-labelledby="placeholdersLabel"></div>
+            <p class="hint" id="placeholdersHint">Use {{name}}, {{company}}, {{email}} or any column of your list.</p>
+          </div>
+
+          <div class="form__foot">
+            <span class="hint" id="recipientSummary">No recipients chosen yet.</span>
+          </div>
+        </form>
+
+        <section class="card preview" aria-labelledby="hPreview">
+          <div class="preview__bar">
+            <div class="preview__who">
+              <h2 class="card__title" id="hPreview">Preview</h2>
+              <span class="preview__to" id="proofTo">No recipient</span>
+              <span class="preview__subject" id="proofSubject"></span>
+            </div>
+            <div class="pager">
+              <button class="btn btn--icon" id="prevBtn" type="button" aria-label="Previous recipient" disabled><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-left"></use></svg></button>
+              <span class="pager__pos" id="proofIndex" aria-live="polite">0 / 0</span>
+              <button class="btn btn--icon" id="nextBtn" type="button" aria-label="Next recipient" disabled><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-right"></use></svg></button>
+              <button class="btn btn--icon" id="previewBtn" type="button" aria-label="Refresh preview"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-refresh"></use></svg></button>
+            </div>
+          </div>
+          <div class="preview__frame">
+            <iframe id="preview" sandbox="" title="Message preview"></iframe>
+            <div class="preview__empty" id="proofEmpty">
+              <svg class="icon empty__icon" aria-hidden="true" focusable="false"><use href="#i-compose"></use></svg>
+              <p class="empty__title" id="proofEmptyTitle">Nothing to preview yet</p>
+              <p class="empty__text" id="proofEmptyText">Pick a template, choose recipients and add a subject.</p>
+            </div>
+          </div>
+          <div class="preview__foot">
+            <span id="proofImages">0 inline images</span>
+            <span id="proofTotal"></span>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <!-- Recipients -->
+    <section class="view" id="viewRecipients" aria-labelledby="hRecipients" hidden>
+      <header class="view__head">
+        <div>
+          <h1 id="hRecipients" tabindex="-1">Recipients</h1>
+          <p class="lead">Choose a saved list, paste addresses or upload a CSV. Every column becomes a merge field.</p>
+        </div>
+        <div class="view__actions">
+          <a class="btn btn--primary" href="#/send">Next: Send<svg class="icon" aria-hidden="true" focusable="false"><use href="#i-right"></use></svg></a>
+        </div>
+      </header>
+
+      <div class="split">
+        <div class="stack">
+          <section class="card form" aria-labelledby="hSource">
+            <h2 class="card__title" id="hSource">Recipient source</h2>
+
+            <div class="tabs" role="tablist" aria-label="Where the recipients come from" id="sourceTabs">
+              <button class="tab" role="tab" type="button" id="tabSaved" data-tab="saved" aria-controls="panelSaved" aria-selected="true">Saved list</button>
+              <button class="tab" role="tab" type="button" id="tabPaste" data-tab="paste" aria-controls="panelPaste" aria-selected="false" tabindex="-1">Paste</button>
+              <button class="tab" role="tab" type="button" id="tabUpload" data-tab="upload" aria-controls="panelUpload" aria-selected="false" tabindex="-1">Upload</button>
+            </div>
+
+            <div class="tabpanel" role="tabpanel" id="panelSaved" aria-labelledby="tabSaved">
+              <div class="field">
+                <label for="csv">List</label>
+                <select id="csv"></select>
+                <p class="hint" id="csvHint"></p>
+              </div>
+              <div class="empty empty--inline" id="csvEmpty" hidden>
+                <p class="empty__title">No saved lists yet</p>
+                <p class="empty__text">Paste addresses or upload a CSV, then save it as a list.</p>
+              </div>
+            </div>
+
+            <div class="tabpanel" role="tabpanel" id="panelPaste" aria-labelledby="tabPaste" hidden>
+              <div class="field">
+                <label for="pasteBox">Addresses</label>
+                <textarea id="pasteBox" rows="7" spellcheck="false" placeholder="priya@example.com, Priya Shah, Sunrise Chemicals&#10;Raj Patel &lt;raj@example.com&gt;&#10;info@example.com"></textarea>
+                <p class="hint" id="pasteCount">One address per line; name and company optional.</p>
+              </div>
+              <div class="inline-form">
+                <div class="field">
+                  <label for="pasteName">List name <span class="optional">optional</span></label>
+                  <input id="pasteName" type="text" spellcheck="false" placeholder="e.g. november-guests">
+                </div>
+                <button type="button" class="btn" id="saveCsvBtn">Save as list</button>
+              </div>
+            </div>
+
+            <div class="tabpanel" role="tabpanel" id="panelUpload" aria-labelledby="tabUpload" hidden>
+              <label class="dropzone" id="dropzone" for="fileInput">
+                <svg class="icon dropzone__icon" aria-hidden="true" focusable="false"><use href="#i-upload"></use></svg>
+                <span class="dropzone__title" id="dropTitle">Choose a CSV file or drop it here</span>
+                <span class="dropzone__sub">Needs an email column. Other columns become merge fields.</span>
+                <input class="visually-hidden" id="fileInput" type="file" accept=".csv,.tsv,.txt,text/csv,text/plain">
+              </label>
+              <p class="status" id="uploadStatus" role="status"></p>
+              <div class="inline-form">
+                <div class="field">
+                  <label for="uploadName">List name <span class="optional">optional</span></label>
+                  <input id="uploadName" type="text" spellcheck="false" placeholder="Defaults to the file name">
+                </div>
+                <button type="button" class="btn btn--primary" id="uploadSaveBtn" disabled>Save and use</button>
+              </div>
+            </div>
+
+            <div class="field field--short">
+              <label for="limit">Limit <span class="optional">optional</span></label>
+              <input id="limit" type="number" min="1" step="1" placeholder="All recipients" inputmode="numeric">
+              <p class="hint">Only the first N recipients receive the campaign.</p>
+            </div>
+          </section>
+
+          <section class="card card--table" id="columnsCard" aria-labelledby="hColumns">
+            <h2 class="card__title" id="hColumns">Columns and merge fields</h2>
+            <div class="table-wrap" id="columnsWrap">
+              <table class="table">
+                <thead><tr><th scope="col">Column</th><th scope="col">Used as</th><th scope="col">Merge field</th></tr></thead>
+                <tbody id="columnsBody"></tbody>
+              </table>
+            </div>
+            <div class="empty empty--inline" id="columnsEmpty">
+              <p class="empty__title">No columns yet</p>
+              <p class="empty__text">Pick or add a list to see how its columns map to merge fields.</p>
+            </div>
+            <p class="hint card__note" id="columnsNote"></p>
+          </section>
+        </div>
+
+        <section class="card roster" aria-labelledby="hRoster">
+          <div class="roster__head">
+            <div>
+              <h2 class="card__title" id="hRoster">Recipients</h2>
+              <p class="roster__source" id="rosterSource">—</p>
+            </div>
+            <a class="btn btn--sm" href="#/compose" id="rosterPreviewLink">Open preview</a>
+          </div>
+          <div class="roster__stats" id="rosterStats" aria-live="polite"></div>
+          <div class="roster__body">
+            <ul class="roster__list" id="rosterList"></ul>
+            <div class="roster__state" id="rosterEmpty">
+              <svg class="icon empty__icon" aria-hidden="true" focusable="false"><use href="#i-users"></use></svg>
+              <p class="empty__title" id="rosterEmptyTitle">No recipients yet</p>
+              <p class="empty__text" id="rosterEmptyText">Choose a saved list, paste addresses or upload a CSV.</p>
+            </div>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <!-- Send -->
+    <section class="view" id="viewSend" aria-labelledby="hSend" hidden>
+      <header class="view__head">
+        <div>
+          <h1 id="hSend" tabindex="-1">Send</h1>
+          <p class="lead">Test it on yourself, then send the campaign or schedule it for later.</p>
+        </div>
+        <div class="view__actions">
+          <button class="btn" id="verifyBtn2" type="button"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-plug"></use></svg>Check connection</button>
+        </div>
+      </header>
+
+      <div class="split">
+        <div class="stack">
+          <section class="card form" aria-labelledby="hReady">
+            <h2 class="card__title" id="hReady">Ready to send?</h2>
+            <ul class="checks" id="sendChecks">
+              <li class="check" data-check="mailbox" data-state="todo"><span class="check__mark" aria-hidden="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-check"></use></svg></span><span class="check__body"><span class="check__title">Mailbox</span><span class="check__sub" id="chkMailbox">—</span></span><a class="check__fix" href="#/settings">Fix</a></li>
+              <li class="check" data-check="template" data-state="todo"><span class="check__mark" aria-hidden="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-check"></use></svg></span><span class="check__body"><span class="check__title">Template and subject</span><span class="check__sub" id="chkCompose">—</span></span><a class="check__fix" href="#/compose">Fix</a></li>
+              <li class="check" data-check="recipients" data-state="todo"><span class="check__mark" aria-hidden="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-check"></use></svg></span><span class="check__body"><span class="check__title">Recipients</span><span class="check__sub" id="chkRecipients">—</span></span><a class="check__fix" href="#/recipients">Fix</a></li>
+            </ul>
+
+            <dl class="facts" id="facts">
+              <div><dt>From</dt><dd id="sumFrom">—</dd></div>
+              <div><dt>Subject</dt><dd id="sumSubject">—</dd></div>
+              <div><dt>Campaign</dt><dd id="sumCampaign">—</dd></div>
+            </dl>
+
+            <div class="field field--short">
+              <label for="delay">Gap between messages (ms)</label>
+              <input id="delay" type="number" min="0" step="500" value="4000" inputmode="numeric">
+              <p class="hint" id="delayHint">Keeps a single mailbox inside provider rate limits.</p>
+            </div>
+
+            <div class="actions">
+              <button id="sendBtn" class="btn btn--primary btn--lg" type="button" disabled><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-send"></use></svg><span id="sendLabel">Send campaign</span></button>
+              <a class="btn btn--lg" href="#/schedule"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-calendar"></use></svg>Schedule instead</a>
+            </div>
+          </section>
+
+          <section class="card form" aria-labelledby="hTest">
+            <h2 class="card__title" id="hTest">Send a test</h2>
+            <p class="lead lead--sm">Sends the first recipient's version of the message to one address you choose.</p>
+            <div class="inline-form">
+              <div class="field">
+                <label for="testTo">Test address</label>
+                <input id="testTo" type="email" spellcheck="false" placeholder="you@yourdomain.com" autocomplete="email">
+              </div>
+              <button id="testBtn" class="btn" type="button">Send test</button>
+            </div>
+            <p class="status" id="testResult" role="status"></p>
+          </section>
+        </div>
+
+        <section class="card run" aria-labelledby="hRun">
+          <div class="run__head">
+            <h2 class="card__title" id="hRun">Live progress</h2>
+            <span class="pill" id="runState" data-state="idle">Idle</span>
+            <button id="cancelBtn" class="btn btn--sm btn--danger-quiet" type="button" hidden>Stop after this one</button>
+          </div>
+          <div class="run__meter">
+            <progress class="meter" id="runProgress" value="0" max="1" aria-labelledby="runLabel"></progress>
+            <div class="run__line">
+              <span id="runLabel">No campaign running</span>
+              <span class="run__counts" id="runCounts"></span>
+            </div>
+          </div>
+          <div class="ledger-box">
+            <ol class="ledger" id="ledger" tabindex="0" aria-label="Send log"></ol>
+            <div class="ledger-box__empty" id="ledgerEmpty">
+              <svg class="icon empty__icon" aria-hidden="true" focusable="false"><use href="#i-send"></use></svg>
+              <p class="empty__title">Nothing sent from here yet</p>
+              <p class="empty__text">Each message appears here as it goes out.</p>
+            </div>
+          </div>
+          <p class="sr-only" id="runAnnounce" role="status" aria-live="polite"></p>
+        </section>
+      </div>
+    </section>
+
+    <!-- Schedule -->
+    <section class="view" id="viewSchedule" aria-labelledby="hSchedule" hidden>
+      <header class="view__head">
+        <div>
+          <h1 id="hSchedule" tabindex="-1">Schedule</h1>
+          <p class="lead">Queue the current campaign for later. Mailroom has to be running at the scheduled time.</p>
+        </div>
+      </header>
+
+      <div class="split">
+        <form class="card form" id="scheduleForm" novalidate>
+          <h2 class="card__title">Schedule this campaign</h2>
+          <p class="summary" id="scheduleSummary">Choose a template, subject and recipients first.</p>
+          <div class="field">
+            <label for="scheduleAt">Send at</label>
+            <input id="scheduleAt" type="datetime-local">
+            <p class="hint" id="scheduleZone"></p>
+          </div>
+          <p class="status" id="scheduleStatus" role="status"></p>
+          <div class="actions">
+            <button class="btn btn--primary" id="scheduleBtn" type="submit" disabled><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-calendar"></use></svg>Schedule send</button>
+          </div>
+          <p class="hint" id="scheduleGrace">A campaign that is late by more than the grace window is held in the queue instead of going out stale.</p>
+        </form>
+
+        <section class="card card--list" aria-labelledby="hQueue">
+          <div class="card__head">
+            <h2 class="card__title" id="hQueue">Scheduled campaigns</h2>
+            <span class="muted" id="queueTotal"></span>
+          </div>
+          <ul class="queue" id="queueList"></ul>
+          <div class="empty" id="queueEmpty">
+            <svg class="icon empty__icon" aria-hidden="true" focusable="false"><use href="#i-calendar"></use></svg>
+            <p class="empty__title">Nothing scheduled</p>
+            <p class="empty__text">Scheduled campaigns appear here, with a way to send or cancel each one.</p>
+          </div>
+          <p class="status status--bad" id="queueError" role="alert"></p>
+        </section>
+      </div>
+    </section>
+
+    <!-- Suppression -->
+    <section class="view" id="viewSuppression" aria-labelledby="hSuppression" hidden>
+      <header class="view__head">
+        <div>
+          <h1 id="hSuppression" tabindex="-1">Suppression list</h1>
+          <p class="lead">Addresses here are never mailed, whatever list they appear in.</p>
+        </div>
+      </header>
+
+      <div class="split">
+        <form class="card form" id="suppressForm" novalidate>
+          <h2 class="card__title">Add addresses</h2>
+          <div class="field">
+            <label for="suppressEmails">Addresses</label>
+            <textarea id="suppressEmails" rows="5" spellcheck="false" placeholder="unsubscribed@example.com&#10;bounced@example.com"></textarea>
+            <p class="hint">Separate with new lines, commas or spaces.</p>
+          </div>
+          <div class="field field--short">
+            <label for="suppressReason">Reason</label>
+            <select id="suppressReason">
+              <option value="manual">Manual</option>
+              <option value="unsubscribe">Unsubscribed</option>
+              <option value="bounce">Bounced</option>
+              <option value="complaint">Complaint</option>
+            </select>
+          </div>
+          <p class="status" id="suppressStatus" role="status"></p>
+          <div class="actions">
+            <button class="btn btn--primary" id="suppressBtn" type="submit">Add to suppression list</button>
+          </div>
+        </form>
+
+        <section class="card card--list" aria-labelledby="hSuppressed">
+          <div class="card__head">
+            <h2 class="card__title" id="hSuppressed">Suppressed addresses</h2>
+            <span class="muted" id="suppressCount"></span>
+          </div>
+          <div class="search">
+            <label class="sr-only" for="suppressSearch">Filter suppressed addresses</label>
+            <input id="suppressSearch" type="search" placeholder="Filter addresses" spellcheck="false" autocomplete="off">
+          </div>
+          <ul class="plain-list" id="suppressList"></ul>
+          <div class="empty" id="suppressEmpty">
+            <svg class="icon empty__icon" aria-hidden="true" focusable="false"><use href="#i-ban"></use></svg>
+            <p class="empty__title" id="suppressEmptyTitle">No suppressed addresses</p>
+            <p class="empty__text" id="suppressEmptyText">Addresses you add, or that unsubscribe, appear here.</p>
+          </div>
+          <p class="hint card__note" id="suppressNote"></p>
+        </section>
+      </div>
+    </section>
+
+    <!-- Settings -->
+    <section class="view" id="viewSettings" aria-labelledby="hSettings" hidden>
+      <header class="view__head">
+        <div>
+          <h1 id="hSettings" tabindex="-1">Settings</h1>
+          <p class="lead" id="settingsLead">Mailroom sends through your own SMTP account, so mail comes from your address and lands in your sent folder.</p>
+        </div>
+      </header>
+
+      <div class="split">
+        <form class="card form" id="settingsForm" novalidate autocomplete="off">
+          <h2 class="card__title">Mailbox (SMTP)</h2>
+
+          <div class="field-row">
+            <div class="field">
+              <label for="setHost">SMTP host</label>
+              <input id="setHost" type="text" spellcheck="false" placeholder="smtp.gmail.com" autocomplete="off">
+            </div>
+            <div class="field field--port">
+              <label for="setPort">Port</label>
+              <input id="setPort" type="number" inputmode="numeric" placeholder="465">
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="setUser">Mailbox address</label>
+            <input id="setUser" type="email" spellcheck="false" placeholder="you@yourdomain.com" autocomplete="off">
+            <p class="hint" id="setUserHint">The account Mailroom signs in as. A relay on this machine needs none.</p>
+          </div>
+
+          <div class="field">
+            <label for="setPass">App password</label>
+            <input id="setPass" type="password" spellcheck="false" autocomplete="new-password" placeholder="16 characters">
+            <p class="hint" id="setPassHint">Gmail needs an App Password, not your login password.</p>
+          </div>
+
+          <div class="field">
+            <label for="setFrom">From line</label>
+            <input id="setFrom" type="text" spellcheck="false" placeholder="Your Name <you@yourdomain.com>" autocomplete="off">
+            <p class="hint">What recipients see. Defaults to the mailbox address.</p>
+          </div>
+
+          <p class="status" id="settingsStatus" role="status"></p>
+          <div class="actions">
+            <button class="btn" id="settingsTestBtn" type="button"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-plug"></use></svg>Test connection</button>
+            <button class="btn btn--primary" id="settingsSaveBtn" type="submit">Save settings</button>
+          </div>
+          <p class="hint" id="settingsPath"></p>
+        </form>
+
+        <div class="stack">
+          <section class="card" aria-labelledby="hAccess">
+            <h2 class="card__title" id="hAccess">Access</h2>
+            <p class="lead lead--sm" id="accessText">Mailroom is only reachable from this computer.</p>
+            <div class="actions" id="accessActions" hidden>
+              <button class="btn" id="signOutBtn2" type="button"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-logout"></use></svg>Sign out</button>
+            </div>
+          </section>
+
+          <section class="card" aria-labelledby="hAbout">
+            <h2 class="card__title" id="hAbout">About</h2>
+            <dl class="facts facts--stack">
+              <div><dt>Version</dt><dd id="aboutVersion">—</dd></div>
+              <div><dt>Server</dt><dd id="aboutHealth">—</dd></div>
+              <div><dt>Platform</dt><dd id="aboutPlatform">—</dd></div>
+              <div><dt>Send log</dt><dd id="aboutLog">—</dd></div>
+              <div><dt>Suppression file</dt><dd id="aboutSuppression">—</dd></div>
+            </dl>
+          </section>
         </div>
       </div>
-      <select id="csv"></select>
-      <div class="roster" id="roster" hidden>
-        <div class="roster__head">
-          <span id="rosterCount">0 addresses</span>
-          <span class="roster__note">Click one to preview it</span>
-        </div>
-        <ul class="roster__list" id="rosterList"></ul>
-      </div>
-      <div class="paste" id="pastePanel" hidden>
-        <textarea id="pasteBox" rows="6" spellcheck="false"
-          placeholder="priya@example.com, Priya Shah, Sunrise Chemicals&#10;Raj Patel &lt;raj@patel.in&gt;&#10;info@example.com"></textarea>
-        <div class="paste__foot">
-          <span class="hint" id="pasteCount"></span>
-          <button type="button" class="btn btn--quiet" id="saveCsvBtn">Save as CSV</button>
-        </div>
-      </div>
-      <p class="hint" id="csvHint"></p>
-    </div>
+    </section>
 
-    <div class="field">
-      <label for="subject">Subject line</label>
-      <input id="subject" type="text" placeholder="Subject line, e.g. Invitation to our November meetup" spellcheck="false">
-      <div class="tokens" id="tokens" aria-label="Insert a merge field"></div>
-    </div>
+  </main>
+</div>
 
-    <div class="field-grid">
-      <div class="field">
-        <label for="campaign">Campaign</label>
-        <input id="campaign" type="text" spellcheck="false" placeholder="e.g. connect-nov-2026">
-        <p class="hint">Makes a re-run skip addresses already sent in it.</p>
-      </div>
-      <div class="field field--narrow">
-        <label for="limit">Limit</label>
-        <input id="limit" type="number" min="1" step="1" placeholder="all">
-      </div>
-    </div>
-
-    <div class="field-grid">
-      <div class="field field--narrow">
-        <label for="delay">Gap</label>
-        <input id="delay" type="number" min="0" step="500" value="4000">
-        <p class="hint">ms between sends.</p>
-      </div>
-      <div class="field">
-        <label for="testTo">Test address</label>
-        <input id="testTo" type="email" spellcheck="false" placeholder="you@yourdomain.com">
-        <p class="hint">Gets the first recipient's data.</p>
-      </div>
-    </div>
-
-    <div class="slip__actions">
-      <button id="sendBtn" class="btn btn--primary" type="button" disabled>Send</button>
-      <button id="scheduleBtn" class="btn" type="button" disabled>Schedule…</button>
-      <button id="testBtn" class="btn" type="button">Send test</button>
-      <button id="previewBtn" class="btn btn--quiet" type="button">Refresh</button>
-    </div>
-  </form>
-
-  <!-- ── Proof + activity ──────────────────────────────────────── -->
-  <section class="stage">
-
-    <div class="proof">
-      <div class="proof__bar">
-        <div class="proof__who">
-          <span id="proofTo">No recipient</span>
-          <span id="proofSubject" class="proof__subject"></span>
-        </div>
-        <div class="proof__page">
-          <button id="prevBtn" class="btn btn--icon" type="button" aria-label="Previous recipient">‹</button>
-          <span id="proofIndex">0 / 0</span>
-          <button id="nextBtn" class="btn btn--icon" type="button" aria-label="Next recipient">›</button>
-        </div>
-      </div>
-      <div class="proof__frame">
-        <iframe id="preview" sandbox="" title="Message preview"></iframe>
-        <div class="proof__empty" id="proofEmpty">Pick a template and recipients, then refresh the preview.</div>
-      </div>
-      <div class="proof__foot">
-        <span id="proofImages">0 inline images</span>
-        <span id="proofTotal"></span>
-      </div>
-    </div>
-
-    <div class="run">
-      <div class="run__head">
-        <h2>Dispatch</h2>
-        <div class="run__counts" id="runCounts"></div>
-        <button id="cancelBtn" class="btn btn--quiet" type="button" hidden>Stop after this one</button>
-      </div>
-      <ol class="ledger" id="ledger" aria-live="polite">
-        <li class="ledger__idle">Nothing sent from here yet.</li>
-      </ol>
-    </div>
-
-  </section>
-</main>
-
-<!-- ── Confirmation ──────────────────────────────────────────────── -->
-<div class="modal" id="modal" hidden>
-  <div class="modal__card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
-    <h2 id="modalTitle">Send for real?</h2>
-    <p id="modalBody"></p>
-    <label class="check">
-      <input type="checkbox" id="modalCheck">
-      <span>I understand these messages go out immediately to real inboxes.</span>
+<!-- ── Confirmation dialog ───────────────────────────────────── -->
+<dialog class="dialog" id="confirmDialog" aria-labelledby="confirmTitle">
+  <div class="dialog__card">
+    <h2 id="confirmTitle">Are you sure?</h2>
+    <div class="dialog__body" id="confirmBody"></div>
+    <label class="checkbox" id="confirmCheckRow" hidden>
+      <input type="checkbox" id="confirmCheck">
+      <span id="confirmCheckText"></span>
     </label>
-    <div class="modal__actions">
-      <button class="btn" id="modalCancel" type="button">Cancel</button>
-      <button class="btn btn--danger" id="modalConfirm" type="button" disabled>Send now</button>
+    <div class="dialog__actions">
+      <button class="btn" id="confirmCancel" type="button">Cancel</button>
+      <button class="btn btn--primary" id="confirmOk" type="button">Confirm</button>
     </div>
   </div>
-</div>
+</dialog>
 
-<!-- ── Mailbox settings ──────────────────────────────────────────── -->
-<div class="modal" id="settingsModal" hidden>
-  <div class="modal__card modal__card--wide" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
-    <h2 id="settingsTitle">Connect your mailbox</h2>
-    <p class="settings__lead" id="settingsLead">
-      Mailroom sends through your own SMTP account, so the mail comes from your
-      address and lands in your sent folder.
-    </p>
-
-    <div class="settings__grid">
-      <div class="field">
-        <label for="setHost">SMTP host</label>
-        <input id="setHost" type="text" spellcheck="false" placeholder="smtp.gmail.com">
-      </div>
-      <div class="field field--narrow">
-        <label for="setPort">Port</label>
-        <input id="setPort" type="number" inputmode="numeric" placeholder="465">
-      </div>
-    </div>
-
-    <div class="field">
-      <label for="setUser">Mailbox address</label>
-      <input id="setUser" type="email" spellcheck="false" placeholder="you@yourdomain.com">
-      <p class="hint" id="setUserHint">The account Mailroom signs in as.</p>
-    </div>
-
-    <div class="field">
-      <label for="setPass">App password</label>
-      <input id="setPass" type="password" spellcheck="false" autocomplete="new-password" placeholder="16 characters">
-      <p class="hint" id="setPassHint">Gmail needs an App Password, not your login password.</p>
-    </div>
-
-    <div class="field">
-      <label for="setFrom">From line</label>
-      <input id="setFrom" type="text" spellcheck="false" placeholder="Your Name &lt;you@yourdomain.com&gt;">
-      <p class="hint">What recipients see. Defaults to the mailbox address.</p>
-    </div>
-
-    <p class="settings__status" id="settingsStatus" role="status" aria-live="polite"></p>
-    <p class="settings__path" id="settingsPath"></p>
-
-    <div class="modal__actions">
-      <button class="btn btn--quiet" id="settingsCancel" type="button">Cancel</button>
-      <button class="btn" id="settingsTestBtn" type="button">Test connection</button>
-      <button class="btn btn--primary" id="settingsSaveBtn" type="button">Save</button>
-    </div>
-  </div>
-</div>
-
-<!-- ── Schedule a campaign ───────────────────────────────────────── -->
-<div class="modal" id="scheduleModal" hidden>
-  <div class="modal__card" role="dialog" aria-modal="true" aria-labelledby="scheduleTitle">
-    <h2 id="scheduleTitle">Schedule this campaign</h2>
-    <p class="settings__lead" id="scheduleSummary"></p>
-    <div class="field">
-      <label for="scheduleAt">Send at</label>
-      <input id="scheduleAt" type="datetime-local">
-      <p class="hint" id="scheduleZone"></p>
-    </div>
-    <p class="settings__status" id="scheduleStatus" role="status" aria-live="polite"></p>
-    <div class="modal__actions">
-      <button class="btn" id="scheduleCancel" type="button">Cancel</button>
-      <button class="btn btn--primary" id="scheduleConfirm" type="button">Schedule send</button>
-    </div>
-  </div>
-</div>
-
-<!-- ── Scheduled campaigns ───────────────────────────────────────── -->
-<div class="modal" id="queueModal" hidden>
-  <div class="modal__card modal__card--wide" role="dialog" aria-modal="true" aria-labelledby="queueTitle">
-    <h2 id="queueTitle">Scheduled campaigns</h2>
-    <p class="settings__lead">Mailroom has to be running at the scheduled time. If it is late by more
-      than the grace window, the campaign is held here instead of going out stale.</p>
-    <ul class="queue" id="queueList"></ul>
-    <p class="queue__empty" id="queueEmpty" hidden>Nothing scheduled yet. Use <strong>Schedule…</strong> beside Send.</p>
-    <div class="modal__actions">
-      <button class="btn" id="queueClose" type="button">Close</button>
-    </div>
-  </div>
-</div>
-
-<div class="notice" id="notice" role="status" aria-live="polite"></div>
+<div class="toasts" id="toasts" role="region" aria-label="Notifications"></div>
 
 <script src="/app.js"></script>
 </body>

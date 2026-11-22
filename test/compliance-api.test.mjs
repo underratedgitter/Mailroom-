@@ -144,3 +144,37 @@ test('unusable compliance settings are refused with a clear message before anyth
   }
   assert.equal(sink.messages.length, 0);
 });
+
+test('the preview of every bundled template has a working unsubscribe link and no link warnings', async (t) => {
+  const server = await startServer({ env: { SMTP_HOST: '127.0.0.1', SMTP_PORT: '2525', EMAIL_FROM: 'Desk <desk@news.example.org>' } });
+  t.after(server.stop);
+
+  for (const name of ['bcci-connect', 'bcci-connect-v2', 'bcci-membership']) {
+    const preview = await post(server.base, '/api/preview', { csv: CSV, html: `templates/${name}.html`, subject: 'Hi' });
+    assert.equal(preview.status, 200, name);
+    assert.deepEqual(preview.data.warnings, [], name);
+    assert.doesNotMatch(preview.data.html, /\{\{\s*unsubscribe_url/);
+  }
+  const v2 = await post(server.base, '/api/preview', { csv: CSV, html: 'templates/bcci-connect-v2.html', subject: 'Hi' });
+  assert.match(v2.data.html, /href="mailto:desk@news\.example\.org\?subject=unsubscribe"/);
+  const found = Object.fromEntries(v2.data.placeholders.map((p) => [p.name, p.status]));
+  assert.equal(found.unsubscribe_url, 'builtin');
+});
+
+test('the preview warns when the unsubscribe link cannot work, as on an install with no From address yet', async (t) => {
+  const server = await startServer();
+  t.after(server.stop);
+  const preview = await post(server.base, '/api/preview', { csv: CSV, html: 'templates/bcci-connect-v2.html', subject: 'Hi' });
+  assert.equal(preview.status, 200);
+  assert.deepEqual(preview.data.warnings.map((w) => w.code), ['placeholder-link', 'no-unsubscribe']);
+});
+
+test('a test send carries the unsubscribe link of the test address', async (t) => {
+  const sink = await startSmtpSink();
+  const server = await startServer({ env: { ...smtpEnv(sink), UNSUBSCRIBE_URL: 'https://news.example.org/u?e={email}' } });
+  t.after(async () => { await server.stop(); await sink.close(); });
+  const sent = await post(server.base, '/api/test', { csv: CSV, html: 'templates/bcci-connect-v2.html', subject: 'Hi', to: 'me@example.test' });
+  assert.equal(sent.data.ok, true, JSON.stringify(sent.data));
+  // The body is quoted-printable, so "=" is "=3D".
+  assert.match(sink.messages[0].data, /news\.example\.org\/u\?e=3Dme%40example\.test/);
+});

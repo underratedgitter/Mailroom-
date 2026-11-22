@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, symlinkSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, symlinkSync, readdirSync, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import {
   parseCsv,
   parseRecipients,
@@ -21,6 +23,9 @@ import {
   runCampaign,
   emailRe,
   createMailer,
+  defaultLogPath,
+  linkWarnings,
+  defaultSuppressionPath,
 } from '../src/lib/core.mjs';
 import { startSmtpSink } from './helpers/smtp-sink.mjs';
 
@@ -504,4 +509,377 @@ test('an address the mailer would split or rewrite is invalid, not mailed to som
   const parsed = parseRecipients('email,name\n"a,b@x.com",A\nok@x.com,Ok\n');
   assert.deepEqual(parsed.recipients.map((r) => r._email), ['ok@x.com']);
   assert.equal(parsed.invalid, 1);
+});
+
+/** Runs a campaign through a real mailer against a local SMTP sink; resolves what the run left behind. */
+async function campaignAgainstSink({ sink: sinkOptions, addresses, run = {} }) {
+  const sink = await startSmtpSink(sinkOptions);
+  const mailer = createMailer({ host: '127.0.0.1', port: sink.port, secure: false, requireTLS: false, from: 'me@x.co', ...run.cfg });
+  const dir = workDir();
+  const logPath = join(dir, 'sent.jsonl');
+  const suppressionPath = join(dir, 'suppressed.csv');
+  try {
+    const summary = await runCampaign({
+      recipients: addresses.map(recipient),
+      templateHtml: 'x',
+      subjectTemplate: 'x',
+      delayMs: 0,
+      retryDelay: 1,
+      limits: { perHour: 0, perDomainPerHour: 0 },
+      mailer,
+      logPath,
+      suppressionPath,
+      onEvent: () => {},
+      ...run.options,
+    });
+    return {
+      summary,
+      messages: sink.messages,
+      connections: sink.connectionCount(),
+      open: sink.openCount(),
+      log: readLog(logPath),
+      suppressed: existsSync(suppressionPath) ? readFileSync(suppressionPath, 'utf8') : '',
+    };
+  } finally {
+    mailer.close();
+    await sink.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('a refused recipient is judged on its own and never halts the campaign', async () => {
+  // Each reply mentions words the old text match treated as account-level.
+  const replies = [
+    (addr) => `452 4.2.2 <${addr}> mailbox over quota`,
+    (addr) => `550 5.2.1 <${addr}> account disabled`,
+    (addr) => `550 5.7.1 <${addr}> authentication required`,
+  ];
+  for (const reply of replies) {
+    const { summary, messages } = await campaignAgainstSink({
+      sink: { rcpt: (addr) => (addr.includes('full') ? reply(addr) : null) },
+      addresses: ['full@example.test', 'ok@example.test'],
+    });
+    assert.equal(summary.stopped, false, reply('x'));
+    assert.deepEqual([summary.sent, summary.failed], [1, 1]);
+    assert.equal(messages.length, 1);
+  }
+});
+
+test('an address with "quota" or "disabled" in it does not stop the run when it is refused', async () => {
+  const { summary } = await campaignAgainstSink({
+    sink: { rcpt: (addr) => (addr.includes('quota') ? `550 5.1.1 <${addr}> no such user` : null) },
+    addresses: ['quota-account-disabled@example.test', 'ok@example.test'],
+  });
+  assert.equal(summary.stopped, false);
+  assert.equal(summary.sent, 1);
+});
+
+test('a sender-stage quota refusal still stops the run', async () => {
+  const { summary, messages } = await campaignAgainstSink({
+    sink: { mail: () => '550 5.4.5 Daily user sending quota exceeded' },
+    addresses: ['a@example.test', 'b@example.test'],
+  });
+  assert.equal(summary.stopped, true);
+  assert.equal(summary.failed, 1);
+  assert.equal(messages.length, 0);
+});
+
+test('a timeout after the message was streamed is logged as uncertain, never retried, and skipped on resume', async () => {
+  const dir = workDir();
+  const logPath = join(dir, 'sent.jsonl');
+  const sink = await startSmtpSink({ stall: (envelope) => envelope.to.some((to) => to.includes('hung')) });
+  const mailer = createMailer({ host: '127.0.0.1', port: sink.port, secure: false, requireTLS: false, from: 'me@x.co', socketTimeout: 400 });
+  const events = [];
+  const options = {
+    recipients: ['hung@example.test', 'ok@example.test'].map(recipient),
+    templateHtml: 'x',
+    subjectTemplate: 'x',
+    campaignId: 'c1',
+    delayMs: 0,
+    retryDelay: 1,
+    limits: { perHour: 0, perDomainPerHour: 0 },
+    mailer,
+    logPath,
+    suppressionPath: join(dir, 'suppressed.csv'),
+    onEvent: (event) => events.push(event),
+  };
+  try {
+    const first = await runCampaign(options);
+    // The server took the message of "hung" and never answered; sending it again would duplicate it.
+    assert.equal(sink.messages.filter((m) => m.to.some((to) => to.includes('hung'))).length, 1);
+    assert.equal(first.sent, 1);
+    assert.equal(first.failed, 0);
+    assert.deepEqual(first.uncertain.map((u) => u.email), ['hung@example.test']);
+    assert.equal(first.remaining, 0);
+    assert.ok(events.some((e) => e.type === 'progress' && e.status === 'uncertain' && e.email === 'hung@example.test'));
+    assert.deepEqual(readLog(logPath).filter((e) => e.status === 'uncertain').map((e) => e.email), ['hung@example.test']);
+
+    const again = await runCampaign({ ...options, alreadySent: sentAddresses(readLog(logPath), 'c1') });
+    assert.equal(sink.messages.filter((m) => m.to.some((to) => to.includes('hung'))).length, 1);
+    assert.equal(again.sent, 0);
+    assert.equal(again.skipped, 2);
+    assert.ok(events.some((e) => e.type === 'progress' && e.status === 'skip' && e.reason === 'uncertain'));
+  } finally {
+    mailer.close();
+    await sink.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a timeout before the message was streamed is still retried', async () => {
+  let attempts = 0;
+  const summary = await runCampaign({
+    recipients: [recipient('a@b.co')],
+    templateHtml: 'x',
+    subjectTemplate: 'x',
+    delayMs: 0,
+    retryDelay: 1,
+    mailer: { send: async () => { attempts++; return { success: false, error: 'Timeout', code: 'ETIMEDOUT' }; } },
+    onEvent: () => {},
+  });
+  assert.equal(attempts, 3);
+  assert.equal(summary.failed, 1);
+  assert.deepEqual(summary.uncertain, []);
+});
+
+test('the socket timeout is long enough for a slow server to answer the DATA command', () => {
+  const mailer = createMailer({ host: '127.0.0.1', port: 1, secure: false, requireTLS: false, from: 'me@x.co' });
+  try {
+    assert.ok(mailer.getTransport().transporter.options.socketTimeout >= 120000);
+  } finally {
+    mailer.close();
+  }
+});
+
+test('refused recipients do not abandon open connections; a dropped link is recovered with a fresh pool', async () => {
+  // Every refusal used to orphan the pool, leaving its connection open for good.
+  const refused = await campaignAgainstSink({
+    sink: { rcpt: (addr) => (addr.includes('bad') ? '550 5.1.1 no such user' : null) },
+    addresses: [...Array.from({ length: 8 }, (_, i) => `bad${i}@example.test`), 'ok@example.test'],
+  });
+  assert.equal(refused.summary.sent, 1);
+  assert.equal(refused.summary.failed, 8);
+  assert.ok(refused.open <= 3, `${refused.open} connections left open`);
+
+  let dropped = false;
+  const unavailable = await campaignAgainstSink({
+    sink: { rcpt: () => (dropped ? null : ((dropped = true), '421 4.7.0 try again later')) },
+    addresses: ['one@example.test', 'two@example.test'],
+  });
+  assert.equal(unavailable.summary.sent, 2);
+  assert.ok(unavailable.open <= 3);
+});
+
+/** Resolves `started()` once the mailer is sending, and finishes only when `release()` is called. */
+function gatedMailer() {
+  let release;
+  let started;
+  const open = new Promise((resolve) => { release = resolve; });
+  const reached = new Promise((resolve) => { started = resolve; });
+  return {
+    reached,
+    release,
+    mailer: { send: async () => { started(); await open; return { success: true }; } },
+  };
+}
+
+const campaignOptions = (dir, mailer, extra = {}) => ({
+  recipients: [recipient('a@b.co')],
+  templateHtml: 'x',
+  subjectTemplate: 'x',
+  delayMs: 0,
+  limits: { perHour: 0, perDomainPerHour: 0 },
+  suppressionPath: join(dir, 'suppressed.csv'),
+  logPath: join(dir, 'sent.jsonl'),
+  mailer,
+  onEvent: () => {},
+  ...extra,
+});
+
+test('a second campaign on the same send log is refused while the first runs, and allowed after', async () => {
+  const dir = workDir();
+  try {
+    const gate = gatedMailer();
+    const first = runCampaign(campaignOptions(dir, gate.mailer));
+    await gate.reached;
+
+    await assert.rejects(
+      runCampaign(campaignOptions(dir, { send: async () => ({ success: true }) })),
+      /already sending/,
+    );
+
+    gate.release();
+    assert.equal((await first).sent, 1);
+
+    const third = await runCampaign(campaignOptions(dir, { send: async () => ({ success: true }) }));
+    assert.equal(third.sent, 1);
+    assert.equal(existsSync(join(dir, 'sent.jsonl.lock')), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a lock left by a process that is gone does not block a campaign', async () => {
+  const dir = workDir();
+  try {
+    const gone = spawnSync(process.execPath, ['-e', '0']);
+    assert.equal(gone.status, 0);
+    const lock = join(dir, 'sent.jsonl.lock');
+    writeFileSync(lock, JSON.stringify({ pid: gone.pid, token: 'old', at: new Date().toISOString() }));
+    assert.equal((await runCampaign(campaignOptions(dir, { send: async () => ({ success: true }) }))).sent, 1);
+
+    // After a restart the new process can reuse the old pid (a container's node is always pid 1).
+    writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'from-an-earlier-run', at: new Date().toISOString() }));
+    assert.equal((await runCampaign(campaignOptions(dir, { send: async () => ({ success: true }) }))).sent, 1);
+
+    writeFileSync(lock, 'not json');
+    assert.equal((await runCampaign(campaignOptions(dir, { send: async () => ({ success: true }) }))).sent, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the default log and suppression paths belong to the install, not the working directory', () => {
+  const here = process.cwd();
+  const elsewhere = mkdtempSync(join(tmpdir(), 'mailroom-cwd-'));
+  try {
+    process.chdir(elsewhere);
+    const log = defaultLogPath({});
+    const suppression = defaultSuppressionPath({});
+    assert.ok(log.endsWith(join('logs', 'sent.jsonl')) && !log.startsWith(realpathSync(elsewhere)), log);
+    assert.ok(suppression.endsWith(join('data', 'suppressed.csv')) && !suppression.startsWith(realpathSync(elsewhere)), suppression);
+    assert.equal(defaultLogPath({ SEND_LOG: 'mine/sent.jsonl' }), join(realpathSync(elsewhere), 'mine', 'sent.jsonl'));
+    assert.equal(defaultSuppressionPath({ SUPPRESSION_FILE: 'mine/s.csv' }), join(realpathSync(elsewhere), 'mine', 's.csv'));
+  } finally {
+    process.chdir(here);
+    rmSync(elsewhere, { recursive: true, force: true });
+  }
+});
+
+test('parseCsv refuses an unclosed quote instead of swallowing the rows after it', () => {
+  const csv = 'email,name\na@b.co,Ann\nb@b.co,"Bob\nc@b.co,Cy\nd@b.co,Di\n';
+  assert.throws(() => parseCsv(csv), /Unclosed quote starting on line 3/);
+  assert.throws(() => parseRecipients(csv), /Unclosed quote starting on line 3/);
+  // A quote that closes after spanning lines is fine.
+  assert.equal(parseCsv('email,note\na@b.co,"one\ntwo"\nb@b.co,x\n').length, 2);
+});
+
+test('a saved recipient list cannot carry a spreadsheet formula, and reads back unchanged', () => {
+  const originals = [
+    { _email: '+tag@example.com', _name: '=HYPERLINK("http://evil.example","click")', _company: '@SUM(A1:A9)' },
+    { _email: 'b@example.com', _name: '-2+3', _company: 'Plain Co' },
+  ];
+  const csv = recipientsToCsv(originals);
+  for (const row of parseCsv(csv)) {
+    for (const value of Object.values(row)) assert.doesNotMatch(value, /^[=+\-@]/, value);
+  }
+  const { recipients } = parseRecipients(csv);
+  assert.deepEqual(recipients.map((r) => [r._email, r._name, r._company]), originals.map((r) => [r._email, r._name, r._company]));
+});
+
+test('a recipient the server says does not exist is suppressed as a hard bounce; other refusals are not', async () => {
+  const replies = {
+    'gone@': '550 5.1.1 <gone@example.test>: user unknown',
+    'off@': '550 5.2.1 <off@example.test>: mailbox disabled',
+    'policy@': '550 5.7.1 <policy@example.test>: rejected by policy',
+    'busy@': '450 4.2.1 <busy@example.test>: mailbox busy',
+  };
+  const { summary, log, suppressed } = await campaignAgainstSink({
+    sink: { rcpt: (addr) => Object.entries(replies).find(([key]) => addr.includes(key))?.[1] ?? null },
+    addresses: ['gone@example.test', 'off@example.test', 'policy@example.test', 'busy@example.test', 'ok@example.test'],
+  });
+
+  assert.equal(summary.failed, 4);
+  assert.equal(summary.sent, 1);
+  const rows = suppressed.trim().split('\n').slice(1).map((line) => line.split(',').slice(0, 2));
+  assert.deepEqual(rows, [['gone@example.test', 'hard-bounce'], ['off@example.test', 'hard-bounce']]);
+
+  const codes = Object.fromEntries(log.filter((e) => e.status === 'failed').map((e) => [e.email, e.responseCode]));
+  assert.deepEqual(codes, {
+    'gone@example.test': 550,
+    'off@example.test': 550,
+    'policy@example.test': 550,
+    'busy@example.test': 450,
+  });
+});
+
+const unsubscribeConfig = { from: 'Desk <desk@news.example.org>' };
+
+test('{{unsubscribe_url}} is the recipient-specific link the unsubscribe header uses', () => {
+  const tpl = '<a href="{{unsubscribe_url}}">Unsubscribe</a>';
+  const rec = { _email: 'a+b@example.test', _name: '', _company: '' };
+
+  assert.equal(render(tpl, rec, unsubscribeConfig), '<a href="mailto:desk@news.example.org?subject=unsubscribe">Unsubscribe</a>');
+  assert.match(render(tpl, rec, { ...unsubscribeConfig, replyTo: 'Help <help@news.example.org>' }), /href="mailto:help@news\.example\.org\?subject=unsubscribe"/);
+  assert.match(render(tpl, rec, { ...unsubscribeConfig, replyTo: 'help@news.example.org', unsubscribeMailto: 'stop@news.example.org' }), /href="mailto:stop@news\.example\.org\?/);
+  assert.match(render(tpl, rec, { ...unsubscribeConfig, unsubscribeUrl: 'https://news.example.org/u?e={email}' }), /href="https:\/\/news\.example\.org\/u\?e=a%2Bb%40example\.test"/);
+  // With no configuration the link is empty rather than invented.
+  assert.equal(render(tpl, rec), '<a href="">Unsubscribe</a>');
+  // A column of the same name cannot override it.
+  assert.match(render(tpl, { ...rec, unsubscribe_url: 'https://evil.example' }, unsubscribeConfig), /mailto:desk@/);
+});
+
+test('linkWarnings flags dead links and a missing unsubscribe link', () => {
+  const codes = (html, options) => linkWarnings(html, options).map((w) => w.code).sort();
+  assert.deepEqual(codes('<a href="https://x.example/">x</a> <a href="mailto:a@x.example?subject=Unsubscribe">u</a>'), []);
+  assert.deepEqual(codes('<a href="#preview-only-unsubscribe">u</a>'), ['placeholder-link']);
+  assert.deepEqual(codes('<a href="#top">x</a> <a href="mailto:a@x.example?subject=unsubscribe">u</a>'), ['placeholder-link']);
+  assert.deepEqual(codes('<a href="">x</a> <a href="https://x.example/unsubscribe">u</a>'), ['placeholder-link']);
+  assert.deepEqual(codes('<a href="/unsubscribe_from_list">u</a> <a href="//x.example/y">y</a>'), ['relative-link']);
+  assert.deepEqual(codes('<a href="https://x.example/">x</a>'), ['no-unsubscribe']);
+  assert.deepEqual(codes('<p>no links at all</p>'), ['no-unsubscribe']);
+  // A hosted one-click URL need not say "unsubscribe" in it.
+  assert.deepEqual(codes('<a href="https://x.example/u/7">u</a>', { unsubscribe: 'https://x.example/u/7' }), []);
+  assert.match(linkWarnings('<a href="#x">u</a>')[0].message, /#x/);
+});
+
+test('every bundled template ships a working unsubscribe link and no dead links', () => {
+  const rec = { _email: 'a@example.test', _name: 'A', _company: 'Co' };
+  const dir = fileURLToPath(new URL('../templates', import.meta.url));
+  const names = readdirSync(dir).filter((name) => name.endsWith('.html'));
+  assert.ok(names.length >= 3);
+  for (const name of names) {
+    const html = render(readFileSync(join(dir, name), 'utf8'), rec, unsubscribeConfig);
+    assert.deepEqual(linkWarnings(html), [], name);
+  }
+});
+
+test('runCampaign gives each recipient their own unsubscribe link', async () => {
+  const bodies = [];
+  await runCampaign({
+    recipients: [recipient('a@b.co'), recipient('c@d.co')],
+    templateHtml: '<a href="{{unsubscribe_url}}">u</a>',
+    subjectTemplate: 'x',
+    delayMs: 0,
+    limits: { perHour: 0, perDomainPerHour: 0 },
+    mailer: { cfg: { from: 'me@x.co', unsubscribeUrl: 'https://x.co/u?e={email}' }, send: async ({ html }) => { bodies.push(html); return { success: true }; } },
+    onEvent: () => {},
+  });
+  assert.deepEqual(bodies, ['<a href="https://x.co/u?e=a%40b.co">u</a>', '<a href="https://x.co/u?e=c%40d.co">u</a>']);
+});
+
+test('the To header shows the recipient\'s name when there is one, and a name cannot add headers', async () => {
+  const rec = (email, name) => ({ _email: email, _name: name, _company: '' });
+  const { messages } = await campaignAgainstSink({
+    sink: {},
+    addresses: [],
+    run: {
+      options: {
+        recipients: [
+          rec('a@example.test', 'Priya Shah'),
+          rec('b@example.test', 'Shah, Raj'),
+          rec('c@example.test', ''),
+          rec('d@example.test', 'Eve\r\nBcc: victim@example.test'),
+        ],
+      },
+    },
+  });
+  const header = (message) => message.data.split('\r\n\r\n')[0];
+
+  assert.equal(messages.length, 4);
+  assert.match(header(messages[0]), /^To: Priya Shah <a@example\.test>$/m);
+  assert.match(header(messages[1]), /^To: "Shah, Raj" <b@example\.test>$/m);
+  assert.match(header(messages[2]), /^To: c@example\.test$/m);
+  assert.doesNotMatch(header(messages[3]), /^Bcc:/im);
+  assert.deepEqual(messages[3].to, ['<d@example.test>']);
 });

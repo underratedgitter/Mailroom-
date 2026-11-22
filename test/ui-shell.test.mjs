@@ -85,3 +85,16 @@ test('the paste box and other hidden panels stay hidden by the [hidden] attribut
   assert.match(css, /\[hidden\]\s*\{\s*display:\s*none\s*!important;?\s*\}/);
   assert.match(html, /<div class="tabpanel"[^>]*id="panelPaste"[^>]*\shidden>/);
 });
+
+test('settings offer the TLS mode and the optional delivery fields, and send them', () => {
+  assert.match(html, /<select id="setSecure">[\s\S]*?value="true"[\s\S]*?value="false"[\s\S]*?<\/select>/);
+  const payload = app.slice(app.indexOf('function settingsPayload()'), app.indexOf('function setSettingsStatus'));
+  for (const key of ['secure', 'replyTo', 'unsubscribeUrl', 'maxPerHour']) assert.match(payload, new RegExp('\\b' + key + ':'));
+});
+
+test('the send checklist shows link warnings, and the suppression copy does not promise automatic unsubscribes', () => {
+  assert.match(html, /data-check="links"[\s\S]*?id="chkLinks"/);
+  assert.match(app, /links: \{[\s\S]*?p\.warnings/);
+  for (const text of [html, app]) assert.doesNotMatch(text, /or that unsubscribe, appear here/);
+  assert.match(html, /Unsubscribe requests are not added automatically/);
+});

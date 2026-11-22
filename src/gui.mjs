@@ -35,9 +35,9 @@
 
 import http from 'node:http';
 import https from 'node:https';
-import { randomUUID, randomBytes } from 'node:crypto';
+import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { hashPassword, verifyPassword, parsePasswordHash } from './lib/auth.mjs';
-import { configIssue } from './lib/mailer.mjs';
+import { configIssue, unsubscribeUrlIssue, bareAddress, unsubscribeLink } from './lib/mailer.mjs';
 import { loadConfig, saveConfig, resolveConfigPath, smtpFileValues, assertConfig } from './lib/config.mjs';
 import { readFileSync, writeFileSync, renameSync, rmSync, existsSync, readdirSync, statSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import { dirname, extname, join, resolve, sep } from 'node:path';
@@ -49,16 +49,20 @@ import {
   recipientsToCsv,
   columnRoles,
   templateVariables,
+  linkWarnings,
   render,
   renderSubject,
   inlineForPreview,
   attachmentsFor,
   readLog,
+  defaultLogPath,
+  defaultSuppressionPath,
   loadSuppressed,
   addSuppressed,
   isSuppressed,
   rateLimitsFromEnv,
   sentAddresses,
+  countAlreadySent,
   campaignSummaries,
   createMailer,
   runCampaign,
@@ -83,8 +87,8 @@ const APP_VERSION = (() => {
 const PUBLIC_DIR = join(ROOT, 'public');
 const DATA_DIR = join(ROOT, 'data');
 const TEMPLATE_DIR = join(ROOT, 'templates');
-const LOG_PATH = resolve(process.env.SEND_LOG || join(ROOT, 'logs', 'sent.jsonl'));
-const SUPPRESSION_PATH = resolve(process.env.SUPPRESSION_FILE || join(DATA_DIR, 'suppressed.csv'));
+const LOG_PATH = defaultLogPath();
+const SUPPRESSION_PATH = defaultSuppressionPath();
 const SCHEDULE_PATH = resolve(process.env.SCHEDULE_FILE || join(ROOT, 'logs', 'schedule.json'));
 // A schedule that came due while the server was off is sent if it is at most
 // this late; later than that it is parked as "missed" for a human to decide.
@@ -451,12 +455,23 @@ function delayFrom(value, fallback = 4000) {
   return Math.max(0, Math.min(10 * 60 * 1000, Math.floor(n)));
 }
 
+/** true is implicit TLS, false is STARTTLS; unspecified follows the saved mode, else the port. */
+function secureFrom(value, port) {
+  if (value === undefined) return resolveSmtpConfig({ ...process.env, SMTP_PORT: String(port) }).secure;
+  if (typeof value === 'boolean') return value;
+  if (value === 'true' || value === 'false') return value === 'true';
+  throw new Error('Invalid TLS mode: secure must be true (implicit TLS) or false (STARTTLS)');
+}
+
+/** A text setting from the form: not sent keeps what is saved, empty clears it. */
+const textSetting = (value, saved) => (value === undefined ? saved : String(value ?? '').trim());
+
 /** SMTP settings from a settings form, falling back to what is saved. */
 function smtpConfigFrom(body) {
   const current = resolveSmtpConfig();
   const host = String(body.host ?? current.host).trim();
   const port = Number(body.port ?? current.port) || 465;
-  const secure = body.secure === undefined ? port === 465 : Boolean(body.secure);
+  const secure = secureFrom(body.secure, port);
   const user = String(body.user ?? current.user).trim();
   const supplied = body.pass === undefined || body.pass === '' ? current.pass : String(body.pass);
   const pass = supplied.replace(/\s+/g, '');
@@ -471,9 +486,27 @@ function smtpConfigFrom(body) {
     user,
     pass,
     from,
+    replyTo: textSetting(body.replyTo, current.replyTo),
+    unsubscribeUrl: textSetting(body.unsubscribeUrl, current.unsubscribeUrl),
+    maxPerHour: textSetting(body.maxPerHour, process.env.MAX_PER_HOUR ?? ''),
     isLocal,
     configured: Boolean((user && pass) || isLocal),
   };
+}
+
+/** Why the optional delivery settings cannot be saved, or null. */
+function deliverySettingsIssue(cfg) {
+  if (cfg.replyTo && !emailRe.test(bareAddress(cfg.replyTo))) {
+    return 'Reply-To must be an email address such as help@example.com or Help <help@example.com>';
+  }
+  const url = unsubscribeUrlIssue(cfg.unsubscribeUrl);
+  if (url) return url;
+  try {
+    rateLimitsFromEnv({ MAX_PER_HOUR: cfg.maxPerHour });
+  } catch (err) {
+    return err.message;
+  }
+  return null;
 }
 
 function smtpState() {
@@ -484,6 +517,9 @@ function smtpState() {
     secure: cfg.secure,
     user: cfg.user,
     from: cfg.from,
+    replyTo: cfg.replyTo,
+    unsubscribeUrl: cfg.unsubscribeUrl,
+    maxPerHour: process.env.MAX_PER_HOUR ?? '',
     configured: cfg.configured,
     passwordSet: Boolean(cfg.pass),
   };
@@ -558,7 +594,8 @@ function previewFor(input, index = 0) {
   const held = (r) => !input.alreadySent.has(r._email.toLowerCase()) && isSuppressed(SUPPRESSION_PATH, r._email);
   const suppressed = input.parsed.recipients.filter(held).length;
   const skipped = input.parsed.recipients.filter((r) => input.alreadySent.has(r._email.toLowerCase())).length;
-  const raw = render(input.templateHtml, rec);
+  const cfg = resolveSmtpConfig();
+  const raw = render(input.templateHtml, rec, cfg);
   const columns = columnRoles(input.parsed.columns || []);
   return {
     index: i,
@@ -579,6 +616,7 @@ function previewFor(input, index = 0) {
     truncated: input.parsed.truncated,
     columns,
     placeholders: placeholdersFor(`${input.templateHtml} ${input.subject}`, columns),
+    warnings: linkWarnings(raw, { unsubscribe: unsubscribeLink(cfg, rec._email) }),
   };
 }
 
@@ -591,7 +629,7 @@ function placeholdersFor(text, columns) {
     const key = name.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
-    const status = ['name', 'company', 'email'].includes(key) ? 'builtin' : known.has(key) ? 'column' : 'missing';
+    const status = ['name', 'company', 'email', 'unsubscribe_url'].includes(key) ? 'builtin' : known.has(key) ? 'column' : 'missing';
     found.push({ name: key, status });
   }
   return found;
@@ -705,7 +743,7 @@ function startCampaign(input, { delay = 0 } = {}) {
       emit(job, {
         type: 'start',
         total: input.parsed.recipients.length,
-        skipped: input.alreadySent.size,
+        skipped: countAlreadySent(input.parsed.recipients, input.alreadySent),
         delay,
         campaign: input.campaignId || null,
       });
@@ -772,19 +810,31 @@ function scheduleView() {
       recipients: (entry.recipients || []).length,
       template: entry.template,
       status: entry.status,
+      interrupted: Boolean(entry.interrupted),
       error: entry.error || null,
       result: entry.result || null,
       createdAt: entry.createdAt || null,
     }));
 }
 
+const sha256 = (text) => createHash('sha256').update(text).digest('hex');
+
 function templateFor(entry) {
   const path = safePath(entry.template, { roots: [TEMPLATE_DIR], ext: ['.html', '.htm'] });
-  return { path, html: readFileSync(path, 'utf8'), assetsDir: assetsDirFor(path) };
+  const html = readFileSync(path, 'utf8');
+  // The recipients and subject were fixed when this was scheduled; so was what
+  // the person approved in the preview. Entries from before the hash existed
+  // have nothing to compare with.
+  if (entry.templateHash && sha256(html) !== entry.templateHash) {
+    throw new Error(`Template changed since scheduling: ${entry.template} is no longer what was approved. Check it, then schedule the campaign again.`);
+  }
+  return { path, html, assetsDir: assetsDirFor(path) };
 }
 
 /** Runs one due entry; the caller has already marked it "sending". */
 async function fireScheduled(entry) {
+  // Set again below if this run is cut short too.
+  entry.interrupted = false;
   try {
     const template = templateFor(entry);
     const campaignId = String(entry.campaign || '');
@@ -812,13 +862,17 @@ async function fireScheduled(entry) {
       sent: summary?.sent || 0,
       failed: summary?.failed || 0,
       skipped: summary?.skipped || 0,
+      ...(summary?.uncertain?.length ? { uncertain: summary.uncertain.length } : {}),
     };
     if (job.cancelled && summary?.remaining > 0) {
       // Stopped part-way. A shutdown puts the entry back in line so the next
       // start resumes it (the log skips whoever was already mailed); a person
       // pressing Stop means it is over.
       entry.status = shuttingDown ? 'pending' : 'cancelled';
-      if (shuttingDown) entry.result = null;
+      if (shuttingDown) {
+        entry.result = null;
+        entry.interrupted = true;
+      }
     } else {
       entry.status = summary?.error || (!summary?.sent && summary?.failed) ? 'failed' : 'sent';
     }
@@ -834,6 +888,8 @@ async function fireScheduled(entry) {
     const stored = current.find((e) => e.id === entry.id);
     if (stored) {
       stored.status = entry.status;
+      if (entry.interrupted) stored.interrupted = true;
+      else delete stored.interrupted;
       stored.error = entry.error ?? null;
       stored.result = entry.result ?? null;
       writeSchedule(current);
@@ -864,9 +920,11 @@ async function tick() {
       }
     }
 
-    // Anything that came due long before the server was up is not sent late.
+    // Anything that came due long before the server was up is not sent late. A
+    // send that was cut short is not "late": it started on time and the log
+    // keeps it from mailing anyone twice, so it always carries on.
     for (const entry of list) {
-      if (entry.status === 'pending' && Date.parse(entry.at) < now - GRACE_MS) {
+      if (entry.status === 'pending' && !entry.interrupted && Date.parse(entry.at) < now - GRACE_MS) {
         entry.status = 'missed';
         entry.error = 'The server was not running at the scheduled time';
         changed = true;
@@ -890,8 +948,8 @@ async function tick() {
 
 /**
  * A crash or restart can leave an entry marked "sending" with no job behind
- * it. Nothing is running this early in the process, so put it back in line;
- * the grace window decides whether it still goes out.
+ * it. Nothing is running this early in the process, so put it back in line,
+ * flagged as interrupted so it resumes whatever the grace window says.
  */
 function recoverSchedule() {
   const list = readSchedule();
@@ -899,6 +957,7 @@ function recoverSchedule() {
   for (const entry of list) {
     if (entry.status !== 'sending') continue;
     entry.status = 'pending';
+    entry.interrupted = true;
     entry.error = null;
     changed = true;
   }
@@ -1041,6 +1100,9 @@ async function route(req, res) {
       secure: cfg.secure,
       user: cfg.user,
       from: cfg.from,
+      replyTo: cfg.replyTo,
+      unsubscribeUrl: cfg.unsubscribeUrl,
+      maxPerHour: process.env.MAX_PER_HOUR ?? '',
       passwordSet: Boolean(cfg.pass),
       configured: cfg.configured,
       configPath: rel(configFile.path),
@@ -1069,9 +1131,11 @@ async function route(req, res) {
     if (!cfg.from) return fail(res, 400, 'A From address is required');
     if (!cfg.configured) return fail(res, 400, 'Those settings are incomplete');
     // Each value becomes one line of the config file; a line break would add keys.
-    if ([cfg.host, cfg.user, cfg.from].some((value) => /[\r\n\0]/.test(value))) {
+    if ([cfg.host, cfg.user, cfg.from, cfg.replyTo, cfg.unsubscribeUrl, cfg.maxPerHour].some((value) => /[\r\n\0]/.test(value))) {
       return fail(res, 400, 'Settings cannot contain line breaks');
     }
+    const delivery = deliverySettingsIssue(cfg);
+    if (delivery) return fail(res, 400, delivery);
 
     let verified = false;
     let verifyError = null;
@@ -1177,7 +1241,7 @@ async function route(req, res) {
     const result = await mailer.send({
       to,
       subject: renderSubject(input.subject, rec),
-      html: render(input.templateHtml, rec),
+      html: render(input.templateHtml, rec, cfg),
       assetsDir: input.assetsDir,
     });
     mailer.close();
@@ -1206,7 +1270,7 @@ async function route(req, res) {
     } catch (err) {
       return fail(res, err.status || 409, err.message);
     }
-    return json(res, 202, { jobId: job.id, total: input.parsed.recipients.length, skipped: input.alreadySent.size });
+    return json(res, 202, { jobId: job.id, total: input.parsed.recipients.length, skipped: countAlreadySent(input.parsed.recipients, input.alreadySent) });
   }
 
   // ── Suppression list ──────────────────────────────────────────────
@@ -1262,6 +1326,7 @@ async function route(req, res) {
       campaign: input.campaignId,
       subject: input.subject,
       template: rel(input.templatePath),
+      templateHash: sha256(input.templateHtml),
       delay: delayFrom(body.delay),
       recipients: input.parsed.recipients.map((r) => ({
         email: r._email,
@@ -1281,7 +1346,7 @@ async function route(req, res) {
     return json(res, 201, {
       entry: scheduleView().find((e) => e.id === entry.id),
       total: entry.recipients.length,
-      skipped: input.alreadySent.size,
+      skipped: countAlreadySent(input.parsed.recipients, input.alreadySent),
     });
   }
 
@@ -1372,7 +1437,7 @@ function handleRequest(req, res) {
       res.end();
       return;
     }
-    const code = err.status || (/not allowed|not found|required|invalid|no valid|no data rows|expected|too long/i.test(err.message) ? 400 : 500);
+    const code = err.status || (/not allowed|not found|required|invalid|no valid|no data rows|unclosed quote|expected|too long/i.test(err.message) ? 400 : 500);
     if (code >= 500) console.error('[gui] request failed:', err.message);
     fail(res, code, err.message);
   });

@@ -396,6 +396,7 @@
               <li class="check" data-check="mailbox" data-state="todo"><span class="check__mark" aria-hidden="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-check"></use></svg></span><span class="check__body"><span class="check__title">Mailbox</span><span class="check__sub" id="chkMailbox">—</span></span><a class="check__fix" href="#/settings">Fix</a></li>
               <li class="check" data-check="template" data-state="todo"><span class="check__mark" aria-hidden="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-check"></use></svg></span><span class="check__body"><span class="check__title">Template and subject</span><span class="check__sub" id="chkCompose">—</span></span><a class="check__fix" href="#/compose">Fix</a></li>
               <li class="check" data-check="recipients" data-state="todo"><span class="check__mark" aria-hidden="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-check"></use></svg></span><span class="check__body"><span class="check__title">Recipients</span><span class="check__sub" id="chkRecipients">—</span></span><a class="check__fix" href="#/recipients">Fix</a></li>
+              <li class="check" data-check="links" data-state="todo"><span class="check__mark" aria-hidden="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-check"></use></svg></span><span class="check__body"><span class="check__title">Links and unsubscribe</span><span class="check__sub" id="chkLinks">—</span></span><a class="check__fix" href="#/compose">Fix</a></li>
             </ul>
 
             <dl class="facts" id="facts">
@@ -542,7 +543,7 @@
           <div class="empty" id="suppressEmpty">
             <svg class="icon empty__icon" aria-hidden="true" focusable="false"><use href="#i-ban"></use></svg>
             <p class="empty__title" id="suppressEmptyTitle">No suppressed addresses</p>
-            <p class="empty__text" id="suppressEmptyText">Addresses you add, or that unsubscribe, appear here.</p>
+            <p class="empty__text" id="suppressEmptyText">Addresses you add, and hard bounces found while sending, appear here. Unsubscribe requests are not added automatically: add them here when they arrive.</p>
           </div>
           <p class="hint card__note" id="suppressNote"></p>
         </section>
@@ -574,6 +575,15 @@
           </div>
 
           <div class="field">
+            <label for="setSecure">Connection security</label>
+            <select id="setSecure">
+              <option value="true">Implicit TLS (usually port 465)</option>
+              <option value="false">STARTTLS (usually port 587 or 25)</option>
+            </select>
+            <p class="hint">Must match the port. Gmail and most providers: 465 with implicit TLS, or 587 with STARTTLS.</p>
+          </div>
+
+          <div class="field">
             <label for="setUser">Mailbox address</label>
             <input id="setUser" type="email" spellcheck="false" placeholder="you@yourdomain.com" autocomplete="off">
             <p class="hint" id="setUserHint">The account Mailroom signs in as. A relay on this machine needs none.</p>
@@ -589,6 +599,24 @@
             <label for="setFrom">From line</label>
             <input id="setFrom" type="text" spellcheck="false" placeholder="Your Name <you@yourdomain.com>" autocomplete="off">
             <p class="hint">What recipients see. Defaults to the mailbox address.</p>
+          </div>
+
+          <div class="field">
+            <label for="setReplyTo">Reply-To (optional)</label>
+            <input id="setReplyTo" type="text" spellcheck="false" placeholder="Help Desk <help@yourdomain.com>" autocomplete="off">
+            <p class="hint">Where replies go, and where unsubscribe requests are mailed. Defaults to the From address.</p>
+          </div>
+
+          <div class="field">
+            <label for="setUnsubUrl">Unsubscribe link (optional)</label>
+            <input id="setUnsubUrl" type="text" spellcheck="false" placeholder="https://yourdomain.com/unsubscribe?e={email}" autocomplete="off">
+            <p class="hint">An https:// page you host; {email} becomes the recipient. Without one, the unsubscribe link mails the Reply-To or From address.</p>
+          </div>
+
+          <div class="field field--short">
+            <label for="setMaxPerHour">Messages per hour (optional)</label>
+            <input id="setMaxPerHour" type="text" inputmode="numeric" spellcheck="false" placeholder="500" autocomplete="off">
+            <p class="hint">Ceiling across all runs; 0 turns it off. Blank keeps the default of 500.</p>
           </div>
 
           <p class="status" id="settingsStatus" role="status"></p>

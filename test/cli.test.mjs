@@ -9,6 +9,9 @@ import { startSmtpSink } from './helpers/smtp-sink.mjs';
 
 const SEND = resolve(dirname(fileURLToPath(import.meta.url)), '../src/send.mjs');
 
+// The log and the suppression list are kept inside each test's own folder, never in the repo.
+const ISOLATED = { SEND_LOG: 'logs/sent.jsonl', SUPPRESSION_FILE: 'data/suppressed.csv' };
+
 // Preview mode renders locally and never opens an SMTP connection.
 function runPreview(extraArgs, env = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'mailroom-cli-'));
@@ -20,7 +23,7 @@ function runPreview(extraArgs, env = {}) {
     ], {
       cwd: dir,
       encoding: 'utf8',
-      env: { PATH: process.env.PATH, HOME: dir, MAILROOM_CONFIG: join(dir, 'none.env'), ...env },
+      env: { ...ISOLATED, PATH: process.env.PATH, HOME: dir, MAILROOM_CONFIG: join(dir, 'none.env'), ...env },
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -91,7 +94,7 @@ async function runCli(args, { env = {}, files = {}, collect = [] } = {}) {
     }
     const child = spawn(process.execPath, [SEND, ...args], {
       cwd: dir,
-      env: { PATH: process.env.PATH, HOME: dir, MAILROOM_CONFIG: join(dir, 'none.env'), ...env },
+      env: { ...ISOLATED, PATH: process.env.PATH, HOME: dir, MAILROOM_CONFIG: join(dir, 'none.env'), ...env },
     });
     let stdout = '';
     let stderr = '';
@@ -138,6 +141,13 @@ test('preview says how many recipients the suppression list will hold back', asy
   assert.match(res.stdout, /suppressed\s+1 \(will skip\)/);
 });
 
+test('preview counts only the addresses of this list as already sent', async () => {
+  const log = '{"email":"ghost@example.com","status":"sent","campaign":"c1"}\n{"email":"a@example.com","status":"sent","campaign":"c1"}\n';
+  const res = await runCli([...SEND_ARGS, '--campaign', 'c1'], { files: { 'logs/sent.jsonl': log } });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /recipients\s+3 \(1 already sent, will skip\)/);
+});
+
 test('--send never mails a suppressed address', async (t) => {
   const sink = await startSmtpSink();
   t.after(() => sink.close());
@@ -182,4 +192,43 @@ test('--send stops before connecting when the compliance settings are unusable',
   assert.equal(from.status, 1);
   assert.match(from.stderr, /EMAIL_FROM must be a full address/);
   assert.equal(sink.messages.length, 0);
+});
+
+test('--send reports a message the server may have accepted as unconfirmed and never resends it', async (t) => {
+  const sink = await startSmtpSink({ stall: (envelope) => (envelope.to[0].startsWith('<b@') ? 'drop' : false) });
+  t.after(() => sink.close());
+  const res = await runCli([...SEND_ARGS, '--send', '--campaign', 'c1'], { env: smtpEnv(sink) });
+
+  assert.equal(res.status, 1, res.stdout + res.stderr);
+  assert.equal(sink.messages.filter((m) => m.to[0] === '<b@example.com>').length, 1);
+  assert.match(res.stdout, /UNCONFIRMED b@example\.com/);
+  assert.match(res.stdout, /unconfirmed\s+1/);
+  assert.match(res.stdout, /sent\s+2/);
+  assert.match(res.stdout, /failed\s+0/);
+});
+
+test('--send is refused while another process holds the lock on the send log', async (t) => {
+  const sink = await startSmtpSink();
+  t.after(() => sink.close());
+  const lock = JSON.stringify({ pid: process.pid, token: 'other-run', at: new Date().toISOString() });
+  const res = await runCli([...SEND_ARGS, '--send', '--log', 'logs/sent.jsonl'], {
+    env: smtpEnv(sink),
+    files: { 'logs/sent.jsonl.lock': lock },
+  });
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /already sending/);
+  assert.equal(sink.messages.length, 0);
+});
+
+test('--send writes the log where SEND_LOG points, as the browser does', async (t) => {
+  const sink = await startSmtpSink();
+  t.after(() => sink.close());
+  const res = await runCli([...SEND_ARGS, '--send', '--campaign', 'c1'], {
+    env: { ...smtpEnv(sink), SEND_LOG: 'elsewhere/campaign.jsonl' },
+    collect: ['elsewhere/campaign.jsonl', 'logs/sent.jsonl'],
+  });
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  assert.equal(res.written['elsewhere/campaign.jsonl'].trim().split('\n').length, 3);
+  assert.equal(res.written['logs/sent.jsonl'], null);
+  assert.match(res.stdout, /log\s+\S*elsewhere\/campaign\.jsonl/);
 });

@@ -114,13 +114,20 @@ export function saveConfig(values, path = resolveConfigPath()) {
   return path;
 }
 
-/** The SMTP keys the setup screen owns, in the order they are written. */
-export function smtpFileValues({ host, port, user, pass, from }) {
+/**
+ * The keys the setup screen owns, in the order they are written. An optional
+ * key that is undefined is left as it is; an empty string removes it.
+ */
+export function smtpFileValues({ host, port, secure, user, pass, from, replyTo, unsubscribeUrl, maxPerHour }) {
   const values = {
     SMTP_HOST: host,
     SMTP_PORT: String(port),
+    SMTP_SECURE: secure === undefined ? undefined : String(secure),
     SMTP_USER: user,
     EMAIL_FROM: from,
+    EMAIL_REPLY_TO: replyTo,
+    UNSUBSCRIBE_URL: unsubscribeUrl,
+    MAX_PER_HOUR: maxPerHour,
   };
   // A blank password means "keep the one already saved".
   if (pass) values.SMTP_PASS = pass;

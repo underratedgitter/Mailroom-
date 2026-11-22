@@ -63,15 +63,35 @@ export function resolveSmtpConfig(env = process.env) {
   };
 }
 
+/** Why an UNSUBSCRIBE_URL cannot be used, or null (empty means none). */
+export function unsubscribeUrlIssue(url) {
+  if (url && !/^https:\/\/[^\s<>]+$/i.test(url)) {
+    return 'UNSUBSCRIBE_URL must be an https:// URL with no spaces (RFC 8058 one-click needs HTTPS).';
+  }
+  return null;
+}
+
 /** Why this configuration cannot send compliant mail, or null when it can. */
 export function configIssue(cfg) {
   if (!addressDomain(cfg.from)) {
     return 'EMAIL_FROM must be a full address such as news@example.com: Message-ID and unsubscribe headers are built from its domain.';
   }
-  if (cfg.unsubscribeUrl && !/^https:\/\/[^\s<>]+$/i.test(cfg.unsubscribeUrl)) {
-    return 'UNSUBSCRIBE_URL must be an https:// URL with no spaces (RFC 8058 one-click needs HTTPS).';
-  }
-  return null;
+  return unsubscribeUrlIssue(cfg.unsubscribeUrl);
+}
+
+/** `mailto:` link to the unsubscribe mailbox (UNSUBSCRIBE_MAILTO, else Reply-To, else From), or ''. */
+function unsubscribeMailtoLink(cfg) {
+  const mailbox = bareAddress(cfg.unsubscribeMailto || cfg.replyTo || cfg.from);
+  if (!mailbox) return '';
+  const at = mailbox.lastIndexOf('@');
+  return `mailto:${encodeURIComponent(mailbox.slice(0, at))}${mailbox.slice(at)}?subject=unsubscribe`;
+}
+
+const unsubscribeUrlFor = (cfg, to) => cfg.unsubscribeUrl.replaceAll('{email}', encodeURIComponent(to));
+
+/** What `{{unsubscribe_url}}` stands for: the hosted URL for this recipient, else the mailto link; '' when neither exists. */
+export function unsubscribeLink(cfg, to) {
+  return cfg.unsubscribeUrl ? unsubscribeUrlFor(cfg, to) : unsubscribeMailtoLink(cfg);
 }
 
 /**
@@ -82,14 +102,11 @@ export function bulkFields(cfg, to) {
   const targets = [];
   const headers = {};
   if (cfg.unsubscribeUrl) {
-    targets.push(`<${cfg.unsubscribeUrl.replaceAll('{email}', encodeURIComponent(to))}>`);
+    targets.push(`<${unsubscribeUrlFor(cfg, to)}>`);
     headers['List-Unsubscribe-Post'] = 'List-Unsubscribe=One-Click';
   }
-  const mailbox = bareAddress(cfg.unsubscribeMailto || cfg.replyTo || cfg.from);
-  if (mailbox) {
-    const at = mailbox.lastIndexOf('@');
-    targets.push(`<mailto:${encodeURIComponent(mailbox.slice(0, at))}${mailbox.slice(at)}?subject=unsubscribe>`);
-  }
+  const mailto = unsubscribeMailtoLink(cfg);
+  if (mailto) targets.push(`<${mailto}>`);
   if (targets.length) headers['List-Unsubscribe'] = targets.join(', ');
 
   return {

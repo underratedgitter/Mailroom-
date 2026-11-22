@@ -497,6 +497,13 @@ function draftChecks() {
           : 'Nothing left to send' + (held.length ? ': ' + held.join(', ') : '') + '.')
         : state.previewError || unpreviewedRecipients(),
     },
+    // A warning, not a blocker: the message can still be sent.
+    links: {
+      ok: Boolean(p && !p.warnings?.length),
+      text: !p ? 'Checked once there is a preview.'
+        : p.warnings?.length ? p.warnings.map((w) => w.message).join(' ')
+          : 'Every link works and there is an unsubscribe link.',
+    },
   };
 }
 
@@ -508,7 +515,7 @@ function renderDraft() {
   for (const [name, check] of Object.entries(checks)) {
     const li = ui.sendChecks.querySelector('[data-check="' + (name === 'compose' ? 'template' : name) + '"]');
     setAttr(li, 'data-state', check.ok ? 'ok' : 'bad');
-    const sub = ui[{ mailbox: 'chkMailbox', compose: 'chkCompose', recipients: 'chkRecipients' }[name]];
+    const sub = ui[{ mailbox: 'chkMailbox', compose: 'chkCompose', recipients: 'chkRecipients', links: 'chkLinks' }[name]];
     setText(sub, check.text);
     setAttr(sub, 'title', check.text);
   }
@@ -1034,6 +1041,8 @@ function clearLedger() {
   setHidden(ui.ledgerEmpty, false);
 }
 
+const UNSENT_REASON = { suppressed: 'suppressed', uncertain: 'earlier attempt unconfirmed; not mailed again' };
+
 function addLine({ n, tag, tagLabel, addr, note, bad = false }) {
   setHidden(ui.ledgerEmpty, true);
   const li = h('li', {},
@@ -1059,8 +1068,8 @@ function appendToLedger(li) {
 }
 
 function renderRun() {
-  const { total, sent, failed, skipped } = state.run;
-  const done = sent + failed + skipped;
+  const { total, sent, failed, skipped, uncertain } = state.run;
+  const done = sent + failed + skipped + uncertain;
   for (const bar of [ui.runProgress, ui.liveProgress]) {
     if (bar.max !== Math.max(total, 1)) bar.max = Math.max(total, 1);
     if (bar.value !== done) bar.value = done;
@@ -1070,12 +1079,12 @@ function renderRun() {
   setText(ui.runLabel, label);
   setText(ui.liveText, 'Sending' + (state.run.campaign ? ' “' + state.run.campaign + '”' : '') + ' — ' + (total ? done + ' of ' + total : 'starting'));
 
-  const counts = [['sent', sent], ['failed', failed], ['skipped', skipped]];
+  const counts = [['sent', sent], ['failed', failed], ['skipped', skipped], ...(uncertain ? [['unconfirmed', uncertain]] : [])];
   reconcile(ui.runCounts, counts, ([name]) => name,
     ([name]) => h('span', {}, name + ' ', h('b')),
     (node, [name, value]) => {
       setText(node.lastElementChild, String(value));
-      setClass(node, 'is-bad', name === 'failed' && value > 0);
+      setClass(node, 'is-bad', (name === 'failed' || name === 'unconfirmed') && value > 0);
     });
 }
 
@@ -1094,7 +1103,7 @@ function lockControls() {
   ui.cancelBtn.disabled = false;
   ui.cancelBtn.textContent = 'Stop after this one';
   clearLedger();
-  state.run = { total: 0, sent: 0, failed: 0, skipped: 0, label: '', campaign: '' };
+  state.run = { total: 0, sent: 0, failed: 0, skipped: 0, uncertain: 0, label: '', campaign: '' };
   setRunState('run', 'Sending');
   setHidden(ui.liveBar, false);
   setHidden(ui.navSendBadge, false);
@@ -1185,14 +1194,17 @@ function listen(jobId, attempt = 0) {
     } else if (data.type === 'progress') {
       if (data.status === 'sent') run.sent++;
       if (data.status === 'failed') run.failed++;
+      if (data.status === 'uncertain') run.uncertain++;
       if (data.status === 'skip') run.skipped++;
       addLine({
         n: String(data.index).padStart(2, '0'),
         tag: data.status,
         tagLabel: data.status,
         addr: data.email,
-        note: data.error || (data.reason === 'suppressed' ? 'suppressed' : ''),
-        bad: data.status === 'failed',
+        note: data.status === 'uncertain'
+          ? 'no reply after the message was sent, so it may have been delivered; not retried (' + data.error + ')'
+          : data.error || UNSENT_REASON[data.reason] || '',
+        bad: data.status === 'failed' || data.status === 'uncertain',
       });
     } else if (data.type === 'throttle') {
       addLine({
@@ -1211,7 +1223,10 @@ function listen(jobId, attempt = 0) {
       const s = data.summary || {};
       const text = s.error
         ? 'Stopped — ' + s.error
-        : (s.stopped ? 'Stopped' : 'Done') + ' — sent ' + (s.sent || 0) + ', failed ' + (s.failed || 0) + ', skipped ' + (s.skipped || 0) + '.' + (s.failed ? ' Failures are in the log.' : '');
+        : (s.stopped ? 'Stopped' : 'Done') + ' — sent ' + (s.sent || 0) + ', failed ' + (s.failed || 0) + ', skipped ' + (s.skipped || 0)
+          + (s.uncertain?.length ? ', unconfirmed ' + s.uncertain.length : '') + '.'
+          + (s.failed ? ' Failures are in the log.' : '')
+          + (s.uncertain?.length ? ' Unconfirmed messages may have been delivered; check your Sent folder before mailing them again.' : '');
       addSummary(text);
       run.label = text;
       setRunState(s.error ? 'bad' : s.stopped ? 'warn' : 'ok', s.error ? 'Failed' : s.stopped ? 'Stopped' : 'Finished');
@@ -1250,6 +1265,7 @@ async function finishSend(summary) {
   unlockControls();
   if (summary.error) toast(summary.error, 'bad');
   else if (summary.failed) toast(plural(summary.failed, 'message') + ' failed — see the log on the Send page.', 'bad');
+  else if (summary.uncertain?.length) toast(plural(summary.uncertain.length, 'message') + ' may or may not have been delivered — check your Sent folder before re-sending.', 'bad');
   else if (summary.stopped) toast('Stopped after ' + plural(summary.sent || 0, 'message') + ' sent.', 'ok');
   else toast('Campaign finished: ' + plural(summary.sent || 0, 'message') + ' sent.', 'ok');
 
@@ -1365,7 +1381,7 @@ function renderQueue() {
       setAttr(line.children[1], 'class', 'tag tag--' + e.status);
       setText(line.children[2], e.status === 'pending' ? relative(e.at) : '');
       setText(meta, [e.campaign || 'No campaign name', plural(e.recipients, 'recipient'), e.subject].filter(Boolean).join(' · '));
-      const text = e.error || (e.result ? 'Sent ' + e.result.sent + ', failed ' + e.result.failed + ', skipped ' + e.result.skipped : '');
+      const text = e.error || (e.status === 'pending' && e.interrupted ? 'Cut short; carries on automatically and skips anyone already mailed.' : e.result ? 'Sent ' + e.result.sent + ', failed ' + e.result.failed + ', skipped ' + e.result.skipped + (e.result.uncertain ? ', unconfirmed ' + e.result.uncertain : '') : '');
       setText(note, text);
       setHidden(note, !text);
       setClass(note, 'is-bad', Boolean(e.error));
@@ -1463,7 +1479,7 @@ function renderSuppression() {
   reconcile(ui.suppressList, shown, (email) => email, (email) => h('li'), (li, email) => setText(li, email));
   setHidden(ui.suppressEmpty, shown.length > 0);
   setText(ui.suppressEmptyTitle, data.count ? 'No matches' : 'No suppressed addresses');
-  setText(ui.suppressEmptyText, data.count ? 'Nothing on the list matches “' + ui.suppressSearch.value.trim() + '”.' : 'Addresses you add, or that unsubscribe, appear here.');
+  setText(ui.suppressEmptyText, data.count ? 'Nothing on the list matches “' + ui.suppressSearch.value.trim() + '”.' : 'Addresses you add, and hard bounces found while sending, appear here. Unsubscribe requests are not added automatically: add them here when they arrive.');
   setText(ui.suppressNote, (matches.length > shown.length ? 'Showing the first ' + shown.length + ' of ' + matches.length + '. Filter to narrow it down. ' : '')
     + 'To remove an address, edit ' + data.path + '.');
 }
@@ -1510,8 +1526,12 @@ async function loadSettingsForm() {
     if (state.settingsDirty) return;
     ui.setHost.value = settings.host || '';
     ui.setPort.value = settings.port || 465;
+    ui.setSecure.value = String(Boolean(settings.secure));
     ui.setUser.value = settings.user || '';
     ui.setFrom.value = settings.from || '';
+    ui.setReplyTo.value = settings.replyTo || '';
+    ui.setUnsubUrl.value = settings.unsubscribeUrl || '';
+    ui.setMaxPerHour.value = settings.maxPerHour || '';
     ui.setPass.value = '';
     ui.setPass.placeholder = settings.passwordSet ? 'Saved — leave blank to keep it' : '16 characters';
     setText(ui.setPassHint, settings.passwordSet
@@ -1526,9 +1546,13 @@ function settingsPayload() {
   return {
     host: ui.setHost.value.trim(),
     port: Number(ui.setPort.value) || undefined,
+    secure: ui.setSecure.value === 'true',
     user: ui.setUser.value.trim(),
     pass: ui.setPass.value,
     from: ui.setFrom.value.trim(),
+    replyTo: ui.setReplyTo.value.trim(),
+    unsubscribeUrl: ui.setUnsubUrl.value.trim(),
+    maxPerHour: ui.setMaxPerHour.value.trim(),
   };
 }
 
@@ -1727,6 +1751,12 @@ ui.suppressSearch.addEventListener('input', debounce(renderSuppression, 150));
 // Settings
 ui.settingsForm.addEventListener('submit', saveSettings);
 ui.settingsForm.addEventListener('input', () => { state.settingsDirty = true; });
+// The two common ports each imply a mode; pick it so the selector starts right.
+ui.setPort.addEventListener('change', () => {
+  const port = Number(ui.setPort.value);
+  if (port === 465) ui.setSecure.value = 'true';
+  else if (port === 587 || port === 25) ui.setSecure.value = 'false';
+});
 ui.settingsTestBtn.addEventListener('click', testSettings);
 
 // Confirm dialog

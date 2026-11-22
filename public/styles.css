@@ -475,7 +475,7 @@ button.chip:hover { background: var(--accent-soft); border-color: var(--accent);
 }
 .tag--sent { background: var(--ok-soft); color: var(--ok); }
 .tag--failed, .tag--sending-failed { background: var(--bad-soft); color: var(--bad); }
-.tag--skip { background: var(--warn-soft); color: var(--warn); }
+.tag--skip, .tag--uncertain { background: var(--warn-soft); color: var(--warn); }
 .tag--run { background: var(--accent-soft); color: var(--accent); }
 .tag--pending { background: var(--accent-soft); color: var(--accent); }
 .tag--sending { background: var(--ok-soft); color: var(--ok); }

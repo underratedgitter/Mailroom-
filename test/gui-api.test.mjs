@@ -91,3 +91,12 @@ test('a saved list can never take the suppression list\'s file name', async (t) 
   assert.notEqual(saved.data.path, 'data/suppressed.csv');
   assert.equal(existsSync(suppressionFile), existed);
 });
+
+test('a CSV with an unclosed quote is reported to the user, not silently truncated', async (t) => {
+  const server = await startServer();
+  t.after(server.stop);
+  const text = 'email,name\na@example.com,A\nb@example.com,"B\nc@example.com,C\n';
+  const dry = await post(server.base, '/api/recipients', { text, format: 'csv', dryRun: true });
+  assert.equal(dry.status, 400);
+  assert.match(dry.data.error, /Unclosed quote starting on line 3/);
+});

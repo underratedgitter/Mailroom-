@@ -120,6 +120,7 @@ npm start
 | `GUI_HOST` | `127.0.0.1` | Network interface to bind (CLI: `--host`) |
 | `GUI_PORT` | `4173` | Port to listen on (CLI: `--port`) |
 | `GUI_ALLOWED_HOSTS` | unset | Comma-separated list of additional allowed `Host` headers |
+| `SEND_LOG` | `logs/sent.jsonl` | Send log (the resume state), shared by the browser and the CLI (CLI: `--log`). Relative paths of `SEND_LOG` resolve against the folder you start from; the default is the install folder |
 | `SEND_LOG_MAX_BYTES` | `10485760` | Size at which `logs/sent.jsonl` is rotated (`0` turns rotation off) |
 | `SEND_LOG_KEEP` | `5` | Rotated archives kept (`sent.jsonl.1` is the newest); at least 1 |
 
@@ -174,6 +175,16 @@ status, counts, recent campaigns), **Compose**, **Recipients**, **Send**,
 **Schedule**, **Suppression** and **Settings**. It follows your light or dark
 system theme and works on a phone-sized screen.
 
+**Settings** — the mailbox (host, port, app password, From line), the
+**connection security** (implicit TLS, `SMTP_SECURE=true`, usually port 465, or
+STARTTLS, `SMTP_SECURE=false`, usually 587 or 25; the page picks one when you
+type 465 or 587 and writes the choice to the settings file), and three optional
+delivery settings: Reply-To (`EMAIL_REPLY_TO`), an https unsubscribe link
+(`UNSUBSCRIBE_URL`, `{email}` replaced) and a messages-per-hour ceiling
+(`MAX_PER_HOUR`). They are validated like the environment variables (a line break,
+an `http://` unsubscribe URL or a non-numeric ceiling is refused) and a blank
+field removes the setting.
+
 **Compose** — every `templates/*.html` file is offered as a template. A folder
 next to it named `<template>-assets/` (for example, `bcci-connect-v2-assets/`) is
 picked up automatically and its images attached inline with `cid:` (Gmail blocks
@@ -195,7 +206,18 @@ common aliases), and every other column as a `{{merge field}}` for the subject a
 template. The Compose page flags any `{{field}}` the list cannot fill.
 
 **Preview** — the actual rendered HTML for the selected recipient, images
-included, with arrows to page through the list.
+included, with arrows to page through the list. The **Links and unsubscribe**
+check on the Send page warns (without blocking) about links that go nowhere
+(`href="#…"` or empty), relative links such as `/unsubscribe`, and a message
+with no unsubscribe link.
+
+**Unsubscribe link** — put `{{unsubscribe_url}}` in a template's footer
+(`href="{{unsubscribe_url}}"`). It is the same target as the List-Unsubscribe
+header: `UNSUBSCRIBE_URL` with `{email}` replaced by the URL-encoded recipient
+when that is set, otherwise `mailto:` the unsubscribe mailbox
+(`UNSUBSCRIBE_MAILTO`, else Reply-To, else From) with the subject `unsubscribe`.
+All bundled templates use it. Mailroom does not receive unsubscribes: add the
+people who write back to the suppression list.
 
 **Send** — a confirmation gate, then per-recipient progress over a live stream.
 Re-running a campaign skips everyone it already mailed. Close the tab and the
@@ -275,6 +297,9 @@ sends alike:
   `List-Unsubscribe-Post: List-Unsubscribe=One-Click`), with `{email}` replaced
   by the URL-encoded recipient. Without a URL there is no `-Post` header,
   because one-click is only valid with HTTPS.
+- **To line.** When the list has a name for a recipient, the To header reads
+  `Priya Shah <priya@example.com>` (quoted and encoded as needed; a name cannot
+  add headers); otherwise just the address.
 - **Plain-text part.** Every message is `multipart/alternative`: the text part
   is generated from the rendered HTML (links keep their address, entities are
   decoded, `<style>`/`<script>` dropped).
@@ -288,11 +313,18 @@ sends alike:
   a per-campaign setting. Skipped addresses are logged as `skipped` with
   `reason: "suppressed"` and counted in the preview, the confirmation dialog
   and the run summary.
+- **Hard bounces at send time.** When the recipient's server refuses the
+  address while Mailroom is still connected (a permanent `5.1.x` reply such as
+  `550 5.1.1 user unknown`, or `5.2.1` mailbox disabled), the address is added
+  to the suppression list with reason `hard-bounce`, and the failed entry in
+  the log carries the SMTP `responseCode`. Other refusals (policy, spam, full or
+  busy mailbox) are logged but not suppressed.
 - **Rate ceiling.** A rolling one-hour window across all runs, rebuilt from the
   send log, so a restart or a second run cannot reset it. When it is full the
   run waits (and says so) until the oldest send ages out; Ctrl+C or *Stop*
-  ends the wait and the campaign resumes later. It does not coordinate two
-  Mailroom processes sending at the same moment.
+  ends the wait and the campaign resumes later. Two Mailroom processes cannot
+  send from the same log at the same moment (see *How it behaves*), so the
+  window is never counted twice.
 
 Add addresses to the suppression list:
 
@@ -313,7 +345,7 @@ call.) Delete a line from the file to un-suppress an address.
 | `EMAIL_REPLY_TO` | unset | Reply-To header; also the default unsubscribe mailbox |
 | `UNSUBSCRIBE_MAILTO` | Reply-To, else From | Mailbox that receives "unsubscribe" mail |
 | `UNSUBSCRIBE_URL` | unset | `https://` one-click endpoint you host; `{email}` is replaced |
-| `SUPPRESSION_FILE` | `data/suppressed.csv` | Suppression list location (CLI: `--suppression-file`) |
+| `SUPPRESSION_FILE` | `data/suppressed.csv` | Suppression list location (CLI: `--suppression-file`); the default is in the install folder for the CLI and the browser alike |
 | `MAX_PER_HOUR` | `500` | Rolling messages-per-hour ceiling for all domains; `0` turns it off |
 | `MAX_PER_DOMAIN_PER_HOUR` | `0` (off) | Same, per recipient domain (e.g. `gmail.com`); a full domain pauses the run |
 
@@ -327,7 +359,9 @@ What stays with you, because it cannot be done from inside the app:
   for you, so use a From address on a domain you have authenticated there.
 - **Reading the unsubscribe mailbox.** Mailroom does not receive mail. When
   someone mails "unsubscribe" (or your one-click endpoint is hit), add them with
-  `--suppress` or `/api/suppress`. The same goes for bounces and spam complaints.
+  `--suppress` or `/api/suppress`. The same goes for spam complaints and for
+  bounces that arrive later by mail (only refusals during the send are
+  suppressed automatically).
 - **The one-click endpoint** must be public HTTPS; the Mailroom UI is not
   (and should not be) exposed that way.
 - **Keep spam complaints under 0.3 %** (Google's threshold), a postal address in
@@ -337,10 +371,24 @@ What stays with you, because it cannot be done from inside the app:
 ## How it behaves
 
 - One campaign at a time; a second start is refused rather than double-mailing.
+  That holds across processes: a run holds `logs/sent.jsonl.lock` (the log's
+  path plus `.lock`, containing its pid) for as long as it sends, so the CLI
+  and the browser, or two CLIs, cannot send from the same log together. A lock
+  left by a process that is gone is taken over automatically; if a pid is
+  reused by something unrelated, delete the lock file named in the message.
 - 4 s between messages by default (and at most `MAX_PER_HOUR` per hour), one message in flight at a time over a
   pooled SMTP connection, retries with backoff on transient errors.
-- Quota, `5.4.5` and authentication errors stop the run so the mailbox is not
-  locked, and 10 connection failures in a row stop it too.
+- Quota, `5.4.5` and authentication errors reported for the account (sign-in,
+  sender or message stage) stop the run so the mailbox is not locked; a refusal
+  of one recipient (an over-quota or disabled mailbox, an unknown user) only
+  fails that recipient. 10 connection failures in a row stop the run too.
+- **Unconfirmed sends.** The SMTP socket timeout is 120 s. If the connection
+  drops or times out after the message body was sent and before the server
+  replied, the server may have accepted it, so Mailroom does not retry it: the
+  address is logged as `uncertain`, shown as *unconfirmed* in the run summary
+  (CLI exit code 1), and skipped on every resume of that campaign. Check your
+  Sent folder, then mail it again with a new campaign name if it never went
+  out.
 - `Ctrl+C` (SIGINT) or SIGTERM during a campaign, in the CLI and in the
   browser server alike, finishes and logs the message in flight, starts no
   more, prints how many recipients were not attempted and how to resume, and
@@ -350,11 +398,12 @@ What stays with you, because it cannot be done from inside the app:
   for the message in flight, so keep your supervisor's stop timeout above that
   (Docker's default 10 s is enough).
 - A scheduled send interrupted by a shutdown goes back to `pending` and
-  resumes on the next start, skipping whoever was already mailed, as long as it
-  is inside the grace window (otherwise it is parked as `missed` and **Run
-  now** resumes it). An entry left `sending` by a crash gets the same
-  treatment at startup. Pressing Stop on a running scheduled send marks it
-  `cancelled`.
+  resumes on the next start, skipping whoever was already mailed, however
+  long the campaign has been running (it is flagged `interrupted`, which the
+  grace window does not apply to). An entry left `sending` by a crash gets the
+  same treatment at startup. Only an entry that never started and is more than
+  the grace window late is parked as `missed`; **Run now** sends it.
+  Pressing Stop on a running scheduled send marks it `cancelled`.
 - Every outcome is appended to `logs/sent.jsonl`; that log is the resume state.
   If it cannot be written the run stops rather than mail people it cannot record.
 - **Log rotation**: when `sent.jsonl` reaches `SEND_LOG_MAX_BYTES` it is renamed
@@ -364,6 +413,16 @@ What stays with you, because it cannot be done from inside the app:
   older than the kept history is no longer skipped on a re-run, so raise
   `SEND_LOG_KEEP` if you resume very old campaigns. `schedule.json` is bounded
   separately (finished entries are dropped after 60 days).
+- A scheduled send fixes its recipients and subject when it is scheduled, and
+  stores a SHA-256 of the template too. If the template file has changed by the
+  time it fires, the entry fails with *Template changed since scheduling*
+  (shown on the Schedule page) and nothing is sent; schedule it again after
+  checking the template. Entries scheduled by older versions are not checked.
+- A CSV with an unclosed quote is rejected (`Unclosed quote starting on line
+  N`) instead of silently dropping every row after it. Lists Mailroom saves
+  from the paste box prefix any name, company or address that starts with `=`,
+  `+`, `-` or `@` with an apostrophe so a spreadsheet does not run it as a
+  formula; the apostrophe is removed when the list is read back.
 - A subject line is not HTML: `&` and apostrophes reach the recipient as typed,
   while the body is escaped so a name cannot break the markup.
 
@@ -426,7 +485,7 @@ Supported SMTP environment variables:
 ## Tests
 
 ```bash
-npm test            # 142 tests: parsing, rendering, resume, retries, scheduling, shutdown, log rotation, config validation, suppression, headers, rate ceiling, CLI, API, auth, TLS, guards
+npm test            # 176 tests: parsing, rendering, resume, retries, scheduling, shutdown, log rotation, config validation, suppression, headers, rate ceiling, CLI, API, auth, TLS, guards
 npm run check       # parse every JS file in bin/, src/ and public/ without running it
 ```
 
@@ -446,6 +505,6 @@ leaves the machine.
   external cron or queue worker. Start it under `systemd`, Docker restart
   policy, or `launchd` if the timing matters.
 - Mailroom sends the unsubscribe headers and honours a suppression list, but it
-  does not receive unsubscribe requests, bounces or complaints; you feed them
+  does not receive unsubscribe requests, late bounces or complaints; you feed them
   in (see above). For large, regulated, or marketing lists use a real ESP.
 - Templates are HTML files on disk, not a visual editor.

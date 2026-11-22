@@ -20,10 +20,14 @@
  * src/lib/core.mjs.
  *
  * Suppression: --suppress a@x.com,b@x.com adds addresses to the suppression
- * list (data/suppressed.csv, or --suppression-file / SUPPRESSION_FILE) and
- * exits. Every send, test included, skips what is on the list.
+ * list (--suppression-file, else SUPPRESSION_FILE, else data/suppressed.csv in
+ * the install folder) and exits. Every send, test included, skips what is on
+ * the list.
  *
- * Flags: --delay 4000 (ms between sends), --limit 100, --log logs/sent.jsonl,
+ * The send log is --log, else SEND_LOG, else logs/sent.jsonl in the install
+ * folder: the same file the browser uses, wherever the CLI is run from.
+ *
+ * Flags: --delay 4000 (ms between sends), --limit 100, --log path/to/sent.jsonl,
  *        --campaign <id> (labels the log so a re-run resumes that campaign),
  *        --send (actually send), --test addr (single test recipient),
  *        --dump file.html (render one recipient, send nothing).
@@ -39,12 +43,14 @@ import {
   attachmentsFor,
   readLog,
   sentAddresses,
+  countAlreadySent,
   createMailer,
   runCampaign,
   resolveSmtpConfig,
   SIGNAL_EXIT,
   describeInterruption,
   defaultSuppressionPath,
+  defaultLogPath,
   addSuppressed,
   isSuppressed,
   rateLimitsFromEnv,
@@ -71,7 +77,7 @@ try {
       campaign: { type: 'string' },
       delay: { type: 'string', default: '4000' },
       limit: { type: 'string' },
-      log: { type: 'string', default: 'logs/sent.jsonl' },
+      log: { type: 'string' },
       send: { type: 'boolean', default: false },
       test: { type: 'string' },
       dump: { type: 'string' },
@@ -83,6 +89,7 @@ try {
   die(err.message);
 }
 
+const logPath = values.log ? resolve(values.log) : defaultLogPath();
 const suppressionPath = values['suppression-file'] ? resolve(values['suppression-file']) : defaultSuppressionPath();
 
 if (values.suppress !== undefined) {
@@ -102,9 +109,9 @@ if (!existsSync(values.csv)) die(`CSV not found: ${values.csv}`);
 if (!existsSync(values.html)) die(`Template not found: ${values.html}`);
 
 try {
-  mkdirSync(dirname(values.log), { recursive: true });
+  mkdirSync(dirname(logPath), { recursive: true });
 } catch (err) {
-  die(`Cannot create the log folder for ${values.log}: ${err.message}`);
+  die(`Cannot create the log folder for ${logPath}: ${err.message}`);
 }
 
 const configProblems = smtpProblems();
@@ -136,7 +143,8 @@ try {
 }
 
 const campaignId = String(values.campaign || '').trim();
-const alreadySent = sentAddresses(readLog(values.log), campaignId);
+const alreadySent = sentAddresses(readLog(logPath), campaignId);
+const alreadySentCount = countAlreadySent(recipients, alreadySent);
 
 let templateHtml;
 try {
@@ -154,7 +162,7 @@ console.log(`  host      ${cfg.host}:${cfg.port} (${cfg.secure ? 'implicit TLS' 
 console.log(`  user      ${cfg.user || '(not set)'}`);
 console.log(`  from      ${cfg.from}`);
 console.log(`  password  ${cfg.pass ? `${cfg.pass.slice(0, 2)}${'•'.repeat(8)}` : '(not set)'}`);
-console.log(`  recipients ${recipients.length}${alreadySent.size ? ` (${alreadySent.size} already sent, will skip)` : ''}`);
+console.log(`  recipients ${recipients.length}${alreadySentCount ? ` (${alreadySentCount} already sent, will skip)` : ''}`);
 console.log(`  delay     ${delayMs}ms between sends`);
 console.log(`  ceiling   ${limits.perHour ? `${limits.perHour} messages/hour` : 'no hourly limit'}${limits.perDomainPerHour ? `, ${limits.perDomainPerHour} per domain` : ''}`);
 const held = recipients.filter((rec) => isSuppressed(suppressionPath, rec._email)).length;
@@ -170,7 +178,7 @@ if (!values.send && !values.test && !values.dump) {
     console.log(`  subject: ${renderSubject(subjectTemplate, rec)}`);
     console.log(`  name:    ${rec._name || '(blank)'}`);
     console.log(`  company: ${rec._company || '(blank)'}`);
-    console.log(`  inline:  ${attachmentsFor(render(templateHtml, rec), assetsDir).length} image(s)`);
+    console.log(`  inline:  ${attachmentsFor(render(templateHtml, rec, cfg), assetsDir).length} image(s)`);
   }
   console.log(`\nRendered ${recipients.length} recipient(s).`);
   if (!cfg.configured) {
@@ -217,7 +225,7 @@ console.log('  connection ok\n');
 // ── Dump: render the first recipient to a file, send nothing ─────────
 if (values.dump) {
   const rec = recipients[0];
-  const html = render(templateHtml, rec);
+  const html = render(templateHtml, rec, cfg);
   writeFileSync(values.dump, html);
   console.log(`Wrote ${values.dump} (${html.length} bytes)`);
   console.log(`  recipient: ${rec._email}\n`);
@@ -233,7 +241,7 @@ if (values.test) {
   }
   const rec = { ...recipients[0], _email: values.test };
   const subject = renderSubject(subjectTemplate, rec);
-  const html = render(templateHtml, rec);
+  const html = render(templateHtml, rec, cfg);
   console.log(`Test send to ${values.test}`);
   console.log(`  subject: ${subject}`);
   const result = await mailer.send({ to: values.test, subject, html, assetsDir });
@@ -256,13 +264,14 @@ try {
     limits,
     delayMs,
     mailer,
-    logPath: values.log,
+    logPath,
     shouldStop: () => stopSignal !== null,
     onEvent: (event) => {
       if (event.type === 'progress') {
         const n = `[${event.index}/${event.total}]`;
-        if (event.status === 'skip') console.log(`${n} skip   ${event.email} (${event.reason === 'suppressed' ? 'suppressed' : 'already sent'})`);
+        if (event.status === 'skip') console.log(`${n} skip   ${event.email} (${{ suppressed: 'suppressed', uncertain: 'earlier attempt unconfirmed' }[event.reason] || 'already sent'})`);
         else if (event.status === 'sent') console.log(`${n} sent   ${event.email}`);
+        else if (event.status === 'uncertain') console.log(`${n} UNCONFIRMED ${event.email} — ${event.error}`);
         else console.log(`${n} FAILED ${event.email} — ${event.error}`);
       } else if (event.type === 'throttle') {
         const minutes = Math.ceil(event.waitMs / 60000);
@@ -284,11 +293,18 @@ console.log('────');
 console.log(`  sent    ${summary.sent}`);
 console.log(`  failed  ${summary.failed}`);
 console.log(`  skipped ${summary.skipped}`);
+if (summary.uncertain.length) console.log(`  unconfirmed ${summary.uncertain.length} (no reply after the message was sent; it may have been delivered)`);
 if (summary.suppressed) console.log(`  suppressed ${summary.suppressed} (on the suppression list)`);
-console.log(`  log     ${values.log}`);
+console.log(`  log     ${logPath}`);
 if (summary.failures.length) {
   console.log('\nFailures');
   for (const f of summary.failures) console.log(`  ${f.email} — ${f.error}`);
+  process.exitCode = 1;
+}
+if (summary.uncertain.length) {
+  console.log('\nUnconfirmed: the server may have accepted these, so they are not retried or mailed again on resume.');
+  console.log('Check your Sent folder; to mail one again anyway, use a new --campaign name.');
+  for (const u of summary.uncertain) console.log(`  ${u.email} — ${u.error}`);
   process.exitCode = 1;
 }
 if (summary.stopped) process.exitCode = 1;

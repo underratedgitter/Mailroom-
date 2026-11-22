@@ -2,13 +2,18 @@
 // without touching a network mailbox.
 import net from 'node:net';
 
-// `rcpt(address)` may return an SMTP reply line to refuse that recipient.
-export function startSmtpSink({ rcpt } = {}) {
+// `mail(address)` / `rcpt(address)` may return an SMTP reply line to refuse that
+// sender / recipient. `stall(envelope)` makes the sink keep the message but
+// never answer it (true) or drop the connection ('drop'), as a server that
+// fails after taking the DATA does.
+export function startSmtpSink({ mail, rcpt, stall } = {}) {
   const messages = [];
   const connections = new Set();
+  let accepted = 0;
 
   const server = net.createServer((sock) => {
     connections.add(sock);
+    accepted++;
     sock.on('close', () => connections.delete(sock));
     sock.on('error', () => {});
 
@@ -29,8 +34,11 @@ export function startSmtpSink({ rcpt } = {}) {
           buffer = buffer.slice(end + 5);
           inData = false;
           messages.push({ ...envelope, data });
+          const hold = stall?.(envelope);
           envelope = { from: null, to: [] };
           data = '';
+          if (hold === 'drop') sock.destroy();
+          if (hold) return;
           sock.write('250 2.0.0 OK queued\r\n');
           continue;
         }
@@ -44,7 +52,13 @@ export function startSmtpSink({ rcpt } = {}) {
         if (verb === 'EHLO') sock.write('250-sink\r\n250-8BITMIME\r\n250 OK\r\n');
         else if (verb === 'HELO') sock.write('250 sink\r\n');
         else if (verb === 'MAIL') {
-          envelope.from = line.replace(/^MAIL FROM:\s*/i, '').trim();
+          const sender = line.replace(/^MAIL FROM:\s*/i, '').trim();
+          const refusal = mail?.(sender);
+          if (refusal) {
+            sock.write(`${refusal}\r\n`);
+            continue;
+          }
+          envelope.from = sender;
           sock.write('250 2.1.0 OK\r\n');
         } else if (verb === 'RCPT') {
           const address = line.replace(/^RCPT TO:\s*/i, '').trim();
@@ -77,6 +91,8 @@ export function startSmtpSink({ rcpt } = {}) {
       resolve({
         port: server.address().port,
         messages,
+        connectionCount: () => accepted,
+        openCount: () => connections.size,
         close: () => new Promise((done) => {
           for (const sock of connections) sock.destroy();
           server.close(() => done());

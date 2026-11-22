@@ -196,3 +196,16 @@ test('--send reports a message the server may have accepted as unconfirmed and n
   assert.match(res.stdout, /sent\s+2/);
   assert.match(res.stdout, /failed\s+0/);
 });
+
+test('--send is refused while another process holds the lock on the send log', async (t) => {
+  const sink = await startSmtpSink();
+  t.after(() => sink.close());
+  const lock = JSON.stringify({ pid: process.pid, token: 'other-run', at: new Date().toISOString() });
+  const res = await runCli([...SEND_ARGS, '--send', '--log', 'logs/sent.jsonl'], {
+    env: smtpEnv(sink),
+    files: { 'logs/sent.jsonl.lock': lock },
+  });
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /already sending/);
+  assert.equal(sink.messages.length, 0);
+});

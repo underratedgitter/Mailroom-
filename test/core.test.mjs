@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, symlinkSync, readdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import {
   parseCsv,
   parseRecipients,
@@ -663,4 +664,73 @@ test('refused recipients do not abandon open connections; a dropped link is reco
   });
   assert.equal(unavailable.summary.sent, 2);
   assert.ok(unavailable.open <= 3);
+});
+
+/** Resolves `started()` once the mailer is sending, and finishes only when `release()` is called. */
+function gatedMailer() {
+  let release;
+  let started;
+  const open = new Promise((resolve) => { release = resolve; });
+  const reached = new Promise((resolve) => { started = resolve; });
+  return {
+    reached,
+    release,
+    mailer: { send: async () => { started(); await open; return { success: true }; } },
+  };
+}
+
+const campaignOptions = (dir, mailer, extra = {}) => ({
+  recipients: [recipient('a@b.co')],
+  templateHtml: 'x',
+  subjectTemplate: 'x',
+  delayMs: 0,
+  limits: { perHour: 0, perDomainPerHour: 0 },
+  suppressionPath: join(dir, 'suppressed.csv'),
+  logPath: join(dir, 'sent.jsonl'),
+  mailer,
+  onEvent: () => {},
+  ...extra,
+});
+
+test('a second campaign on the same send log is refused while the first runs, and allowed after', async () => {
+  const dir = workDir();
+  try {
+    const gate = gatedMailer();
+    const first = runCampaign(campaignOptions(dir, gate.mailer));
+    await gate.reached;
+
+    await assert.rejects(
+      runCampaign(campaignOptions(dir, { send: async () => ({ success: true }) })),
+      /already sending/,
+    );
+
+    gate.release();
+    assert.equal((await first).sent, 1);
+
+    const third = await runCampaign(campaignOptions(dir, { send: async () => ({ success: true }) }));
+    assert.equal(third.sent, 1);
+    assert.equal(existsSync(join(dir, 'sent.jsonl.lock')), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a lock left by a process that is gone does not block a campaign', async () => {
+  const dir = workDir();
+  try {
+    const gone = spawnSync(process.execPath, ['-e', '0']);
+    assert.equal(gone.status, 0);
+    const lock = join(dir, 'sent.jsonl.lock');
+    writeFileSync(lock, JSON.stringify({ pid: gone.pid, token: 'old', at: new Date().toISOString() }));
+    assert.equal((await runCampaign(campaignOptions(dir, { send: async () => ({ success: true }) }))).sent, 1);
+
+    // After a restart the new process can reuse the old pid (a container's node is always pid 1).
+    writeFileSync(lock, JSON.stringify({ pid: process.pid, token: 'from-an-earlier-run', at: new Date().toISOString() }));
+    assert.equal((await runCampaign(campaignOptions(dir, { send: async () => ({ success: true }) }))).sent, 1);
+
+    writeFileSync(lock, 'not json');
+    assert.equal((await runCampaign(campaignOptions(dir, { send: async () => ({ success: true }) }))).sent, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

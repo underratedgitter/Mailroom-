@@ -291,8 +291,9 @@ sends alike:
 - **Rate ceiling.** A rolling one-hour window across all runs, rebuilt from the
   send log, so a restart or a second run cannot reset it. When it is full the
   run waits (and says so) until the oldest send ages out; Ctrl+C or *Stop*
-  ends the wait and the campaign resumes later. It does not coordinate two
-  Mailroom processes sending at the same moment.
+  ends the wait and the campaign resumes later. Two Mailroom processes cannot
+  send from the same log at the same moment (see *How it behaves*), so the
+  window is never counted twice.
 
 Add addresses to the suppression list:
 
@@ -337,6 +338,11 @@ What stays with you, because it cannot be done from inside the app:
 ## How it behaves
 
 - One campaign at a time; a second start is refused rather than double-mailing.
+  That holds across processes: a run holds `logs/sent.jsonl.lock` (the log's
+  path plus `.lock`, containing its pid) for as long as it sends, so the CLI
+  and the browser, or two CLIs, cannot send from the same log together. A lock
+  left by a process that is gone is taken over automatically; if a pid is
+  reused by something unrelated, delete the lock file named in the message.
 - 4 s between messages by default (and at most `MAX_PER_HOUR` per hour), one message in flight at a time over a
   pooled SMTP connection, retries with backoff on transient errors.
 - Quota, `5.4.5` and authentication errors reported for the account (sign-in,

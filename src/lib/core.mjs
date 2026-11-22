@@ -5,7 +5,8 @@
 // drift apart. Anything fatal is thrown as an Error; the callers decide
 // whether that means a non-zero exit or an HTTP 400.
 
-import { readFileSync, appendFileSync, mkdirSync, existsSync, readdirSync, statSync, realpathSync, renameSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync, readdirSync, statSync, realpathSync, renameSync, rmSync, linkSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import nodemailer from 'nodemailer';
 import { resolveSmtpConfig, bulkFields, addressDomain } from './mailer.mjs';
@@ -419,6 +420,77 @@ export function appendLog(logPath, entry, { maxBytes, keep } = logLimits()) {
   }
 }
 
+// ── Campaign lock ────────────────────────────────────────────────────
+// Two runs sharing a send log (the CLI and the browser, or two CLIs) would each
+// read "not sent yet" and mail the same people. A lock file beside the log
+// names the process that is sending; a lock whose process is gone is stale and
+// is taken over.
+const heldLocks = new Set();
+
+const processAlive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+};
+
+function lockHolder(lockPath) {
+  try {
+    const holder = JSON.parse(readFileSync(lockPath, 'utf8'));
+    return Number.isInteger(holder?.pid) ? holder : null;
+  } catch {
+    return null;
+  }
+}
+
+/** True while the process that wrote the lock is still sending. */
+function lockIsLive(holder) {
+  if (!holder) return false;
+  if (heldLocks.has(holder.token)) return true;
+  // The same pid without a lock of ours is an earlier run of this program
+  // (a container's node is always pid 1), not a concurrent one.
+  return holder.pid !== process.pid && processAlive(holder.pid);
+}
+
+/** Claims the right to send with this log; returns the function that gives it up. */
+export function lockCampaign(logPath) {
+  const lockPath = `${logPath}.lock`;
+  const token = randomUUID();
+  // Linking a finished file makes the lock appear whole or not at all.
+  const staging = `${lockPath}.${process.pid}.${token}`;
+  try {
+    try {
+      writeFileSync(staging, JSON.stringify({ pid: process.pid, token, at: new Date().toISOString() }));
+    } catch (err) {
+      // No log folder: there is nothing to share, and appendLog reports it.
+      if (err.code === 'ENOENT') return () => {};
+      throw err;
+    }
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        linkSync(staging, lockPath);
+        heldLocks.add(token);
+        return () => {
+          heldLocks.delete(token);
+          if (lockHolder(lockPath)?.token === token) rmSync(lockPath, { force: true });
+        };
+      } catch (err) {
+        if (err.code !== 'EEXIST') throw err;
+      }
+      const holder = lockHolder(lockPath);
+      if (lockIsLive(holder)) {
+        throw new Error(`Another Mailroom campaign (process ${holder.pid}) is already sending with ${logPath}. Wait for it to finish; if that process is gone, delete ${lockPath}.`);
+      }
+      rmSync(lockPath, { force: true });
+    }
+    throw new Error(`Cannot lock ${lockPath}: another process keeps taking it`);
+  } finally {
+    rmSync(staging, { force: true });
+  }
+}
+
 /** Exit codes for a run stopped by a signal (128 + signal number). */
 export const SIGNAL_EXIT = { SIGINT: 130, SIGTERM: 143 };
 
@@ -651,20 +723,7 @@ export function isFatal(failure) {
 }
 
 // ── Send loop ────────────────────────────────────────────────────────
-/**
- * Sends the campaign sequentially, logging every outcome. Shared by the CLI
- * and the GUI so resume, retry and kill-switch rules are identical.
- *
- * onEvent receives:
- *   { type: 'progress', index, total, status: 'sent'|'skip'|'failed'|'uncertain', email, error?, reason? }
- *       (a skip's reason is 'already-sent', 'suppressed' or 'uncertain'; 'uncertain'
- *       means the server may have accepted the message, so it is neither retried
- *       nor mailed again on resume)
- *   { type: 'throttle', email, waitMs, scope }   waiting for the hourly ceiling
- *   { type: 'fatal', email, error }
- *   { type: 'done', summary }
- */
-export async function runCampaign({
+async function sendCampaign({
   recipients,
   templateHtml,
   subjectTemplate,
@@ -802,6 +861,31 @@ export async function runCampaign({
   const summary = { sent, failed, skipped, suppressed, failures, uncertain, stopped, total, remaining, logPath: logPath || null };
   onEvent({ type: 'done', summary });
   return summary;
+}
+
+/**
+ * Sends the campaign sequentially, logging every outcome. Shared by the CLI
+ * and the GUI so resume, retry and kill-switch rules are identical.
+ *
+ * Holds the lock on the send log for the whole run, so a second process cannot
+ * send from the same log at the same time.
+ *
+ * onEvent receives:
+ *   { type: 'progress', index, total, status: 'sent'|'skip'|'failed'|'uncertain', email, error?, reason? }
+ *       (a skip's reason is 'already-sent', 'suppressed' or 'uncertain'; 'uncertain'
+ *       means the server may have accepted the message, so it is neither retried
+ *       nor mailed again on resume)
+ *   { type: 'throttle', email, waitMs, scope }   waiting for the hourly ceiling
+ *   { type: 'fatal', email, error }
+ *   { type: 'done', summary }
+ */
+export async function runCampaign(options) {
+  const unlock = options.logPath ? lockCampaign(options.logPath) : () => {};
+  try {
+    return await sendCampaign(options);
+  } finally {
+    unlock();
+  }
 }
 
 export { resolveSmtpConfig };

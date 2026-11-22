@@ -741,6 +741,19 @@ export function isTransient(failure) {
 /** A refusal of one recipient says nothing about the account sending it. */
 const isRecipientStage = ({ code, command }) => command === 'RCPT TO' || (code === 'EENVELOPE' && command !== 'MAIL FROM');
 
+/**
+ * The recipient's own server said the address cannot receive mail: 5.1.x (bad
+ * destination) or 5.2.1 (mailbox disabled) in a permanent RCPT-stage reply.
+ */
+export function isHardBounce({ code, command, response, responseCode }) {
+  return isRecipientStage({ code, command })
+    && Number.isInteger(responseCode) && responseCode >= 500
+    && /^5\d\d[ -]\s*(?:5\.1\.\d+|5\.2\.1)\b/.test(String(response ?? ''));
+}
+
+/** What the send log keeps of a failed send. */
+const failureDetails = ({ error, responseCode }) => ({ error, ...(Number.isInteger(responseCode) ? { responseCode } : {}) });
+
 export function isFatal(failure) {
   const { error, code, command } = typeof failure === 'object' && failure ? failure : { error: failure };
   if (code === 'EAUTH') return true;
@@ -839,7 +852,7 @@ async function sendCampaign({
       if (result.success) break;
       if (result.uncertain) break;
       if (isFatal(result)) {
-        if (logPath) appendLog(logPath, { email: addr, status: 'failed', error: result.error, at: new Date().toISOString(), campaign: campaignId || null });
+        if (logPath) appendLog(logPath, { email: addr, status: 'failed', ...failureDetails(result), at: new Date().toISOString(), campaign: campaignId || null });
         failed++;
         failures.push({ email: addr, error: result.error });
         stopped = true;
@@ -863,8 +876,11 @@ async function sendCampaign({
       const status = result.uncertain ? 'uncertain' : 'failed';
       if (result.uncertain) uncertain.push({ email: addr, error: result.error });
       else { failed++; failures.push({ email: addr, error: result.error }); }
-      if (logPath) appendLog(logPath, { email: addr, status, error: result.error, at: new Date().toISOString(), campaign: campaignId || null });
-      onEvent({ type: 'progress', index: i + 1, total, status, email: addr, error: result.error });
+      // The server said this mailbox does not exist: never write to it again.
+      const bounced = !result.uncertain && isHardBounce(result);
+      if (bounced) addSuppressed(suppressionPath, [addr], 'hard-bounce');
+      if (logPath) appendLog(logPath, { email: addr, status, ...failureDetails(result), at: new Date().toISOString(), campaign: campaignId || null });
+      onEvent({ type: 'progress', index: i + 1, total, status, email: addr, error: result.error, ...(bounced ? { reason: 'hard-bounce' } : {}) });
 
       if (result.uncertain || isTransient(result)) {
         transportFailures++;

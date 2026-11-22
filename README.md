@@ -289,6 +289,12 @@ sends alike:
   a per-campaign setting. Skipped addresses are logged as `skipped` with
   `reason: "suppressed"` and counted in the preview, the confirmation dialog
   and the run summary.
+- **Hard bounces at send time.** When the recipient's server refuses the
+  address while Mailroom is still connected (a permanent `5.1.x` reply such as
+  `550 5.1.1 user unknown`, or `5.2.1` mailbox disabled), the address is added
+  to the suppression list with reason `hard-bounce`, and the failed entry in
+  the log carries the SMTP `responseCode`. Other refusals (policy, spam, full or
+  busy mailbox) are logged but not suppressed.
 - **Rate ceiling.** A rolling one-hour window across all runs, rebuilt from the
   send log, so a restart or a second run cannot reset it. When it is full the
   run waits (and says so) until the oldest send ages out; Ctrl+C or *Stop*
@@ -329,7 +335,9 @@ What stays with you, because it cannot be done from inside the app:
   for you, so use a From address on a domain you have authenticated there.
 - **Reading the unsubscribe mailbox.** Mailroom does not receive mail. When
   someone mails "unsubscribe" (or your one-click endpoint is hit), add them with
-  `--suppress` or `/api/suppress`. The same goes for bounces and spam complaints.
+  `--suppress` or `/api/suppress`. The same goes for spam complaints and for
+  bounces that arrive later by mail (only refusals during the send are
+  suppressed automatically).
 - **The one-click endpoint** must be public HTTPS; the Mailroom UI is not
   (and should not be) exposed that way.
 - **Keep spam complaints under 0.3 %** (Google's threshold), a postal address in
@@ -468,6 +476,6 @@ leaves the machine.
   external cron or queue worker. Start it under `systemd`, Docker restart
   policy, or `launchd` if the timing matters.
 - Mailroom sends the unsubscribe headers and honours a suppression list, but it
-  does not receive unsubscribe requests, bounces or complaints; you feed them
+  does not receive unsubscribe requests, late bounces or complaints; you feed them
   in (see above). For large, regulated, or marketing lists use a real ESP.
 - Templates are HTML files on disk, not a visual editor.

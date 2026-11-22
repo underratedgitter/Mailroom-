@@ -774,3 +774,29 @@ test('a saved recipient list cannot carry a spreadsheet formula, and reads back 
   const { recipients } = parseRecipients(csv);
   assert.deepEqual(recipients.map((r) => [r._email, r._name, r._company]), originals.map((r) => [r._email, r._name, r._company]));
 });
+
+test('a recipient the server says does not exist is suppressed as a hard bounce; other refusals are not', async () => {
+  const replies = {
+    'gone@': '550 5.1.1 <gone@example.test>: user unknown',
+    'off@': '550 5.2.1 <off@example.test>: mailbox disabled',
+    'policy@': '550 5.7.1 <policy@example.test>: rejected by policy',
+    'busy@': '450 4.2.1 <busy@example.test>: mailbox busy',
+  };
+  const { summary, log, suppressed } = await campaignAgainstSink({
+    sink: { rcpt: (addr) => Object.entries(replies).find(([key]) => addr.includes(key))?.[1] ?? null },
+    addresses: ['gone@example.test', 'off@example.test', 'policy@example.test', 'busy@example.test', 'ok@example.test'],
+  });
+
+  assert.equal(summary.failed, 4);
+  assert.equal(summary.sent, 1);
+  const rows = suppressed.trim().split('\n').slice(1).map((line) => line.split(',').slice(0, 2));
+  assert.deepEqual(rows, [['gone@example.test', 'hard-bounce'], ['off@example.test', 'hard-bounce']]);
+
+  const codes = Object.fromEntries(log.filter((e) => e.status === 'failed').map((e) => [e.email, e.responseCode]));
+  assert.deepEqual(codes, {
+    'gone@example.test': 550,
+    'off@example.test': 550,
+    'policy@example.test': 550,
+    'busy@example.test': 450,
+  });
+});

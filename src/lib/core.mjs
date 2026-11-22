@@ -70,6 +70,14 @@ function pick(rec, keys) {
 // display-name brackets, quoting and comments) are refused outright.
 export const emailRe = /^[^\s@,;:<>()[\]"\\]+@[^\s@,;:<>()[\]"\\]+\.[^\s@,;:<>()[\]"\\]+$/;
 
+/** What each header of a CSV does: the address, the name/company the template aliases, or a plain {{merge field}}. */
+export function columnRoles(columns) {
+  const roleOf = (name) => (EMAIL_KEYS.includes(name) ? 'email'
+    : NAME_KEYS.includes(name) ? 'name'
+      : COMPANY_KEYS.includes(name) ? 'company' : 'field');
+  return columns.map((name) => ({ name, role: roleOf(name) }));
+}
+
 /** Validates, de-duplicates and limits a list of `{_email,_name,_company}` records. */
 function finishRecords(records, limit) {
   const seen = new Set();
@@ -107,7 +115,7 @@ export function parseRecipients(raw, { limit = Infinity } = {}) {
     _name: pick(row, NAME_KEYS),
     _company: pick(row, COMPANY_KEYS),
   }));
-  return finishRecords(records, limit);
+  return { ...finishRecords(records, limit), columns: Object.keys(rows[0]) };
 }
 
 /**
@@ -141,7 +149,7 @@ export function parseRecipientsText(text, { limit = Infinity } = {}) {
 
     records.push({ _email: email, _name: name, _company: company });
   }
-  return finishRecords(records, limit);
+  return { ...finishRecords(records, limit), columns: ['email', 'name', 'company'] };
 }
 
 export function recipientsFromFile(csvPath, options = {}) {

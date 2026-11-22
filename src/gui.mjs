@@ -17,7 +17,12 @@
  *   POST /api/settings         save SMTP settings (tests first when asked)
  *   POST /api/settings/test    authenticate with unsaved settings
  *   POST /api/login|logout     password session when MAILROOM_PASSWORD or MAILROOM_PASSWORD_HASH is set
- *   POST /api/preview          render one recipient, with images inlined
+ *   POST /api/preview          render one recipient, with images inlined, plus column and {{field}} checks
+ *   POST /api/roster           who is in a saved CSV, and how its columns map to merge fields
+ *   POST /api/recipients       save (or dry-run) a pasted list or an uploaded CSV into data/
+ *   GET  /api/suppression      the suppression list
+ *   POST /api/suppress         add addresses to it
+ *   GET  /api/schedule         queued campaigns (POST creates one; POST /api/schedule/:id/cancel|run)
  *   POST /api/verify           SMTP connect + auth check
  *   POST /api/test             send one real message to one address
  *   POST /api/send             start a campaign job → { jobId }
@@ -42,6 +47,8 @@ import {
   parseRecipients,
   parseRecipientsText,
   recipientsToCsv,
+  columnRoles,
+  templateVariables,
   render,
   renderSubject,
   inlineForPreview,
@@ -536,7 +543,8 @@ function nextCsvPath(name) {
     .replace(/^-+|-+$/g, '') || `recipients-${Date.now()}`;
   let candidate = join(DATA_DIR, `${slug.replace(/\.csv$/, '')}.csv`);
   let n = 2;
-  while (existsSync(candidate)) {
+  // The suppression list lives in data/ too; a recipient list must never claim its name.
+  while (existsSync(candidate) || candidate === SUPPRESSION_PATH) {
     candidate = join(DATA_DIR, `${slug.replace(/\.csv$/, '')}-${n}.csv`);
     n++;
   }
@@ -551,6 +559,7 @@ function previewFor(input, index = 0) {
   const suppressed = input.parsed.recipients.filter(held).length;
   const skipped = input.parsed.recipients.filter((r) => input.alreadySent.has(r._email.toLowerCase())).length;
   const raw = render(input.templateHtml, rec);
+  const columns = columnRoles(input.parsed.columns || []);
   return {
     index: i,
     total: input.parsed.recipients.length,
@@ -568,6 +577,44 @@ function previewFor(input, index = 0) {
     invalid: input.parsed.invalid,
     duplicates: input.parsed.duplicates,
     truncated: input.parsed.truncated,
+    columns,
+    placeholders: placeholdersFor(`${input.templateHtml} ${input.subject}`, columns),
+  };
+}
+
+/** Each {{field}} the message uses, and whether the recipient list can fill it. */
+function placeholdersFor(text, columns) {
+  const known = new Set(columns.map((c) => c.name));
+  const seen = new Set();
+  const found = [];
+  for (const name of templateVariables(text)) {
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const status = ['name', 'company', 'email'].includes(key) ? 'builtin' : known.has(key) ? 'column' : 'missing';
+    found.push({ name: key, status });
+  }
+  return found;
+}
+
+/** The recipient table the page shows for a saved CSV, a dry run or a pasted list. */
+function rosterView(parsed, { path = null, alreadySent = new Set() } = {}) {
+  const shown = parsed.recipients.slice(0, 1000);
+  return {
+    path,
+    total: parsed.recipients.length,
+    shown: shown.length,
+    invalid: parsed.invalid,
+    duplicates: parsed.duplicates,
+    truncated: parsed.truncated,
+    sentCount: parsed.recipients.filter((r) => alreadySent.has(r._email.toLowerCase())).length,
+    columns: columnRoles(parsed.columns || []),
+    recipients: shown.map((rec) => ({
+      email: rec._email,
+      name: rec._name,
+      company: rec._company,
+      sent: alreadySent.has(rec._email.toLowerCase()),
+    })),
   };
 }
 
@@ -1060,38 +1107,29 @@ async function route(req, res) {
     });
     const campaignId = String(body.campaign ?? '').trim();
     const alreadySent = sentAddresses(readLog(LOG_PATH), campaignId);
-    const shown = parsed.recipients.slice(0, 1000);
-
-    return json(res, 200, {
-      path: rel(csvPath),
-      total: parsed.recipients.length,
-      shown: shown.length,
-      invalid: parsed.invalid,
-      duplicates: parsed.duplicates,
-      truncated: parsed.truncated,
-      sentCount: parsed.recipients.filter((r) => alreadySent.has(r._email.toLowerCase())).length,
-      recipients: shown.map((rec) => ({
-        email: rec._email,
-        name: rec._name,
-        company: rec._company,
-        sent: alreadySent.has(rec._email.toLowerCase()),
-      })),
-    });
+    return json(res, 200, rosterView(parsed, { path: rel(csvPath), alreadySent }));
   }
 
   // Save a pasted list as a CSV in data/ so it can be reused or edited.
   if (req.method === 'POST' && pathname === '/api/recipients') {
     const body = await readJson(req);
     const text = String(body.text ?? '').trim();
+    // format "csv" keeps a header row and its extra columns for {{merge fields}};
+    // anything else is the one-address-per-line paste format.
+    const asCsv = body.format === 'csv';
+    // A dry run reports what would be saved, so the page can validate as the
+    // user types or picks a file, without leaving a file behind.
+    if (body.dryRun === true && !text) return json(res, 200, rosterView({ recipients: [], invalid: 0, duplicates: 0, truncated: 0, columns: [] }));
     if (!text) return fail(res, 400, 'Nothing to save');
-    const parsed = parseRecipientsText(text);
+    const parsed = asCsv ? parseRecipients(text) : parseRecipientsText(text);
+    if (body.dryRun === true) return json(res, 200, rosterView(parsed));
     if (!parsed.recipients.length) return fail(res, 400, 'No valid email addresses to save');
 
     const target = nextCsvPath(body.name || parsed.recipients[0]._email.replace(/@.*$/, '') + '-list');
     // Write then rename, so a crash cannot leave a half-written recipient file.
     const staging = `${target}.tmp`;
     try {
-      writeFileSync(staging, recipientsToCsv(parsed.recipients), 'utf8');
+      writeFileSync(staging, asCsv ? `${text}\n` : recipientsToCsv(parsed.recipients), 'utf8');
       renameSync(staging, target);
     } catch (err) {
       rmSync(staging, { force: true });

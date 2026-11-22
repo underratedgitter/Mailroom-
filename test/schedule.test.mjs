@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from 'no
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { startServer, post, get, wait } from './helpers/server.mjs';
 import { startSmtpSink } from './helpers/smtp-sink.mjs';
 
@@ -355,4 +355,34 @@ test('a scheduled campaign stopped by a shutdown is flagged as interrupted in th
   const stored = JSON.parse(readFileSync(join(server.workDir, 'schedule.json'), 'utf8'))[0];
   assert.equal(stored.status, 'pending');
   assert.equal(stored.interrupted, true);
+});
+
+test('a schedule remembers its template by hash and refuses to send if the file has changed since', async (t) => {
+  const sink = await startSmtpSink();
+  const dir = mkdtempSync(join(tmpdir(), 'mailroom-hash-'));
+  t.after(async () => {
+    await sink.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const smtp = { ...FAST, SMTP_HOST: '127.0.0.1', SMTP_PORT: String(sink.port), EMAIL_FROM: 'desk@local.test' };
+
+  // The hash is taken when the campaign is scheduled.
+  const first = await startServer({ dir, env: { ...smtp, SCHEDULER_INTERVAL_MS: '600000' } });
+  const created = await post(first.base, '/api/schedule', scheduleBody({ at: new Date(Date.now() + 3_600_000).toISOString() }));
+  assert.equal(created.status, 201);
+  await first.stop({ keepData: true });
+  const stored = JSON.parse(readFileSync(join(dir, 'schedule.json'), 'utf8'))[0];
+  assert.equal(stored.templateHash, createHash('sha256').update(readFileSync(join(ROOT, TEMPLATE), 'utf8')).digest('hex'));
+
+  // Someone edits the template before it fires: the stored hash no longer matches.
+  stored.templateHash = createHash('sha256').update('the template as it was approved').digest('hex');
+  stored.at = new Date(Date.now() - 1000).toISOString();
+  writeFileSync(join(dir, 'schedule.json'), JSON.stringify([stored]));
+
+  const server = await startServer({ dir, env: smtp });
+  t.after(() => server.stop({ keepData: true }));
+  const done = await waitForStatus(server.base, stored.id, ['sent', 'failed', 'missed'], 10000);
+  assert.equal(done.status, 'failed');
+  assert.match(done.error, /Template changed since scheduling/);
+  assert.equal(sink.messages.length, 0);
 });

@@ -410,6 +410,11 @@ What stays with you, because it cannot be done from inside the app:
   older than the kept history is no longer skipped on a re-run, so raise
   `SEND_LOG_KEEP` if you resume very old campaigns. `schedule.json` is bounded
   separately (finished entries are dropped after 60 days).
+- A scheduled send fixes its recipients and subject when it is scheduled, and
+  stores a SHA-256 of the template too. If the template file has changed by the
+  time it fires, the entry fails with *Template changed since scheduling*
+  (shown on the Schedule page) and nothing is sent; schedule it again after
+  checking the template. Entries scheduled by older versions are not checked.
 - A CSV with an unclosed quote is rejected (`Unclosed quote starting on line
   N`) instead of silently dropping every row after it. Lists Mailroom saves
   from the paste box prefix any name, company or address that starts with `=`,

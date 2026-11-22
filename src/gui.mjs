@@ -35,7 +35,7 @@
 
 import http from 'node:http';
 import https from 'node:https';
-import { randomUUID, randomBytes } from 'node:crypto';
+import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { hashPassword, verifyPassword, parsePasswordHash } from './lib/auth.mjs';
 import { configIssue, unsubscribeUrlIssue, bareAddress, unsubscribeLink } from './lib/mailer.mjs';
 import { loadConfig, saveConfig, resolveConfigPath, smtpFileValues, assertConfig } from './lib/config.mjs';
@@ -817,9 +817,18 @@ function scheduleView() {
     }));
 }
 
+const sha256 = (text) => createHash('sha256').update(text).digest('hex');
+
 function templateFor(entry) {
   const path = safePath(entry.template, { roots: [TEMPLATE_DIR], ext: ['.html', '.htm'] });
-  return { path, html: readFileSync(path, 'utf8'), assetsDir: assetsDirFor(path) };
+  const html = readFileSync(path, 'utf8');
+  // The recipients and subject were fixed when this was scheduled; so was what
+  // the person approved in the preview. Entries from before the hash existed
+  // have nothing to compare with.
+  if (entry.templateHash && sha256(html) !== entry.templateHash) {
+    throw new Error(`Template changed since scheduling: ${entry.template} is no longer what was approved. Check it, then schedule the campaign again.`);
+  }
+  return { path, html, assetsDir: assetsDirFor(path) };
 }
 
 /** Runs one due entry; the caller has already marked it "sending". */
@@ -1317,6 +1326,7 @@ async function route(req, res) {
       campaign: input.campaignId,
       subject: input.subject,
       template: rel(input.templatePath),
+      templateHash: sha256(input.templateHtml),
       delay: delayFrom(body.delay),
       recipients: input.parsed.recipients.map((r) => ({
         email: r._email,

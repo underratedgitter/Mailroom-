@@ -54,6 +54,8 @@ import {
   inlineForPreview,
   attachmentsFor,
   readLog,
+  defaultLogPath,
+  defaultSuppressionPath,
   loadSuppressed,
   addSuppressed,
   isSuppressed,
@@ -83,8 +85,8 @@ const APP_VERSION = (() => {
 const PUBLIC_DIR = join(ROOT, 'public');
 const DATA_DIR = join(ROOT, 'data');
 const TEMPLATE_DIR = join(ROOT, 'templates');
-const LOG_PATH = resolve(process.env.SEND_LOG || join(ROOT, 'logs', 'sent.jsonl'));
-const SUPPRESSION_PATH = resolve(process.env.SUPPRESSION_FILE || join(DATA_DIR, 'suppressed.csv'));
+const LOG_PATH = defaultLogPath();
+const SUPPRESSION_PATH = defaultSuppressionPath();
 const SCHEDULE_PATH = resolve(process.env.SCHEDULE_FILE || join(ROOT, 'logs', 'schedule.json'));
 // A schedule that came due while the server was off is sent if it is at most
 // this late; later than that it is parked as "missed" for a human to decide.

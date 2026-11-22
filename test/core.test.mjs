@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, symlinkSync, readdirSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, symlinkSync, readdirSync, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -22,6 +22,8 @@ import {
   runCampaign,
   emailRe,
   createMailer,
+  defaultLogPath,
+  defaultSuppressionPath,
 } from '../src/lib/core.mjs';
 import { startSmtpSink } from './helpers/smtp-sink.mjs';
 
@@ -732,5 +734,22 @@ test('a lock left by a process that is gone does not block a campaign', async ()
     assert.equal((await runCampaign(campaignOptions(dir, { send: async () => ({ success: true }) }))).sent, 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the default log and suppression paths belong to the install, not the working directory', () => {
+  const here = process.cwd();
+  const elsewhere = mkdtempSync(join(tmpdir(), 'mailroom-cwd-'));
+  try {
+    process.chdir(elsewhere);
+    const log = defaultLogPath({});
+    const suppression = defaultSuppressionPath({});
+    assert.ok(log.endsWith(join('logs', 'sent.jsonl')) && !log.startsWith(realpathSync(elsewhere)), log);
+    assert.ok(suppression.endsWith(join('data', 'suppressed.csv')) && !suppression.startsWith(realpathSync(elsewhere)), suppression);
+    assert.equal(defaultLogPath({ SEND_LOG: 'mine/sent.jsonl' }), join(realpathSync(elsewhere), 'mine', 'sent.jsonl'));
+    assert.equal(defaultSuppressionPath({ SUPPRESSION_FILE: 'mine/s.csv' }), join(realpathSync(elsewhere), 'mine', 's.csv'));
+  } finally {
+    process.chdir(here);
+    rmSync(elsewhere, { recursive: true, force: true });
   }
 });

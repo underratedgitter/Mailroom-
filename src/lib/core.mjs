@@ -8,6 +8,7 @@
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync, readdirSync, statSync, realpathSync, renameSync, rmSync, linkSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import nodemailer from 'nodemailer';
 import { resolveSmtpConfig, bulkFields, addressDomain } from './mailer.mjs';
 
@@ -511,7 +512,14 @@ export function describeInterruption(signal, summary, { campaign = '', resume } 
 // before every message, so an address added while a campaign runs is honoured
 // by the very next send.
 
-export const defaultSuppressionPath = (env = process.env) => resolve(env.SUPPRESSION_FILE || 'data/suppressed.csv');
+// Where the install keeps its state when nothing says otherwise: the package
+// folder, so the CLI and the browser share one log and one suppression list
+// whatever directory they are started from.
+const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+export const defaultLogPath = (env = process.env) => resolve(env.SEND_LOG || join(PACKAGE_ROOT, 'logs', 'sent.jsonl'));
+
+export const defaultSuppressionPath = (env = process.env) => resolve(env.SUPPRESSION_FILE || join(PACKAGE_ROOT, 'data', 'suppressed.csv'));
 
 const suppressionCache = new Map();
 

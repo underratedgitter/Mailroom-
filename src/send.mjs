@@ -20,10 +20,14 @@
  * src/lib/core.mjs.
  *
  * Suppression: --suppress a@x.com,b@x.com adds addresses to the suppression
- * list (data/suppressed.csv, or --suppression-file / SUPPRESSION_FILE) and
- * exits. Every send, test included, skips what is on the list.
+ * list (--suppression-file, else SUPPRESSION_FILE, else data/suppressed.csv in
+ * the install folder) and exits. Every send, test included, skips what is on
+ * the list.
  *
- * Flags: --delay 4000 (ms between sends), --limit 100, --log logs/sent.jsonl,
+ * The send log is --log, else SEND_LOG, else logs/sent.jsonl in the install
+ * folder: the same file the browser uses, wherever the CLI is run from.
+ *
+ * Flags: --delay 4000 (ms between sends), --limit 100, --log path/to/sent.jsonl,
  *        --campaign <id> (labels the log so a re-run resumes that campaign),
  *        --send (actually send), --test addr (single test recipient),
  *        --dump file.html (render one recipient, send nothing).
@@ -45,6 +49,7 @@ import {
   SIGNAL_EXIT,
   describeInterruption,
   defaultSuppressionPath,
+  defaultLogPath,
   addSuppressed,
   isSuppressed,
   rateLimitsFromEnv,
@@ -71,7 +76,7 @@ try {
       campaign: { type: 'string' },
       delay: { type: 'string', default: '4000' },
       limit: { type: 'string' },
-      log: { type: 'string', default: 'logs/sent.jsonl' },
+      log: { type: 'string' },
       send: { type: 'boolean', default: false },
       test: { type: 'string' },
       dump: { type: 'string' },
@@ -83,6 +88,7 @@ try {
   die(err.message);
 }
 
+const logPath = values.log ? resolve(values.log) : defaultLogPath();
 const suppressionPath = values['suppression-file'] ? resolve(values['suppression-file']) : defaultSuppressionPath();
 
 if (values.suppress !== undefined) {
@@ -102,9 +108,9 @@ if (!existsSync(values.csv)) die(`CSV not found: ${values.csv}`);
 if (!existsSync(values.html)) die(`Template not found: ${values.html}`);
 
 try {
-  mkdirSync(dirname(values.log), { recursive: true });
+  mkdirSync(dirname(logPath), { recursive: true });
 } catch (err) {
-  die(`Cannot create the log folder for ${values.log}: ${err.message}`);
+  die(`Cannot create the log folder for ${logPath}: ${err.message}`);
 }
 
 const configProblems = smtpProblems();
@@ -136,7 +142,7 @@ try {
 }
 
 const campaignId = String(values.campaign || '').trim();
-const alreadySent = sentAddresses(readLog(values.log), campaignId);
+const alreadySent = sentAddresses(readLog(logPath), campaignId);
 
 let templateHtml;
 try {
@@ -256,7 +262,7 @@ try {
     limits,
     delayMs,
     mailer,
-    logPath: values.log,
+    logPath,
     shouldStop: () => stopSignal !== null,
     onEvent: (event) => {
       if (event.type === 'progress') {
@@ -287,7 +293,7 @@ console.log(`  failed  ${summary.failed}`);
 console.log(`  skipped ${summary.skipped}`);
 if (summary.uncertain.length) console.log(`  unconfirmed ${summary.uncertain.length} (no reply after the message was sent; it may have been delivered)`);
 if (summary.suppressed) console.log(`  suppressed ${summary.suppressed} (on the suppression list)`);
-console.log(`  log     ${values.log}`);
+console.log(`  log     ${logPath}`);
 if (summary.failures.length) {
   console.log('\nFailures');
   for (const f of summary.failures) console.log(`  ${f.email} — ${f.error}`);

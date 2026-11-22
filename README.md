@@ -120,6 +120,7 @@ npm start
 | `GUI_HOST` | `127.0.0.1` | Network interface to bind (CLI: `--host`) |
 | `GUI_PORT` | `4173` | Port to listen on (CLI: `--port`) |
 | `GUI_ALLOWED_HOSTS` | unset | Comma-separated list of additional allowed `Host` headers |
+| `SEND_LOG` | `logs/sent.jsonl` | Send log (the resume state), shared by the browser and the CLI (CLI: `--log`). Relative paths of `SEND_LOG` resolve against the folder you start from; the default is the install folder |
 | `SEND_LOG_MAX_BYTES` | `10485760` | Size at which `logs/sent.jsonl` is rotated (`0` turns rotation off) |
 | `SEND_LOG_KEEP` | `5` | Rotated archives kept (`sent.jsonl.1` is the newest); at least 1 |
 
@@ -314,7 +315,7 @@ call.) Delete a line from the file to un-suppress an address.
 | `EMAIL_REPLY_TO` | unset | Reply-To header; also the default unsubscribe mailbox |
 | `UNSUBSCRIBE_MAILTO` | Reply-To, else From | Mailbox that receives "unsubscribe" mail |
 | `UNSUBSCRIBE_URL` | unset | `https://` one-click endpoint you host; `{email}` is replaced |
-| `SUPPRESSION_FILE` | `data/suppressed.csv` | Suppression list location (CLI: `--suppression-file`) |
+| `SUPPRESSION_FILE` | `data/suppressed.csv` | Suppression list location (CLI: `--suppression-file`); the default is in the install folder for the CLI and the browser alike |
 | `MAX_PER_HOUR` | `500` | Rolling messages-per-hour ceiling for all domains; `0` turns it off |
 | `MAX_PER_DOMAIN_PER_HOUR` | `0` (off) | Same, per recipient domain (e.g. `gmail.com`); a full domain pauses the run |
 

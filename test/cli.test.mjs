@@ -141,6 +141,13 @@ test('preview says how many recipients the suppression list will hold back', asy
   assert.match(res.stdout, /suppressed\s+1 \(will skip\)/);
 });
 
+test('preview counts only the addresses of this list as already sent', async () => {
+  const log = '{"email":"ghost@example.com","status":"sent","campaign":"c1"}\n{"email":"a@example.com","status":"sent","campaign":"c1"}\n';
+  const res = await runCli([...SEND_ARGS, '--campaign', 'c1'], { files: { 'logs/sent.jsonl': log } });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stdout, /recipients\s+3 \(1 already sent, will skip\)/);
+});
+
 test('--send never mails a suppressed address', async (t) => {
   const sink = await startSmtpSink();
   t.after(() => sink.close());

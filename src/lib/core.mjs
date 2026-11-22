@@ -397,6 +397,11 @@ export function uncertainAddresses(entries, campaignId = '') {
   return set;
 }
 
+/** How many of these recipients are already in `alreadySent`; the set also holds addresses of other lists. */
+export function countAlreadySent(recipients, alreadySent) {
+  return recipients.filter((rec) => alreadySent.has(rec._email.toLowerCase())).length;
+}
+
 export function campaignSummaries(entries) {
   const byId = new Map();
   for (const entry of entries) {

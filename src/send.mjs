@@ -43,6 +43,7 @@ import {
   attachmentsFor,
   readLog,
   sentAddresses,
+  countAlreadySent,
   createMailer,
   runCampaign,
   resolveSmtpConfig,
@@ -143,6 +144,7 @@ try {
 
 const campaignId = String(values.campaign || '').trim();
 const alreadySent = sentAddresses(readLog(logPath), campaignId);
+const alreadySentCount = countAlreadySent(recipients, alreadySent);
 
 let templateHtml;
 try {
@@ -160,7 +162,7 @@ console.log(`  host      ${cfg.host}:${cfg.port} (${cfg.secure ? 'implicit TLS' 
 console.log(`  user      ${cfg.user || '(not set)'}`);
 console.log(`  from      ${cfg.from}`);
 console.log(`  password  ${cfg.pass ? `${cfg.pass.slice(0, 2)}${'•'.repeat(8)}` : '(not set)'}`);
-console.log(`  recipients ${recipients.length}${alreadySent.size ? ` (${alreadySent.size} already sent, will skip)` : ''}`);
+console.log(`  recipients ${recipients.length}${alreadySentCount ? ` (${alreadySentCount} already sent, will skip)` : ''}`);
 console.log(`  delay     ${delayMs}ms between sends`);
 console.log(`  ceiling   ${limits.perHour ? `${limits.perHour} messages/hour` : 'no hourly limit'}${limits.perDomainPerHour ? `, ${limits.perDomainPerHour} per domain` : ''}`);
 const held = recipients.filter((rec) => isSuppressed(suppressionPath, rec._email)).length;

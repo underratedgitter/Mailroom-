@@ -276,3 +276,18 @@ test('a scheduled send keeps the custom CSV columns the preview showed', async (
   assert.equal(done.status, 'sent');
   assert.match(String(sink.messages[0].data), /Subject: Hello Treasurer/);
 });
+
+test('the already-sent count only counts addresses that are in this list', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'mailroom-count-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  // One logged address is in the CSV, one (from a bigger earlier list) is not.
+  writeFileSync(join(dir, 'sent.jsonl'), '{"email":"ghost@example.com","status":"sent","campaign":"scheduled-test","at":"2026-01-01T00:00:00Z"}\n{"email":"one@example.com","status":"sent","campaign":"scheduled-test","at":"2026-01-01T00:00:00Z"}\n');
+  const server = await startServer({ dir });
+  t.after(() => server.stop({ keepData: true }));
+
+  const at = new Date(Date.now() + 60_000).toISOString();
+  const created = await post(server.base, '/api/schedule', scheduleBody({ at }));
+  assert.equal(created.status, 201);
+  assert.equal(created.data.total, 4);
+  assert.equal(created.data.skipped, 1);
+});

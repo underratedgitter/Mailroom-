@@ -61,6 +61,7 @@ import {
   isSuppressed,
   rateLimitsFromEnv,
   sentAddresses,
+  countAlreadySent,
   campaignSummaries,
   createMailer,
   runCampaign,
@@ -707,7 +708,7 @@ function startCampaign(input, { delay = 0 } = {}) {
       emit(job, {
         type: 'start',
         total: input.parsed.recipients.length,
-        skipped: input.alreadySent.size,
+        skipped: countAlreadySent(input.parsed.recipients, input.alreadySent),
         delay,
         campaign: input.campaignId || null,
       });
@@ -1209,7 +1210,7 @@ async function route(req, res) {
     } catch (err) {
       return fail(res, err.status || 409, err.message);
     }
-    return json(res, 202, { jobId: job.id, total: input.parsed.recipients.length, skipped: input.alreadySent.size });
+    return json(res, 202, { jobId: job.id, total: input.parsed.recipients.length, skipped: countAlreadySent(input.parsed.recipients, input.alreadySent) });
   }
 
   // ── Suppression list ──────────────────────────────────────────────
@@ -1284,7 +1285,7 @@ async function route(req, res) {
     return json(res, 201, {
       entry: scheduleView().find((e) => e.id === entry.id),
       total: entry.recipients.length,
-      skipped: input.alreadySent.size,
+      skipped: countAlreadySent(input.parsed.recipients, input.alreadySent),
     });
   }
 

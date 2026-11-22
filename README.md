@@ -485,7 +485,7 @@ Supported SMTP environment variables:
 ## Tests
 
 ```bash
-npm test            # 142 tests: parsing, rendering, resume, retries, scheduling, shutdown, log rotation, config validation, suppression, headers, rate ceiling, CLI, API, auth, TLS, guards
+npm test            # 176 tests: parsing, rendering, resume, retries, scheduling, shutdown, log rotation, config validation, suppression, headers, rate ceiling, CLI, API, auth, TLS, guards
 npm run check       # parse every JS file in bin/, src/ and public/ without running it
 ```
 

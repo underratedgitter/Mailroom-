@@ -1374,7 +1374,7 @@ function renderQueue() {
       setAttr(line.children[1], 'class', 'tag tag--' + e.status);
       setText(line.children[2], e.status === 'pending' ? relative(e.at) : '');
       setText(meta, [e.campaign || 'No campaign name', plural(e.recipients, 'recipient'), e.subject].filter(Boolean).join(' · '));
-      const text = e.error || (e.result ? 'Sent ' + e.result.sent + ', failed ' + e.result.failed + ', skipped ' + e.result.skipped + (e.result.uncertain ? ', unconfirmed ' + e.result.uncertain : '') : '');
+      const text = e.error || (e.status === 'pending' && e.interrupted ? 'Cut short; carries on automatically and skips anyone already mailed.' : e.result ? 'Sent ' + e.result.sent + ', failed ' + e.result.failed + ', skipped ' + e.result.skipped + (e.result.uncertain ? ', unconfirmed ' + e.result.uncertain : '') : '');
       setText(note, text);
       setHidden(note, !text);
       setClass(note, 'is-bad', Boolean(e.error));

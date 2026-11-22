@@ -775,6 +775,7 @@ function scheduleView() {
       recipients: (entry.recipients || []).length,
       template: entry.template,
       status: entry.status,
+      interrupted: Boolean(entry.interrupted),
       error: entry.error || null,
       result: entry.result || null,
       createdAt: entry.createdAt || null,
@@ -788,6 +789,8 @@ function templateFor(entry) {
 
 /** Runs one due entry; the caller has already marked it "sending". */
 async function fireScheduled(entry) {
+  // Set again below if this run is cut short too.
+  entry.interrupted = false;
   try {
     const template = templateFor(entry);
     const campaignId = String(entry.campaign || '');
@@ -822,7 +825,10 @@ async function fireScheduled(entry) {
       // start resumes it (the log skips whoever was already mailed); a person
       // pressing Stop means it is over.
       entry.status = shuttingDown ? 'pending' : 'cancelled';
-      if (shuttingDown) entry.result = null;
+      if (shuttingDown) {
+        entry.result = null;
+        entry.interrupted = true;
+      }
     } else {
       entry.status = summary?.error || (!summary?.sent && summary?.failed) ? 'failed' : 'sent';
     }
@@ -838,6 +844,8 @@ async function fireScheduled(entry) {
     const stored = current.find((e) => e.id === entry.id);
     if (stored) {
       stored.status = entry.status;
+      if (entry.interrupted) stored.interrupted = true;
+      else delete stored.interrupted;
       stored.error = entry.error ?? null;
       stored.result = entry.result ?? null;
       writeSchedule(current);
@@ -868,9 +876,11 @@ async function tick() {
       }
     }
 
-    // Anything that came due long before the server was up is not sent late.
+    // Anything that came due long before the server was up is not sent late. A
+    // send that was cut short is not "late": it started on time and the log
+    // keeps it from mailing anyone twice, so it always carries on.
     for (const entry of list) {
-      if (entry.status === 'pending' && Date.parse(entry.at) < now - GRACE_MS) {
+      if (entry.status === 'pending' && !entry.interrupted && Date.parse(entry.at) < now - GRACE_MS) {
         entry.status = 'missed';
         entry.error = 'The server was not running at the scheduled time';
         changed = true;
@@ -894,8 +904,8 @@ async function tick() {
 
 /**
  * A crash or restart can leave an entry marked "sending" with no job behind
- * it. Nothing is running this early in the process, so put it back in line;
- * the grace window decides whether it still goes out.
+ * it. Nothing is running this early in the process, so put it back in line,
+ * flagged as interrupted so it resumes whatever the grace window says.
  */
 function recoverSchedule() {
   const list = readSchedule();
@@ -903,6 +913,7 @@ function recoverSchedule() {
   for (const entry of list) {
     if (entry.status !== 'sending') continue;
     entry.status = 'pending';
+    entry.interrupted = true;
     entry.error = null;
     changed = true;
   }

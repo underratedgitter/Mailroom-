@@ -366,11 +366,12 @@ What stays with you, because it cannot be done from inside the app:
   for the message in flight, so keep your supervisor's stop timeout above that
   (Docker's default 10 s is enough).
 - A scheduled send interrupted by a shutdown goes back to `pending` and
-  resumes on the next start, skipping whoever was already mailed, as long as it
-  is inside the grace window (otherwise it is parked as `missed` and **Run
-  now** resumes it). An entry left `sending` by a crash gets the same
-  treatment at startup. Pressing Stop on a running scheduled send marks it
-  `cancelled`.
+  resumes on the next start, skipping whoever was already mailed, however
+  long the campaign has been running (it is flagged `interrupted`, which the
+  grace window does not apply to). An entry left `sending` by a crash gets the
+  same treatment at startup. Only an entry that never started and is more than
+  the grace window late is parked as `missed`; **Run now** sends it.
+  Pressing Stop on a running scheduled send marks it `cancelled`.
 - Every outcome is appended to `logs/sent.jsonl`; that log is the resume state.
   If it cannot be written the run stops rather than mail people it cannot record.
 - **Log rotation**: when `sent.jsonl` reaches `SEND_LOG_MAX_BYTES` it is renamed

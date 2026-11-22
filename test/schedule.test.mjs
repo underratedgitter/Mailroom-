@@ -291,3 +291,68 @@ test('the already-sent count only counts addresses that are in this list', async
   assert.equal(created.data.total, 4);
   assert.equal(created.data.skipped, 1);
 });
+
+test('a campaign cut short by a crash or a shutdown resumes however late it is, and sends nobody twice', async (t) => {
+  const sink = await startSmtpSink();
+  const dir = mkdtempSync(join(tmpdir(), 'mailroom-resume-'));
+  t.after(async () => {
+    await sink.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // Long campaigns outlive the grace window, so "interrupted" must not mean "missed".
+  const longAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+  const entry = (campaign, overrides) => ({
+    id: randomUUID(),
+    at: longAgo,
+    createdAt: longAgo,
+    campaign,
+    subject: 'Resumed',
+    template: TEMPLATE,
+    delay: 0,
+    recipients: ['a', 'b', 'c'].map((who) => ({ email: `${who}-${campaign}@example.test`, name: who, company: '' })),
+    status: 'pending',
+    error: null,
+    result: null,
+    ...overrides,
+  });
+  const crashed = entry('crashed', { status: 'sending' });
+  const shutDown = entry('shut-down', { interrupted: true });
+  writeFileSync(join(dir, 'schedule.json'), JSON.stringify([crashed, shutDown]));
+  // The first recipient of each was mailed before the interruption.
+  writeFileSync(join(dir, 'sent.jsonl'), [crashed, shutDown]
+    .map((e) => JSON.stringify({ email: e.recipients[0].email, status: 'sent', at: longAgo, campaign: e.campaign }))
+    .join('\n') + '\n');
+
+  const server = await startServer({
+    dir,
+    env: { ...FAST, SMTP_HOST: '127.0.0.1', SMTP_PORT: String(sink.port), EMAIL_FROM: 'desk@local.test' },
+  });
+  t.after(() => server.stop({ keepData: true }));
+
+  for (const { id } of [crashed, shutDown]) {
+    const done = await waitForStatus(server.base, id, ['sent', 'failed', 'missed'], 20000);
+    assert.equal(done.status, 'sent', done.error || '');
+    assert.deepEqual(done.result, { sent: 2, failed: 0, skipped: 1 });
+  }
+  assert.equal(sink.messages.length, 4, 'nobody is mailed twice');
+});
+
+test('a scheduled campaign stopped by a shutdown is flagged as interrupted in the queue file', async (t) => {
+  const sink = await startSmtpSink();
+  const server = await startServer({
+    env: { ...FAST, SMTP_HOST: '127.0.0.1', SMTP_PORT: String(sink.port), EMAIL_FROM: 'desk@local.test' },
+  });
+  t.after(async () => { await server.stop(); await sink.close(); });
+
+  const created = await post(server.base, '/api/schedule', scheduleBody({ at: new Date(Date.now() + 1200).toISOString(), delay: 3000 }));
+  assert.equal(created.status, 201);
+  const deadline = Date.now() + 15000;
+  while (sink.messages.length < 1 && Date.now() < deadline) await wait(50);
+  server.child.kill('SIGTERM');
+  await new Promise((done) => server.child.once('exit', done));
+
+  const stored = JSON.parse(readFileSync(join(server.workDir, 'schedule.json'), 'utf8'))[0];
+  assert.equal(stored.status, 'pending');
+  assert.equal(stored.interrupted, true);
+});

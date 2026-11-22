@@ -721,13 +721,13 @@ export function createMailer(cfg = resolveSmtpConfig()) {
     }
   }
 
-  async function send({ to, subject, html, assetsDir }) {
+  async function send({ to, name = '', subject, html, assetsDir }) {
     const attachments = attachmentsFor(html, assetsDir);
     let dataStarted = false;
     try {
       const info = await getTransport().sendMail({
         from: cfg.from,
-        to,
+        to: name ? { name, address: to } : to,
         subject,
         html,
         text: htmlToText(html),
@@ -880,7 +880,7 @@ async function sendCampaign({
 
     let result;
     for (let attempt = 1; attempt <= 3; attempt++) {
-      result = await mailer.send({ to: addr, subject, html, assetsDir });
+      result = await mailer.send({ to: addr, name: rec._name, subject, html, assetsDir });
       if (result.success) break;
       if (result.uncertain) break;
       if (isFatal(result)) {

@@ -857,3 +857,29 @@ test('runCampaign gives each recipient their own unsubscribe link', async () => 
   });
   assert.deepEqual(bodies, ['<a href="https://x.co/u?e=a%40b.co">u</a>', '<a href="https://x.co/u?e=c%40d.co">u</a>']);
 });
+
+test('the To header shows the recipient\'s name when there is one, and a name cannot add headers', async () => {
+  const rec = (email, name) => ({ _email: email, _name: name, _company: '' });
+  const { messages } = await campaignAgainstSink({
+    sink: {},
+    addresses: [],
+    run: {
+      options: {
+        recipients: [
+          rec('a@example.test', 'Priya Shah'),
+          rec('b@example.test', 'Shah, Raj'),
+          rec('c@example.test', ''),
+          rec('d@example.test', 'Eve\r\nBcc: victim@example.test'),
+        ],
+      },
+    },
+  });
+  const header = (message) => message.data.split('\r\n\r\n')[0];
+
+  assert.equal(messages.length, 4);
+  assert.match(header(messages[0]), /^To: Priya Shah <a@example\.test>$/m);
+  assert.match(header(messages[1]), /^To: "Shah, Raj" <b@example\.test>$/m);
+  assert.match(header(messages[2]), /^To: c@example\.test$/m);
+  assert.doesNotMatch(header(messages[3]), /^Bcc:/im);
+  assert.deepEqual(messages[3].to, ['<d@example.test>']);
+});

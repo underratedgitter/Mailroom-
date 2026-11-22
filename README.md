@@ -297,6 +297,9 @@ sends alike:
   `List-Unsubscribe-Post: List-Unsubscribe=One-Click`), with `{email}` replaced
   by the URL-encoded recipient. Without a URL there is no `-Post` header,
   because one-click is only valid with HTTPS.
+- **To line.** When the list has a name for a recipient, the To header reads
+  `Priya Shah <priya@example.com>` (quoted and encoded as needed; a name cannot
+  add headers); otherwise just the address.
 - **Plain-text part.** Every message is `multipart/alternative`: the text part
   is generated from the rendered HTML (links keep their address, entities are
   decoded, `<style>`/`<script>` dropped).

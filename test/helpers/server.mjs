@@ -128,24 +128,26 @@ async function stop(child, workDir, { keepData = false } = {}) {
   if (!keepData) rmSync(workDir, { recursive: true, force: true });
 }
 
+function parseBody(text) {
+  try { return text ? JSON.parse(text) : null; } catch { return text; }
+}
+
+async function readResponse(res) {
+  return { status: res.status, data: parseBody(await res.text()), headers: res.headers };
+}
+
 export async function post(base, path, body, headers = {}) {
   const res = await fetch(`${base}${path}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...headers },
     body: JSON.stringify(body ?? {}),
   });
-  const text = await res.text();
-  let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-  return { status: res.status, data, headers: res.headers };
+  return readResponse(res);
 }
 
 export async function get(base, path, headers = {}) {
   const res = await fetch(`${base}${path}`, { headers, redirect: 'manual' });
-  const text = await res.text();
-  let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-  return { status: res.status, data, headers: res.headers };
+  return readResponse(res);
 }
 
 export const wait = (ms) => new Promise((r) => setTimeout(r, ms));

@@ -171,7 +171,7 @@ rather than silently serving credentials in the clear or an open relay.
 ## What it does
 
 The browser app has a page for each step, in the sidebar: **Overview** (mailbox
-status, counts, recent campaigns), **Compose**, **Recipients**, **Send**,
+status, counts, campaign reports & sent/failed/unsent CSV export), **Compose**, **Recipients**, **Send**,
 **Schedule**, **Suppression** and **Settings**. It follows your light or dark
 system theme and works on a phone-sized screen.
 
@@ -185,11 +185,13 @@ delivery settings: Reply-To (`EMAIL_REPLY_TO`), an https unsubscribe link
 an `http://` unsubscribe URL or a non-numeric ceiling is refused) and a blank
 field removes the setting.
 
-**Compose** — every `templates/*.html` file is offered as a template. A folder
-next to it named `<template>-assets/` (for example, `bcci-connect-v2-assets/`) is
-picked up automatically and its images attached inline with `cid:` (Gmail blocks
-`data:` URIs). Bundled templates include `bcci-connect-v2.html`,
-`bcci-connect.html`, and `bcci-membership.html`.
+**Compose** — every `templates/*.html` file is offered as a template, and you can
+create, duplicate, delete, or edit template HTML and upload/delete inline
+images (PNG, JPG, GIF, WEBP up to 5 MB) directly in the Template studio tab. A
+folder next to a template named `<template>-assets/` (for example,
+`bcci-connect-v2-assets/`) is picked up automatically and its images attached
+inline with `cid:` (Gmail blocks `data:` URIs). Bundled templates include
+`bcci-connect-v2.html`, `bcci-connect.html`, and `bcci-membership.html`.
 
 **Recipients** — a saved `data/*.csv`, a CSV you upload, or addresses pasted straight in:
 
@@ -214,11 +216,12 @@ with no unsubscribe link.
 
 **Unsubscribe link** — put `{{unsubscribe_url}}` in a template's footer
 (`href="{{unsubscribe_url}}"`). It is the same target as the List-Unsubscribe
-header: `UNSUBSCRIBE_URL` with `{email}` replaced by the URL-encoded recipient
-when that is set, otherwise `mailto:` the unsubscribe mailbox
-(`UNSUBSCRIBE_MAILTO`, else Reply-To, else From) with the subject `unsubscribe`.
-All bundled templates use it. Mailroom does not receive unsubscribes: add the
-people who write back to the suppression list.
+header: `UNSUBSCRIBE_URL` with `{email}` replaced when that is set, otherwise
+a signed `MAILROOM_PUBLIC_URL` `/unsubscribe?token=…` link when set (confirmations
+add the address to `suppressed.csv` without requiring a login), otherwise
+`mailto:` the unsubscribe mailbox (`UNSUBSCRIBE_MAILTO`, else Reply-To, else From)
+with the subject `unsubscribe`. All bundled templates use it; people who opt
+out via `mailto:` or an external endpoint still need adding to the suppression list.
 
 **Send** — a confirmation gate, then per-recipient progress over a live stream.
 Re-running a campaign skips everyone it already mailed. Close the tab and the
@@ -335,18 +338,25 @@ npm run send -- --suppress "gone@example.com, other@example.com"
 curl -X POST http://127.0.0.1:4173/api/suppress \
   -H 'content-type: application/json' \
   -d '{"emails": ["gone@example.com"], "reason": "unsubscribe"}'   # reason is optional
-curl http://127.0.0.1:4173/api/suppression                         # path, count, emails
+curl -X POST http://127.0.0.1:4173/api/unsuppress \
+  -H 'content-type: application/json' \
+  -d '{"email": "gone@example.com"}'
+curl http://127.0.0.1:4173/api/suppression                         # path, count, emails, entries
 ```
 
 (With `MAILROOM_PASSWORD` set, send the session cookie as for any other API
-call.) Delete a line from the file to un-suppress an address.
+call.) You can also remove suppressed addresses in the **Suppression list** view.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `EMAIL_REPLY_TO` | unset | Reply-To header; also the default unsubscribe mailbox |
 | `UNSUBSCRIBE_MAILTO` | Reply-To, else From | Mailbox that receives "unsubscribe" mail |
-| `UNSUBSCRIBE_URL` | unset | `https://` one-click endpoint you host; `{email}` is replaced |
+| `UNSUBSCRIBE_URL` | unset | External `https://` one-click endpoint you host; `{email}` is replaced (overrides `MAILROOM_PUBLIC_URL`) |
+| `MAILROOM_PUBLIC_URL` | unset | Public `https://` origin of this Mailroom server for signed one-click `/unsubscribe` links (works without logging in) |
+| `MAILROOM_UNSUBSCRIBE_SECRET` | generated in `logs/.unsubscribe-secret` | Explicit HMAC secret for signing `/unsubscribe` tokens across CLI and server restarts |
+| `UNSUBSCRIBE_SECRET_FILE` | `<log dir>/.unsubscribe-secret` | Override path where the generated HMAC signing secret is stored (`0600`) |
 | `SUPPRESSION_FILE` | `data/suppressed.csv` | Suppression list location (CLI: `--suppression-file`); the default is in the install folder for the CLI and the browser alike |
+| `SCHEDULE_FILE` | `logs/schedule.json` | Scheduled campaign queue file location |
 | `MAX_PER_HOUR` | `500` | Rolling messages-per-hour ceiling for all domains; `0` turns it off |
 | `MAX_PER_DOMAIN_PER_HOUR` | `0` (off) | Same, per recipient domain (e.g. `gmail.com`); a full domain pauses the run |
 
@@ -486,7 +496,7 @@ Supported SMTP environment variables:
 ## Tests
 
 ```bash
-npm test            # 176 tests: parsing, rendering, resume, retries, scheduling, shutdown, log rotation, config validation, suppression, headers, rate ceiling, CLI, API, auth, TLS, guards
+npm test            # 183 tests: parsing, rendering, resume, retries, scheduling, shutdown, log rotation, config validation, suppression, headers, rate ceiling, CLI, API, template studio, auth, TLS, guards
 npm run check       # parse every JS file in bin/, src/ and public/ without running it
 ```
 
@@ -508,4 +518,7 @@ leaves the machine.
 - Mailroom sends the unsubscribe headers and honours a suppression list, but it
   does not receive unsubscribe requests, late bounces or complaints; you feed them
   in (see above). For large, regulated, or marketing lists use a real ESP.
-- Templates are HTML files on disk, not a visual editor.
+- Templates are edited as raw HTML and inline `cid:` images (PNG, JPG, GIF, or
+  WEBP up to 5 MB) in the Compose **Template studio** tab rather than a
+  drag-and-drop visual designer; bundled templates are read-only (duplicate one
+  to edit a copy).

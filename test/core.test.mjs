@@ -17,6 +17,8 @@ import {
   inlineForPreview,
   sentAddresses,
   campaignSummaries,
+  campaignDeliveryLists,
+  formatReportCsv,
   readLog,
   appendLog,
   logArchives,
@@ -882,4 +884,52 @@ test('the To header shows the recipient\'s name when there is one, and a name ca
   assert.match(header(messages[2]), /^To: c@example\.test$/m);
   assert.doesNotMatch(header(messages[3]), /^Bcc:/im);
   assert.deepEqual(messages[3].to, ['<d@example.test>']);
+});
+
+test('campaignDeliveryLists computes latest sent, failed, and unsent (excluding suppressed and uncertain)', () => {
+  const recipients = [
+    { _email: 'sent@example.com', _name: 'Sent User', _company: 'Acme' },
+    { _email: 'retried@example.com', _name: 'Retried User', _company: 'Beta' },
+    { _email: 'failed@example.com', _name: '=cmd|"/c calc"!A0', _company: 'Co' },
+    { _email: 'uncertain@example.com', _name: 'Uncertain', _company: 'Co' },
+    { _email: 'suppressed@example.com', _name: 'Opted Out', _company: 'Co' },
+    { _email: 'pending@example.com', _name: 'Pending', _company: 'Gamma' },
+  ];
+  const entries = [
+    { email: 'sent@example.com', status: 'sent', campaign: 'c1', at: '2026-11-27T01:00:00Z' },
+    { email: 'retried@example.com', status: 'failed', error: '451 temporary', responseCode: 451, campaign: 'c1', at: '2026-11-27T01:00:01Z' },
+    { email: 'retried@example.com', status: 'sent', campaign: 'c1', at: '2026-11-27T01:05:00Z' },
+    { email: 'failed@example.com', status: 'failed', error: '550 5.1.1 unknown', responseCode: 550, campaign: 'c1', at: '2026-11-27T01:01:00Z' },
+    { email: 'uncertain@example.com', status: 'uncertain', error: 'timeout', campaign: 'c1', at: '2026-11-27T01:02:00Z' },
+    { email: 'other@example.com', status: 'sent', campaign: 'other', at: '2026-11-27T01:03:00Z' },
+  ];
+  const suppressed = new Set(['suppressed@example.com']);
+  const lists = campaignDeliveryLists(entries, recipients, 'c1', suppressed);
+
+  assert.deepEqual(lists.sent.map((r) => r.email), ['sent@example.com', 'retried@example.com']);
+  assert.deepEqual(lists.failed.map((r) => [r.email, r.responseCode, r.error]), [
+    ['failed@example.com', 550, '550 5.1.1 unknown'],
+  ]);
+  // Suppressed, sent, and uncertain recipients are excluded from unsent; failed + pending remain eligible.
+  assert.deepEqual(lists.unsent.map((r) => r._email), ['failed@example.com', 'pending@example.com']);
+});
+
+test('formatReportCsv neutralises spreadsheet formula cells and escapes RFC 4180 quotes', () => {
+  const csv = formatReportCsv([
+    { email: 'a@example.com', name: '=1+1', company: '+cmd|x', error: '-bad', at: '@now' },
+    { email: 'b@example.com', name: 'Shah, "Priya"', company: '\tTab\nLine', error: '\rCR', at: 'ok' },
+  ], [
+    { key: 'email', label: 'email' },
+    { key: 'name', label: 'name' },
+    { key: 'company', label: 'company' },
+    { key: 'error', label: 'error' },
+    { key: 'at', label: 'at' },
+  ]);
+
+  assert.equal(
+    csv,
+    'email,name,company,error,at\n'
+    + 'a@example.com,\'=1+1,\'+cmd|x,\'-bad,\'@now\n'
+    + 'b@example.com,"Shah, ""Priya""","\'\tTab\nLine","\'\rCR",ok\n',
+  );
 });

@@ -58,10 +58,15 @@ import {
 } from './lib/core.mjs';
 import { loadConfig, smtpProblems } from './lib/config.mjs';
 import { missingSmtpFields, configIssue } from './lib/mailer.mjs';
+import { errMsg } from './lib/errors.mjs';
 
 // Same settings the browser writes: ./.env or ~/.mailroom/config.env.
 loadConfig();
 
+/**
+ * @param {string} msg
+ * @returns {never}
+ */
 const die = (msg) => {
   console.error(`\nError: ${msg}\n`);
   process.exit(1);
@@ -85,9 +90,9 @@ try {
       suppress: { type: 'string' },
       'suppression-file': { type: 'string' },
     },
-}));
+  }));
 } catch (err) {
-  die(err.message);
+  die(errMsg(err));
 }
 
 const logPath = values.log ? resolve(values.log) : defaultLogPath();
@@ -103,22 +108,29 @@ if (values.suppress !== undefined) {
   process.exit(0);
 }
 
-if (!values.csv) die('--csv is required');
-if (!values.html) die('--html is required');
-if (!values.subject) die('--subject is required');
-if (!existsSync(values.csv)) die(`CSV not found: ${values.csv}`);
-if (!existsSync(values.html)) die(`Template not found: ${values.html}`);
+const csvArg = values.csv || die('--csv is required');
+const htmlArg = values.html || die('--html is required');
+const subjectTemplate = values.subject || die('--subject is required');
+if (!existsSync(csvArg)) die(`CSV not found: ${csvArg}`);
+if (!existsSync(htmlArg)) die(`Template not found: ${htmlArg}`);
 
 try {
   mkdirSync(dirname(logPath), { recursive: true });
 } catch (err) {
-  die(`Cannot create the log folder for ${logPath}: ${err.message}`);
+  die(`Cannot create the log folder for ${logPath}: ${errMsg(err)}`);
 }
 
 const configProblems = smtpProblems();
 if (configProblems.length) die(`Invalid configuration:\n  - ${configProblems.join('\n  - ')}`);
 
 // Number('abc') is NaN, which would silently mean "no throttling" or "no limit".
+/**
+ * @param {string} flag
+ * @param {string} text
+ * @param {number} min
+ * @param {string} rule
+ * @returns {number}
+ */
 const wholeNumber = (flag, text, min, rule) => {
   if (!/^\d+$/.test(text.trim()) || Number(text) < min) die(`${flag} must be ${rule}, got "${text}"`);
   return Number(text);
@@ -128,9 +140,9 @@ const limit = values.limit === undefined ? Infinity : wholeNumber('--limit', val
 
 let parsed;
 try {
-  parsed = recipientsFromFile(values.csv, { limit });
+  parsed = recipientsFromFile(csvArg, { limit });
 } catch (err) {
-  die(err.message);
+  die(errMsg(err));
 }
 const recipients = parsed.recipients;
 
@@ -140,7 +152,7 @@ let limits;
 try {
   limits = rateLimitsFromEnv();
 } catch (err) {
-  die(err.message);
+  die(errMsg(err));
 }
 
 const campaignId = String(values.campaign || '').trim();
@@ -149,11 +161,10 @@ const alreadySentCount = countAlreadySent(recipients, alreadySent);
 
 let templateHtml;
 try {
-  templateHtml = readFileSync(values.html, 'utf8');
+  templateHtml = readFileSync(htmlArg, 'utf8');
 } catch (err) {
-  die(`Cannot read template ${values.html}: ${err.message}`);
+  die(`Cannot read template ${htmlArg}: ${errMsg(err)}`);
 }
-const subjectTemplate = values.subject;
 const assetsDir = values['assets-dir'];
 
 if (process.env.MAILROOM_PUBLIC_URL) loadOrCreateUnsubscribeSecret();
@@ -199,6 +210,7 @@ if (!cfg.configured) {
 
 // A signal during a campaign finishes the message in flight, records it, and
 // stops. The run exits non-zero so a script or scheduler knows it is unfinished.
+/** @type {string | null} */
 let stopSignal = null;
 if (!values.dump && !values.test) {
   for (const signal of Object.keys(SIGNAL_EXIT)) {
@@ -254,6 +266,7 @@ if (values.test) {
 }
 
 // ── Send ─────────────────────────────────────────────────────────────
+/** @type {import('./lib/core.mjs').CampaignRunSummary} */
 let summary;
 try {
   summary = await runCampaign({
@@ -272,7 +285,9 @@ try {
     onEvent: (event) => {
       if (event.type === 'progress') {
         const n = `[${event.index}/${event.total}]`;
-        if (event.status === 'skip') console.log(`${n} skip   ${event.email} (${{ suppressed: 'suppressed', uncertain: 'earlier attempt unconfirmed' }[event.reason] || 'already sent'})`);
+        /** @type {Record<string, string>} */
+        const skipReason = { suppressed: 'suppressed', uncertain: 'earlier attempt unconfirmed' };
+        if (event.status === 'skip') console.log(`${n} skip   ${event.email} (${skipReason[event.reason || ''] || 'already sent'})`);
         else if (event.status === 'sent') console.log(`${n} sent   ${event.email}`);
         else if (event.status === 'uncertain') console.log(`${n} UNCONFIRMED ${event.email} — ${event.error}`);
         else console.log(`${n} FAILED ${event.email} — ${event.error}`);
@@ -286,7 +301,7 @@ try {
   });
 } catch (err) {
   mailer.close();
-  die(err.message);
+  die(errMsg(err));
 }
 
 mailer.close();

@@ -21,7 +21,7 @@ import { errMsg, errCode } from './errors.mjs';
 /** @typedef {{ filename: string, path: string, cid: string }} InlineAttachment */
 /** @typedef {{ email: string, status: string, campaign?: string | null, reason?: string, messageId?: string | null, error?: string, responseCode?: number, at: string }} SendLogEntry */
 /** @typedef {{ email: string, reason: string, added: string }} SuppressionEntry */
-/** @typedef {{ id: string, sent: number, skipped: number, failed: number, last: string | null }} CampaignSummary */
+/** @typedef {{ id: string, sent: number, skipped: number, failed: number, uncertain: number, last: string | null, lastError: string | null }} CampaignSummary */
 /** @typedef {{ perHour: number, perDomainPerHour: number }} RateLimits */
 /** @typedef {{ at: number | string, domain: string }} RateHistoryEntry */
 /** @typedef {{ at: number, domain: string }} RateSample */
@@ -265,22 +265,35 @@ const neutralise = (value) => {
 /** @param {string} value */
 const restore = (value) => (/^'[=+\-@\t\r]/.test(value) ? value.slice(1) : value);
 
+/** @param {unknown} value */
+const csvCell = (value) => {
+  const text = neutralise(String(value ?? ''));
+  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+};
+
 /**
  * Writes recipients back out as a CSV the sender (and Excel) can read.
  * @param {Recipient[]} recipients
  * @returns {string}
  */
 export function recipientsToCsv(recipients) {
-  /** @param {string} value */
-  const cell = (value) => {
-    const text = neutralise(value);
-    return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-  };
   const lines = ['email,name,company'];
   for (const rec of recipients) {
-    lines.push([rec._email, rec._name, rec._company].map(cell).join(','));
+    lines.push([rec._email, rec._name, rec._company].map(csvCell).join(','));
   }
   return `${lines.join('\n')}\n`;
+}
+
+/**
+ * Formats arbitrary rows and `{ key, label }` specs as RFC 4180 CSV with formula neutralisation.
+ * @param {Record<string, unknown>[]} rows
+ * @param {Array<{ key: string, label: string }>} columns
+ * @returns {string}
+ */
+export function formatReportCsv(rows, columns) {
+  const header = columns.map((c) => csvCell(c.label)).join(',');
+  const body = rows.map((row) => columns.map((c) => csvCell(row[c.key])).join(','));
+  return `${[header, ...body].join('\n')}\n`;
 }
 
 // ── Rendering ────────────────────────────────────────────────────────
@@ -655,15 +668,92 @@ export function campaignSummaries(entries) {
     const id = entry.campaign || '(untagged)';
     let c = byId.get(id);
     if (!c) {
-      c = { id, sent: 0, skipped: 0, failed: 0, last: null };
+      c = { id, sent: 0, skipped: 0, failed: 0, uncertain: 0, last: null, lastError: null };
       byId.set(id, c);
     }
     if (entry.status === 'sent') c.sent++;
     else if (entry.status === 'skipped') c.skipped++;
-    else if (entry.status === 'failed') c.failed++;
+    else if (entry.status === 'uncertain') c.uncertain++;
+    else if (entry.status === 'failed') {
+      c.failed++;
+      if (entry.error) c.lastError = entry.error;
+    }
     if (!c.last || String(entry.at) > String(c.last)) c.last = entry.at;
   }
   return [...byId.values()].sort((a, b) => String(b.last).localeCompare(String(a.last)));
+}
+
+/**
+ * Resolves the latest outcome per address for `campaignId` into `{ sent, failed, unsent }`.
+ * `unsent` lists addresses in `allRecipients` not yet sent/uncertain and not suppressed.
+ * @param {SendLogEntry[]} entries
+ * @param {Recipient[]} [allRecipients]
+ * @param {string} [campaignId]
+ * @param {Set<string>} [suppressed]
+ */
+export function campaignDeliveryLists(entries, allRecipients = [], campaignId = '', suppressed = new Set()) {
+  const target = String(campaignId || '').trim();
+  /** @type {Map<string, Recipient>} */
+  const metaByEmail = new Map();
+  for (const rec of allRecipients) {
+    const key = String(rec._email || '').toLowerCase();
+    if (key && !metaByEmail.has(key)) metaByEmail.set(key, rec);
+  }
+
+  /** @type {Map<string, SendLogEntry>} */
+  const latest = new Map();
+  for (const entry of entries) {
+    if (entry.status !== 'sent' && entry.status !== 'failed' && entry.status !== 'uncertain') continue;
+    const entryCampaign = entry.campaign || '(untagged)';
+    if (target) {
+      if (target === '(untagged)') {
+        if (entry.campaign) continue;
+      } else if (entryCampaign !== target) {
+        continue;
+      }
+    }
+    const key = String(entry.email || '').toLowerCase();
+    if (!key) continue;
+    const prev = latest.get(key);
+    if (!prev || String(entry.at || '') >= String(prev.at || '')) {
+      latest.set(key, entry);
+    }
+  }
+
+  /** @type {Array<{ email: string, name: string, company: string, responseCode: number | string, error: string, at: string }>} */
+  const sent = [];
+  /** @type {Array<{ email: string, name: string, company: string, responseCode: number | string, error: string, at: string }>} */
+  const failed = [];
+  /** @type {Set<string>} */
+  const sentSet = new Set();
+  /** @type {Set<string>} */
+  const uncertainSet = new Set();
+
+  for (const [key, entry] of latest) {
+    const meta = metaByEmail.get(key);
+    const row = {
+      email: meta?._email || entry.email,
+      name: meta?._name || '',
+      company: meta?._company || '',
+      responseCode: entry.responseCode ?? '',
+      error: entry.error || '',
+      at: entry.at || '',
+    };
+    if (entry.status === 'sent') {
+      sentSet.add(key);
+      sent.push(row);
+    } else if (entry.status === 'uncertain') {
+      uncertainSet.add(key);
+    } else {
+      failed.push(row);
+    }
+  }
+
+  const unsent = allRecipients.filter((rec) => {
+    const key = String(rec._email || '').toLowerCase();
+    return !sentSet.has(key) && !uncertainSet.has(key) && !suppressed.has(key);
+  });
+  return { sent, failed, unsent };
 }
 
 /**

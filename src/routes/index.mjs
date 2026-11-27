@@ -1,4 +1,5 @@
 import { httpError } from '../lib/errors.mjs';
+import { routes as campaignRoutes } from './campaigns.mjs';
 import { routes as recipientRoutes } from './recipients.mjs';
 import { routes as scheduleRoutes } from './schedule.mjs';
 import { routes as sendRoutes } from './send.mjs';
@@ -97,6 +98,7 @@ export const apiRoutes = [
   ...templateRoutes,
   ...sendRoutes,
   ...suppressionRoutes,
+  ...campaignRoutes,
   ...scheduleRoutes,
 ];
 

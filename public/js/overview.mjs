@@ -49,16 +49,57 @@ export async function loadHealth() {
   setHidden(ui.offlineBar, state.online);
 }
 
+export async function loadCampaigns() {
+  try {
+    const data = await api('/api/campaigns');
+    state.campaigns = data.campaigns || [];
+    renderCampaigns();
+  } catch { /* fallback to /api/state recent list */ }
+}
+
+function exportHref(campaignId, kind, csvPath = '') {
+  const params = new URLSearchParams({ kind });
+  if (csvPath) params.set('csv', csvPath);
+  return '/api/campaigns/' + encodeURIComponent(campaignId) + '/export?' + params.toString();
+}
+
+export function initOverview() {
+  ui.reportCsv.addEventListener('change', renderCampaigns);
+}
+
 export function renderCampaigns() {
-  const rows = state.log.campaigns || [];
+  const rows = state.campaigns || state.log.campaigns || [];
   setHidden(ui.campaignsEmpty, rows.length > 0);
   setHidden(ui.campaignsWrap, rows.length === 0);
-  const cells = (c) => [c.id, String(c.sent), String(c.failed), String(c.skipped), c.last ? formatWhen(c.last) : '—'];
+  const csvPath = ui.reportCsv.value || '';
+
   reconcile(ui.campaignsBody, rows, (c) => c.id,
-    () => h('tr', {}, h('th', { scope: 'row' }), h('td', { class: 'num' }), h('td', { class: 'num' }), h('td', { class: 'num' }), h('td')),
+    () => h('tr', {},
+      h('th', { scope: 'row' }, h('div'), h('div', { class: 'queue__meta' })),
+      h('td', { class: 'num' }),
+      h('td', { class: 'num' }),
+      h('td', { class: 'num' }),
+      h('td', {},
+        h('div', { class: 'export-links' },
+          h('a', { class: 'export-link', download: '' }, 'Sent'),
+          h('a', { class: 'export-link', download: '' }, 'Failed'),
+          h('a', { class: 'export-link', download: '' }, 'Unsent')))),
     (tr, c) => {
-      cells(c).forEach((text, i) => setText(tr.children[i], text));
-      setClass(tr.children[2], 'is-bad', c.failed > 0);
+      const [head, sentCell, failedCell, skippedCell, exportCell] = tr.children;
+      setText(head.children[0], c.id);
+      setText(head.children[1], c.last ? formatWhen(c.last) : '—');
+      setText(sentCell, c.sent);
+      setText(failedCell, c.failed);
+      setText(skippedCell, c.skipped);
+      setClass(failedCell, 'is-bad', c.failed > 0);
+
+      const [sentLink, failedLink, unsentLink] = exportCell.children[0].children;
+      setAttr(sentLink, 'href', exportHref(c.id, 'sent', csvPath));
+      setHidden(sentLink, !c.sent);
+      setAttr(failedLink, 'href', exportHref(c.id, 'failed', csvPath));
+      setHidden(failedLink, !c.failed);
+      setAttr(unsentLink, 'href', csvPath ? exportHref(c.id, 'unsent', csvPath) : '#');
+      setHidden(unsentLink, !csvPath);
     });
 }
 

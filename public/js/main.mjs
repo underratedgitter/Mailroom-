@@ -21,7 +21,7 @@ import {
   ui,
 } from './api.mjs';
 import { describeTemplate, initCompose, refreshPreview, renderTokens } from './compose.mjs';
-import { loadHealth, mailboxOf, renderCampaigns, renderConn, renderDraft } from './overview.mjs';
+import { initOverview, loadCampaigns, loadHealth, mailboxOf, renderCampaigns, renderConn, renderDraft } from './overview.mjs';
 import { describeCsv, initRecipients, loadRoster, markRosterCurrent, setTab, validatePaste } from './recipients.mjs';
 import { initSchedule, loadQueue, prepareScheduleForm, renderScheduleSummary } from './schedule.mjs';
 import { initSend, listen, lockControls, resumeActiveJob } from './send.mjs';
@@ -42,7 +42,7 @@ function options(select, items, preferred) {
 
 // ── Routing ──────────────────────────────────────────────────────────
 const ROUTES = [
-  { id: 'overview', title: 'Overview', view: 'viewOverview', heading: 'hOverview', enter: () => loadHealth() },
+  { id: 'overview', title: 'Overview', view: 'viewOverview', heading: 'hOverview', enter: () => { loadHealth(); loadCampaigns(); } },
   { id: 'compose', title: 'Compose', view: 'viewCompose', heading: 'hCompose' },
   { id: 'recipients', title: 'Recipients', view: 'viewRecipients', heading: 'hRecipients' },
   { id: 'send', title: 'Send', view: 'viewSend', heading: 'hSend' },
@@ -136,6 +136,11 @@ function applyState(data) {
     value: c.path,
     label: c.error ? c.name + ' (unreadable)' : c.name + ' — ' + plural(c.recipients, 'recipient'),
   })), store.get('csv'));
+  options(ui.reportCsv, data.csvs.filter((c) => !c.error).map((c) => ({
+    value: c.path,
+    label: c.name,
+  })), ui.csv.value || store.get('csv'));
+  setHidden(ui.reportCsvWrap, data.csvs.every((c) => c.error));
   setHidden(ui.csvEmpty, data.csvs.length > 0);
   setHidden(ui.csv.closest('.field'), data.csvs.length === 0);
 
@@ -165,6 +170,7 @@ async function refreshBackground() {
   }
   await loadQueue();
   if (currentRoute().id === 'suppression') await loadSuppression();
+  if (currentRoute().id === 'overview') await loadCampaigns();
   if (currentRoute().id === 'settings' || currentRoute().id === 'overview') await loadHealth();
 }
 
@@ -193,6 +199,7 @@ hooks.attachJob = (jobId) => { if (!state.sending) lockControls(); listen(jobId)
 
 initDialogs();
 initNavigation();
+initOverview();
 initCompose();
 initTemplateStudio();
 initRecipients();

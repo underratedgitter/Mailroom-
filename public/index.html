@@ -171,10 +171,16 @@
         </section>
 
         <section class="card card--table" aria-labelledby="hCampaigns">
-          <h2 class="card__title" id="hCampaigns">Recent campaigns</h2>
+          <div class="card__head">
+            <h2 class="card__title" id="hCampaigns">Campaign reports</h2>
+            <div class="campaigns__csv" id="reportCsvWrap">
+              <label for="reportCsv">Unsent list</label>
+              <select id="reportCsv"></select>
+            </div>
+          </div>
           <div class="table-wrap" id="campaignsWrap">
             <table class="table">
-              <thead><tr><th scope="col">Campaign</th><th scope="col" class="num">Sent</th><th scope="col" class="num">Failed</th><th scope="col" class="num">Skipped</th><th scope="col">Last activity</th></tr></thead>
+              <thead><tr><th scope="col">Campaign</th><th scope="col" class="num">Sent</th><th scope="col" class="num">Failed</th><th scope="col" class="num">Skipped</th><th scope="col">Export CSV</th></tr></thead>
               <tbody id="campaignsBody"></tbody>
             </table>
           </div>

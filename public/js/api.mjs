@@ -109,6 +109,7 @@ export const state = {
   csvs: [],
   templates: [],
   log: { path: '', entries: 0, campaigns: [] },
+  campaigns: null,
   suppression: { path: '', count: 0 },
   queue: null,
   suppressed: null,

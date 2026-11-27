@@ -482,6 +482,7 @@ function samplePathForPattern(pattern) {
     .replace(/\$$/, '')
     .replace(/\\\//g, '/')
     .replace(/\(\[\\w-\]\+\)/g, 'sample-id')
+    .replace(/\(\[\^\/\]\+\)/g, 'sample-id')
     .replace(/\(([^()|]+)\|[^()]+\)/g, '$1');
   assert.ok(pattern.test(sample), `sample path "${sample}" did not match ${pattern}`);
   return sample;

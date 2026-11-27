@@ -171,7 +171,7 @@ rather than silently serving credentials in the clear or an open relay.
 ## What it does
 
 The browser app has a page for each step, in the sidebar: **Overview** (mailbox
-status, counts, recent campaigns), **Compose**, **Recipients**, **Send**,
+status, counts, campaign reports & sent/failed/unsent CSV export), **Compose**, **Recipients**, **Send**,
 **Schedule**, **Suppression** and **Settings**. It follows your light or dark
 system theme and works on a phone-sized screen.
 

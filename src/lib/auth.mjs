@@ -85,6 +85,84 @@ export async function verifyPassword(password, stored) {
   return timingSafeEqual(key, parsed.key);
 }
 
+/**
+ * Parse a Cookie header without throwing on malformed percent-escapes.
+ * @param {string | undefined} header
+ * @returns {Record<string, string>}
+ */
+export function parseCookies(header) {
+  /** @type {Record<string, string>} */
+  const out = {};
+  for (const part of String(header || '').split(';')) {
+    const eq = part.indexOf('=');
+    if (eq === -1) continue;
+    const name = part.slice(0, eq).trim();
+    const raw = part.slice(eq + 1).trim();
+    try { out[name] = decodeURIComponent(raw); } catch { out[name] = raw; }
+  }
+  return out;
+}
+
+/**
+ * Bounded in-memory session token store with TTL expiration.
+ * @param {{ ttlMs: number, maxSessions: number }} opts
+ */
+export function createSessionStore({ ttlMs, maxSessions }) {
+  /** @type {Map<string, number>} */
+  const sessions = new Map();
+  return {
+    create() {
+      const now = Date.now();
+      for (const [token, expiry] of sessions) if (expiry < now) sessions.delete(token);
+      while (sessions.size >= maxSessions) {
+        const oldest = sessions.keys().next().value;
+        if (oldest !== undefined) sessions.delete(oldest);
+      }
+      const token = randomBytes(32).toString('hex');
+      sessions.set(token, now + ttlMs);
+      return token;
+    },
+    has(/** @type {string} */ token) {
+      const expiry = sessions.get(token);
+      if (!expiry) return false;
+      if (expiry < Date.now()) {
+        sessions.delete(token);
+        return false;
+      }
+      return true;
+    },
+    delete(/** @type {string} */ token) {
+      sessions.delete(token);
+    },
+  };
+}
+
+/**
+ * Per-IP sliding-window login attempt tracker.
+ * @param {{ windowMs: number, maxAttempts: number }} opts
+ */
+export function createLoginLimiter({ windowMs, maxAttempts }) {
+  /** @type {Map<string, number[]>} */
+  const attempts = new Map();
+  /** @param {string} ip */
+  function recent(ip) {
+    const now = Date.now();
+    const hits = (attempts.get(ip) || []).filter((t) => now - t < windowMs);
+    if (hits.length) attempts.set(ip, hits);
+    else attempts.delete(ip);
+    return hits;
+  }
+  return {
+    isBlocked: (/** @type {string} */ ip) => recent(ip).length >= maxAttempts,
+    note(/** @type {string} */ ip, /** @type {boolean} */ ok) {
+      if (ok) { attempts.delete(ip); return; }
+      const hits = recent(ip);
+      hits.push(Date.now());
+      attempts.set(ip, hits);
+    },
+  };
+}
+
 // ── Command line: print a hash for the password given on stdin ───────
 /**
  * @param {string} prompt

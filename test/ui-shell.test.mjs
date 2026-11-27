@@ -119,3 +119,10 @@ test('compose includes the template studio tabs, editor, asset manager, and name
     assert.ok(app.includes(route), route + ' missing from public/js');
   }
 });
+
+test('the suppression view displays reason and date and removes addresses via /api/unsuppress', () => {
+  assert.match(app, /\/api\/unsuppress/);
+  assert.match(app, /function renderSuppression[\s\S]*?\.reason/);
+  assert.match(app, /function renderSuppression[\s\S]*?\.added/);
+  assert.match(app, /Remove/);
+});

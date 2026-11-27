@@ -20,6 +20,7 @@ import { errMsg, errCode } from './errors.mjs';
 /** @typedef {{ code: string, message: string }} LinkWarning */
 /** @typedef {{ filename: string, path: string, cid: string }} InlineAttachment */
 /** @typedef {{ email: string, status: string, campaign?: string | null, reason?: string, messageId?: string | null, error?: string, responseCode?: number, at: string }} SendLogEntry */
+/** @typedef {{ email: string, reason: string, added: string }} SuppressionEntry */
 /** @typedef {{ id: string, sent: number, skipped: number, failed: number, last: string | null }} CampaignSummary */
 /** @typedef {{ perHour: number, perDomainPerHour: number }} RateLimits */
 /** @typedef {{ at: number | string, domain: string }} RateHistoryEntry */
@@ -808,33 +809,79 @@ export const defaultLogPath = (env = process.env) => resolve(env.SEND_LOG || joi
 /** @param {Record<string, string | undefined>} [env] */
 export const defaultSuppressionPath = (env = process.env) => resolve(env.SUPPRESSION_FILE || join(PACKAGE_ROOT, 'data', 'suppressed.csv'));
 
-/** @type {Map<string, { stamp: string, set: Set<string> }>} */
+/** @type {Map<string, { stamp: string, set: Set<string>, entries: SuppressionEntry[] }>} */
 const suppressionCache = new Map();
 
 /**
- * @param {string} path
- * @returns {Set<string>}
+ * @param {unknown} value
+ * @returns {string}
  */
-export function loadSuppressed(path) {
+const unquoteField = (value) => String(value ?? '').trim().replace(/^"|"$/g, '').trim();
+
+/**
+ * @param {string} line
+ * @returns {SuppressionEntry | null}
+ */
+function parseSuppressionLine(line) {
+  const parts = String(line).split(/[,;\t]/);
+  const email = unquoteField(parts[0]).toLowerCase();
+  if (!emailRe.test(email)) return null;
+  return {
+    email,
+    reason: unquoteField(parts[1]),
+    added: unquoteField(parts[2]),
+  };
+}
+
+/**
+ * @param {string} path
+ * @returns {{ stamp: string, set: Set<string>, entries: SuppressionEntry[] }}
+ */
+function readSuppressionSnapshot(path) {
   let stamp;
   try {
     const stats = statSync(path);
     stamp = `${stats.mtimeMs}:${stats.size}`;
   } catch {
     suppressionCache.delete(path);
-    return new Set();
+    return { stamp: '', set: new Set(), entries: [] };
   }
   const hit = suppressionCache.get(path);
-  if (hit && hit.stamp === stamp) return hit.set;
+  if (hit && hit.stamp === stamp) return hit;
 
-  /** @type {Set<string>} */
-  const set = new Set();
+  /** @type {Map<string, SuppressionEntry>} */
+  const byEmail = new Map();
   for (const line of readFileSync(path, 'utf8').split(/\r?\n/)) {
-    const first = line.split(/[,;\t]/)[0].trim().replace(/^"|"$/g, '').toLowerCase();
-    if (emailRe.test(first)) set.add(first);
+    const entry = parseSuppressionLine(line);
+    if (!entry) continue;
+    const prev = byEmail.get(entry.email);
+    byEmail.set(entry.email, {
+      email: entry.email,
+      reason: entry.reason || prev?.reason || '',
+      added: entry.added || prev?.added || '',
+    });
   }
-  suppressionCache.set(path, { stamp, set });
-  return set;
+  const entries = [...byEmail.values()].sort((a, b) => a.email.localeCompare(b.email));
+  const snapshot = { stamp, set: new Set(entries.map((e) => e.email)), entries };
+  suppressionCache.set(path, snapshot);
+  return snapshot;
+}
+
+/**
+ * @param {string} path
+ * @returns {Set<string>}
+ */
+export function loadSuppressed(path) {
+  return readSuppressionSnapshot(path).set;
+}
+
+/**
+ * Returns suppression rows `{ email, reason, added }` sorted by email, backward compatible with plain files.
+ * @param {string} path
+ * @returns {SuppressionEntry[]}
+ */
+export function loadSuppressionEntries(path) {
+  return readSuppressionSnapshot(path).entries.map((entry) => ({ ...entry }));
 }
 
 /**
@@ -874,7 +921,61 @@ export function addSuppressed(path, emails, reason = 'manual') {
   const rows = added.map((email) => `${email},${label},${at}\n`).join('');
   const lead = !existing ? 'email,reason,added\n' : existing.endsWith('\n') ? '' : '\n';
   appendFileSync(path, lead + rows);
+  suppressionCache.delete(path);
   return { added, already, invalid };
+}
+
+/**
+ * Removes addresses from the suppression file atomically while keeping header and untouched rows intact.
+ * @param {string} path
+ * @param {string[] | string} emails
+ * @returns {{ removed: string[], notFound: string[], invalid: string[] }}
+ */
+export function removeSuppressed(path, emails) {
+  /** @type {string[]} */
+  const targets = [];
+  /** @type {string[]} */
+  const invalid = [];
+  for (const raw of (Array.isArray(emails) ? emails : [emails])) {
+    const trimmed = String(raw ?? '').trim();
+    const email = trimmed.toLowerCase();
+    if (!emailRe.test(email)) invalid.push(trimmed);
+    else if (!targets.includes(email)) targets.push(email);
+  }
+  if (!targets.length || !existsSync(path)) {
+    return { removed: [], notFound: targets, invalid };
+  }
+
+  const wanted = new Set(targets);
+  /** @type {Set<string>} */
+  const removedSet = new Set();
+  const rawText = readFileSync(path, 'utf8').replace(/\r?\n$/, '');
+  /** @type {string[]} */
+  const kept = [];
+  for (const line of rawText.split(/\r?\n/)) {
+    const entry = parseSuppressionLine(line);
+    if (entry && wanted.has(entry.email)) {
+      removedSet.add(entry.email);
+      continue;
+    }
+    kept.push(line);
+  }
+
+  const removed = targets.filter((email) => removedSet.has(email));
+  const notFound = targets.filter((email) => !removedSet.has(email));
+  if (!removed.length) return { removed, notFound, invalid };
+
+  const next = kept.length ? kept.join('\n') + '\n' : '';
+  const staging = `${path}.${process.pid}.tmp`;
+  try {
+    writeFileSync(staging, next);
+    renameSync(staging, path);
+  } catch (err) {
+    rmSync(staging, { force: true });
+    throw err;
+  }
+  suppressionCache.delete(path);
+  return { removed, notFound, invalid };
 }
 
 // ── Rate ceiling ─────────────────────────────────────────────────────

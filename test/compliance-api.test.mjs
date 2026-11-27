@@ -43,12 +43,56 @@ test('POST /api/suppress adds addresses and GET /api/suppression lists them', as
 
   const list = await get(server.base, '/api/suppression');
   assert.deepEqual(list.data.emails, ['bye@example.com', 'gone@example.com', 'new@example.com']);
+  assert.equal(list.data.entries.length, 3);
+  const goneEntry = list.data.entries.find((e) => e.email === 'gone@example.com');
+  assert.equal(goneEntry.reason, 'unsubscribe');
+  assert.match(goneEntry.added, /^\d{4}-\d\d-\d\dT/);
   assert.match(readFileSync(join(server.workDir, 'suppressed.csv'), 'utf8'), /^email,reason,added\ngone@example\.com,unsubscribe,/);
 
   assert.equal((await get(server.base, '/api/state')).data.suppression.count, 3);
   assert.equal((await post(server.base, '/api/suppress', { emails: '  ' })).status, 400);
   assert.equal((await post(server.base, '/api/suppress', { emails: 5 })).status, 400);
   assert.equal((await post(server.base, '/api/suppress', { emails: 'nonsense' })).status, 400);
+});
+
+test('POST /api/unsuppress removes addresses and makes them eligible again', async (t) => {
+  const sink = await startSmtpSink();
+  const server = await startServer({ env: smtpEnv(sink) });
+  t.after(async () => { await server.stop(); await sink.close(); });
+
+  await post(server.base, '/api/suppress', {
+    emails: ['Gone@Example.com', 'stay@example.com'],
+    reason: 'bounce',
+  });
+  const beforeTest = await post(server.base, '/api/test', {
+    csv: CSV, html: TEMPLATE, subject: 'Hi', to: 'gone@example.com',
+  });
+  assert.equal(beforeTest.status, 400);
+
+  const removed = await post(server.base, '/api/unsuppress', { email: 'GONE@example.com' });
+  assert.equal(removed.status, 200);
+  assert.deepEqual(removed.data.removed, ['gone@example.com']);
+  assert.equal(removed.data.count, 1);
+
+  const list = await get(server.base, '/api/suppression');
+  assert.deepEqual(list.data.emails, ['stay@example.com']);
+  assert.deepEqual(list.data.entries.map((e) => [e.email, e.reason]), [['stay@example.com', 'bounce']]);
+  assert.equal((await get(server.base, '/api/state')).data.suppression.count, 1);
+
+  const afterTest = await post(server.base, '/api/test', {
+    csv: CSV, html: TEMPLATE, subject: 'Hi', to: 'gone@example.com',
+  });
+  assert.equal(afterTest.status, 200);
+  assert.equal(afterTest.data.ok, true);
+
+  const missing = await post(server.base, '/api/unsuppress', { emails: ['missing@example.com'] });
+  assert.equal(missing.status, 200);
+  assert.deepEqual(missing.data.removed, []);
+  assert.deepEqual(missing.data.notFound, ['missing@example.com']);
+
+  assert.equal((await post(server.base, '/api/unsuppress', { emails: '   ' })).status, 400);
+  assert.equal((await post(server.base, '/api/unsuppress', { emails: 5 })).status, 400);
+  assert.equal((await post(server.base, '/api/unsuppress', { email: 'not-an-email' })).status, 400);
 });
 
 test('the suppression file is not offered as a recipient list', async (t) => {

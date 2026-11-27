@@ -836,6 +836,9 @@ progress::-moz-progress-bar { background: var(--accent-solid); border-radius: 99
   overflow-wrap: anywhere;
 }
 .plain-list li:first-child { border-top: 0; }
+.suppress__row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; }
+.suppress__info { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
+.suppress__email { font-weight: 500; overflow-wrap: anywhere; }
 
 /* ── Dialog ─────────────────────────────────────────────────────── */
 .dialog {

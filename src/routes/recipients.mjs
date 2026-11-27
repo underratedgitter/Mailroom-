@@ -19,7 +19,7 @@ import {
 } from '../lib/core.mjs';
 import { errMsg } from '../lib/errors.mjs';
 import { unsubscribeLink } from '../lib/mailer.mjs';
-import { assetsDirFor, rel, safePath } from './templates.mjs';
+import { assetsDirFor, realRoot, rel, safePath } from './templates.mjs';
 
 /** @typedef {import('./index.mjs').RouteDef} RouteDef */
 /** @typedef {import('./index.mjs').ServerState} ServerState */
@@ -275,6 +275,21 @@ export const routes = [
         duplicates: parsed.duplicates,
         invalid: parsed.invalid,
       });
+    },
+  },
+  {
+    method: 'POST',
+    path: '/api/csv/delete',
+    handler: async ({ readJson, json, fail, state }) => {
+      const body = await readJson();
+      const rawPath = String(body.path ?? body.csv ?? '').trim();
+      if (!rawPath) return fail(400, 'Missing file path');
+      const csvPath = safePath(rawPath, state, { roots: [state.dataDir], ext: ['.csv'] });
+      if (csvPath === realRoot(state.suppressionPath)) {
+        return fail(400, 'Not allowed: cannot delete the suppression list');
+      }
+      rmSync(csvPath, { force: true });
+      return json(200, { ok: true, deleted: rel(csvPath, state) });
     },
   },
 ];

@@ -259,6 +259,14 @@ export function stopScheduler() {
   if (schedulerTimer) clearInterval(schedulerTimer);
 }
 
+/** @param {unknown} raw @returns {{ at: number } | { error: string }} */
+function parseFutureAt(raw) {
+  const at = Date.parse(String(raw || ''));
+  if (!Number.isFinite(at)) return { error: 'Pick a date and time' };
+  if (at < Date.now() + 1000) return { error: 'Pick a time in the future' };
+  return { at };
+}
+
 /** @type {RouteDef[]} */
 export const routes = [
   {
@@ -282,9 +290,9 @@ export const routes = [
       const issue = smtp.configured ? complianceIssue(smtp) : null;
       if (issue) return fail(400, issue);
 
-      const at = Date.parse(String(body.at || ''));
-      if (!Number.isFinite(at)) return fail(400, 'Pick a date and time');
-      if (at < Date.now() + 1000) return fail(400, 'Pick a time in the future');
+      const parsedAt = parseFutureAt(body.at);
+      if ('error' in parsedAt) return fail(400, parsedAt.error);
+      const at = parsedAt.at;
 
       const list = readSchedule(state);
       const active = list.filter((e) => e.status === 'pending' || e.status === 'sending').length;
@@ -324,8 +332,8 @@ export const routes = [
   },
   {
     method: 'POST',
-    pattern: /^\/api\/schedule\/([\w-]+)\/(cancel|run)$/,
-    handler: ({ match, json, fail, state }) => {
+    pattern: /^\/api\/schedule\/([\w-]+)\/(cancel|run|reschedule)$/,
+    handler: async ({ match, readJson, json, fail, state }) => {
       const list = readSchedule(state);
       const entry = match ? list.find((e) => e.id === match[1]) : null;
       if (!entry || !match) return fail(404, 'Unknown scheduled campaign');
@@ -337,6 +345,21 @@ export const routes = [
         entry.status = 'cancelled';
         writeSchedule(list, state);
         return json(200, { ok: true });
+      }
+
+      if (match[2] === 'reschedule') {
+        if (entry.status !== 'pending' && entry.status !== 'missed') {
+          return fail(409, `Cannot reschedule a campaign that is ${entry.status}`);
+        }
+        const body = await readJson();
+        const parsedAt = parseFutureAt(body.at);
+        if ('error' in parsedAt) return fail(400, parsedAt.error);
+        entry.at = new Date(parsedAt.at).toISOString();
+        entry.status = 'pending';
+        entry.error = null;
+        delete entry.interrupted;
+        writeSchedule(list, state);
+        return json(200, { ok: true, entry: scheduleView(state).find((e) => e.id === entry.id) });
       }
 
       if (entry.status === 'sending') return fail(409, 'That campaign is sending already');

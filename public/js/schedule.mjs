@@ -139,6 +139,7 @@ export function renderQueue() {
       if (e.status === 'pending' || e.status === 'missed') {
         actions.append(
           h('button', { type: 'button', class: 'btn btn--sm', dataset: { action: 'run' } }, 'Send now'),
+          h('button', { type: 'button', class: 'btn btn--sm', dataset: { action: 'reschedule' } }, 'Reschedule'),
           h('button', { type: 'button', class: 'btn btn--sm btn--danger-quiet', dataset: { action: 'cancel' } }, e.status === 'missed' ? 'Discard' : 'Cancel'));
       }
     });
@@ -200,6 +201,41 @@ async function cancelScheduled(id) {
   }
 }
 
+let rescheduleId = null;
+
+function openReschedule(id) {
+  const entry = state.queue.find((e) => e.id === id);
+  if (!entry) return;
+  rescheduleId = id;
+  setText(ui.rescheduleMeta, (entry.campaign || entry.subject) + ' · ' + plural(entry.recipients, 'recipient'));
+  setText(ui.rescheduleStatus, '');
+  const current = Date.parse(entry.at);
+  ui.rescheduleAt.value = toLocalInput(new Date(Number.isFinite(current) && current > Date.now() ? current : Date.now() + 60 * 60 * 1000));
+  ui.rescheduleSave.disabled = false;
+  ui.rescheduleDialog.showModal();
+  ui.rescheduleAt.focus();
+}
+
+async function submitReschedule(event) {
+  event.preventDefault();
+  if (!rescheduleId) return;
+  const when = ui.rescheduleAt.value ? new Date(ui.rescheduleAt.value) : null;
+  if (!when || Number.isNaN(when.getTime())) { setText(ui.rescheduleStatus, 'Pick a date and time.'); return; }
+  ui.rescheduleSave.disabled = true;
+  setText(ui.rescheduleStatus, '');
+  try {
+    await api('/api/schedule/' + rescheduleId + '/reschedule', { at: when.toISOString() });
+    rescheduleId = null;
+    ui.rescheduleDialog.close();
+    toast('Rescheduled for ' + formatWhen(when.toISOString()) + '.', 'ok');
+    await loadQueue();
+  } catch (err) {
+    setText(ui.rescheduleStatus, err.message);
+  } finally {
+    ui.rescheduleSave.disabled = false;
+  }
+}
+
 export function initSchedule() {
   ui.scheduleForm.addEventListener('submit', submitSchedule);
   ui.queueList.addEventListener('click', (event) => {
@@ -207,6 +243,13 @@ export function initSchedule() {
     if (!button) return;
     const id = button.closest('li').dataset.key;
     if (button.dataset.action === 'run') runScheduled(id);
+    else if (button.dataset.action === 'reschedule') openReschedule(id);
     else cancelScheduled(id);
   });
+  ui.rescheduleForm.addEventListener('submit', submitReschedule);
+  ui.rescheduleCancel.addEventListener('click', () => ui.rescheduleDialog.close());
+  ui.rescheduleDialog.addEventListener('click', (event) => {
+    if (event.target === ui.rescheduleDialog) ui.rescheduleDialog.close();
+  });
+  ui.rescheduleDialog.addEventListener('close', () => { rescheduleId = null; });
 }

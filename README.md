@@ -201,8 +201,9 @@ Raj Patel <raj@patel.in>
 ops@example.com	Ops Desk	Example Co
 ```
 
-Invalid and duplicate lines are dropped as you type, and **Save as list** writes
-the list into `data/` for next time. **Upload** checks a CSV before saving it and
+Invalid and duplicate lines are dropped as you type, **Save as list** writes
+the list into `data/` for next time, and saved lists can be removed with
+**Delete**. **Upload** checks a CSV before saving it and
 shows how each column is used: the email column, `name` and `company` (with their
 common aliases), and every other column as a `{{merge field}}` for the subject and
 template. The Compose page flags any `{{field}}` the list cannot fill.
@@ -228,8 +229,8 @@ send continues; reopen it and the page re-attaches.
 
 **Schedule** — the **Schedule** page queues the same campaign for a later date
 and time (in your machine's time zone). The queue lives in `logs/schedule.json`,
-so it survives restarts; the page lists what is waiting, with *Send now* and
-*Cancel* on each entry. The recipient list is snapshotted at the
+so it survives restarts; the page lists what is waiting, with *Send now*,
+*Reschedule*, and *Cancel* on each entry. The recipient list is snapshotted at the
 moment you schedule it. Mailroom must be running when the time arrives — if it
 was down, anything more than 30 minutes late is parked as **missed** in the
 queue rather than going out stale, and you decide what to do with it. If the

@@ -101,6 +101,49 @@ test('a CSV with an unclosed quote is reported to the user, not silently truncat
   assert.match(dry.data.error, /Unclosed quote starting on line 3/);
 });
 
+test('POST /api/csv/delete removes saved CSVs safely and never deletes the suppression file or symlinks', async (t) => {
+  const supName = `sup-protect-${process.pid}.csv`;
+  const supFile = join(ROOT, 'data', supName);
+  const linkName = `link-del-${process.pid}.csv`;
+  const linkPath = join(ROOT, 'data', linkName);
+  const targetFile = join(ROOT, 'data', `real-del-${process.pid}.csv`);
+  const server = await startServer({ env: { SUPPRESSION_FILE: supFile } });
+  t.after(async () => {
+    rmSync(supFile, { force: true });
+    rmSync(linkPath, { force: true });
+    rmSync(targetFile, { force: true });
+    await server.stop();
+  });
+
+  const saved = await post(server.base, '/api/recipients', { text: 'a@example.com,A\n', name: `temp-del-${process.pid}` });
+  assert.equal(saved.status, 201);
+  t.after(() => rmSync(join(ROOT, saved.data.path), { force: true }));
+  assert.equal(existsSync(join(ROOT, saved.data.path)), true);
+
+  const deleted = await post(server.base, '/api/csv/delete', { path: saved.data.path });
+  assert.equal(deleted.status, 200);
+  assert.equal(deleted.data.ok, true);
+  assert.equal(existsSync(join(ROOT, saved.data.path)), false);
+  const state = await get(server.base, '/api/state');
+  assert.equal(state.data.csvs.some((c) => c.path === saved.data.path), false);
+
+  // Refuses deleting missing files, traversal, non-CSV, symlinks, and the suppression file.
+  assert.equal((await post(server.base, '/api/csv/delete', { path: saved.data.path })).status, 400);
+  assert.equal((await post(server.base, '/api/csv/delete', { path: '../package.json' })).status, 400);
+
+  await post(server.base, '/api/suppress', { emails: 'protect@example.com' });
+  const supDel = await post(server.base, '/api/csv/delete', { path: `data/${supName}` });
+  assert.equal(supDel.status, 400);
+  assert.equal(existsSync(supFile), true);
+
+  writeFileSync(targetFile, 'email\na@example.com\n');
+  symlinkSync(targetFile, linkPath);
+  const symDel = await post(server.base, '/api/csv/delete', { path: `data/${linkName}` });
+  assert.equal(symDel.status, 400);
+  assert.equal(existsSync(linkPath), true);
+  assert.equal(existsSync(targetFile), true);
+});
+
 test('template studio creates, reads, saves, uploads/deletes assets, duplicates, deletes, and guards paths', async (t) => {
   const server = await startServer();
   const stem = `studio-test-${process.pid}`;

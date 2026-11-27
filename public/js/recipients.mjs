@@ -1,6 +1,7 @@
 import {
   api,
   baseName,
+  confirmDialog,
   currentLimit,
   debounce,
   h,
@@ -23,6 +24,34 @@ import { renderDraft } from './overview.mjs';
 export function describeCsv() {
   const c = state.csvs.find((x) => x.path === ui.csv.value);
   setText(ui.csvHint, c?.error || '');
+  ui.deleteCsvBtn.disabled = !ui.csv.value;
+}
+
+async function deleteCsv() {
+  const path = ui.csv.value;
+  if (!path) return;
+  const ok = await confirmDialog({
+    title: 'Delete saved list?',
+    body: h('p', {}, baseName(path) + ' will be removed from data/ and cannot be undone.'),
+    confirmLabel: 'Delete list',
+    cancelLabel: 'Keep list',
+    danger: true,
+  });
+  if (!ok) return;
+  ui.deleteCsvBtn.disabled = true;
+  try {
+    await api('/api/csv/delete', { path });
+    if (store.get('csv') === path) store.set('csv', '');
+    ui.csv.value = '';
+    toast('Deleted ' + baseName(path) + '.');
+    await hooks.loadState();
+    await loadRoster();
+    await refreshPreview({ resetIndex: true });
+  } catch (err) {
+    toast(err.message, 'bad');
+  } finally {
+    describeCsv();
+  }
 }
 
 function activeRosterKey() {
@@ -364,6 +393,7 @@ export function initRecipients() {
     refreshPreview({ resetIndex: true });
   }, 500));
   ui.saveCsvBtn.addEventListener('click', savePastedList);
+  ui.deleteCsvBtn.addEventListener('click', deleteCsv);
   ui.limit.addEventListener('input', debounce(() => {
     refreshPreview({ resetIndex: true });
     loadRoster();

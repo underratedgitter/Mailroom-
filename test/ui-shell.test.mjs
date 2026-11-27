@@ -110,6 +110,13 @@ test('the send checklist shows link warnings, and the suppression copy does not 
   assert.match(html, /Unsubscribe requests are not added automatically/);
 });
 
+test('schedule supports rescheduling and saved recipient lists can be deleted cleanly', () => {
+  assert.ok(ids.has('deleteCsvBtn'));
+  assert.ok(ids.has('rescheduleDialog'));
+  assert.match(app, /\/api\/csv\/delete/);
+  assert.match(app, /\/reschedule/);
+});
+
 test('overview exposes campaign reports and sent/failed/unsent CSV export links', () => {
   assert.match(app, /\/api\/campaigns/);
   assert.match(app, /\/export\?/);

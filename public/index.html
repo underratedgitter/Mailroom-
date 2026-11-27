@@ -339,7 +339,10 @@
             <div class="tabpanel" role="tabpanel" id="panelSaved" aria-labelledby="tabSaved">
               <div class="field">
                 <label for="csv">List</label>
-                <select id="csv"></select>
+                <div class="inline-actions">
+                  <select id="csv"></select>
+                  <button type="button" class="btn btn--danger-quiet" id="deleteCsvBtn" disabled>Delete</button>
+                </div>
                 <p class="hint" id="csvHint"></p>
               </div>
               <div class="empty empty--inline" id="csvEmpty" hidden>
@@ -715,6 +718,25 @@
       <button class="btn btn--primary" id="confirmOk" type="button">Confirm</button>
     </div>
   </div>
+</dialog>
+
+<!-- ── Reschedule dialog ────────────────────────────────────────── -->
+<dialog class="dialog" id="rescheduleDialog" aria-labelledby="rescheduleTitle">
+  <form class="dialog__card" id="rescheduleForm" method="dialog" novalidate>
+    <h2 id="rescheduleTitle">Reschedule campaign</h2>
+    <div class="dialog__body">
+      <p class="muted" id="rescheduleMeta"></p>
+      <div class="field">
+        <label for="rescheduleAt">New send time</label>
+        <input id="rescheduleAt" type="datetime-local">
+      </div>
+      <p class="status is-bad" id="rescheduleStatus" role="status"></p>
+    </div>
+    <div class="dialog__actions">
+      <button class="btn" id="rescheduleCancel" type="button">Cancel</button>
+      <button class="btn btn--primary" id="rescheduleSave" type="submit">Save new time</button>
+    </div>
+  </form>
 </dialog>
 
 <!-- ── Template name dialog ──────────────────────────────────── -->

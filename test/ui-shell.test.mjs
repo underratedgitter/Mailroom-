@@ -98,3 +98,10 @@ test('the send checklist shows link warnings, and the suppression copy does not 
   for (const text of [html, app]) assert.doesNotMatch(text, /or that unsubscribe, appear here/);
   assert.match(html, /Unsubscribe requests are not added automatically/);
 });
+
+test('the suppression view displays reason and date and removes addresses via /api/unsuppress', () => {
+  assert.match(app, /\/api\/unsuppress/);
+  assert.match(app, /function renderSuppression[\s\S]*?\.reason/);
+  assert.match(app, /function renderSuppression[\s\S]*?\.added/);
+  assert.match(app, /Remove/);
+});

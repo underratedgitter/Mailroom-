@@ -9,7 +9,9 @@ import {
   runCampaign,
   readLog,
   loadSuppressed,
+  loadSuppressionEntries,
   addSuppressed,
+  removeSuppressed,
   isSuppressed,
   createRateLimiter,
   rateLimitsFromEnv,
@@ -190,6 +192,55 @@ test('a missing suppression file means nobody is suppressed; a hand-edited one s
     addSuppressed(path, ['d@example.com']);
     assert.equal(isSuppressed(path, 'd@example.com'), true);
     assert.equal(isSuppressed(path, 'nonsense'), false);
+
+    // Entries preserve reason and added date when present, and stay blank when absent.
+    const entries = loadSuppressionEntries(path);
+    assert.deepEqual(entries.map((e) => e.email), ['a@example.com', 'b@example.com', 'c@example.com', 'd@example.com']);
+    assert.deepEqual(entries.find((e) => e.email === 'a@example.com'), { email: 'a@example.com', reason: '', added: '' });
+    assert.deepEqual(entries.find((e) => e.email === 'b@example.com'), { email: 'b@example.com', reason: 'bounce', added: '' });
+    assert.deepEqual(entries.find((e) => e.email === 'c@example.com'), { email: 'c@example.com', reason: 'spam', added: '' });
+    assert.equal(entries.find((e) => e.email === 'd@example.com').reason, 'manual');
+    assert.match(entries.find((e) => e.email === 'd@example.com').added, /^\d{4}-\d\d-\d\dT/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('removeSuppressed removes matching addresses, invalidates cache, and preserves comments and remaining rows', () => {
+  const dir = workDir();
+  const path = join(dir, 'suppressed.csv');
+  try {
+    assert.deepEqual(removeSuppressed(path, ['absent@example.com']), {
+      removed: [],
+      notFound: ['absent@example.com'],
+      invalid: [],
+    });
+
+    writeFileSync(path, '# hand comment\n');
+    addSuppressed(path, ['Alpha@Example.com', 'beta@example.com'], 'unsubscribe');
+    addSuppressed(path, ['gamma@example.com'], 'hard-bounce');
+
+    const res = removeSuppressed(path, ['BETA@example.com', 'missing@example.com', 'not-email']);
+    assert.deepEqual(res, {
+      removed: ['beta@example.com'],
+      notFound: ['missing@example.com'],
+      invalid: ['not-email'],
+    });
+    assert.equal(isSuppressed(path, 'beta@example.com'), false);
+    assert.equal(isSuppressed(path, 'alpha@example.com'), true);
+    assert.deepEqual(loadSuppressionEntries(path).map((e) => [e.email, e.reason]), [
+      ['alpha@example.com', 'unsubscribe'],
+      ['gamma@example.com', 'hard-bounce'],
+    ]);
+
+    const raw = readFileSync(path, 'utf8');
+    assert.match(raw, /^# hand comment\nalpha@example\.com,unsubscribe,/);
+    assert.doesNotMatch(raw, /beta@example\.com/);
+
+    // Removed address can be re-suppressed later cleanly.
+    const readded = addSuppressed(path, ['beta@example.com'], 'manual');
+    assert.deepEqual(readded.added, ['beta@example.com']);
+    assert.equal(isSuppressed(path, 'beta@example.com'), true);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

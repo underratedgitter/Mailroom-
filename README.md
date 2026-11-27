@@ -334,11 +334,14 @@ npm run send -- --suppress "gone@example.com, other@example.com"
 curl -X POST http://127.0.0.1:4173/api/suppress \
   -H 'content-type: application/json' \
   -d '{"emails": ["gone@example.com"], "reason": "unsubscribe"}'   # reason is optional
-curl http://127.0.0.1:4173/api/suppression                         # path, count, emails
+curl -X POST http://127.0.0.1:4173/api/unsuppress \
+  -H 'content-type: application/json' \
+  -d '{"email": "gone@example.com"}'
+curl http://127.0.0.1:4173/api/suppression                         # path, count, emails, entries
 ```
 
 (With `MAILROOM_PASSWORD` set, send the session cookie as for any other API
-call.) Delete a line from the file to un-suppress an address.
+call.) You can also remove suppressed addresses in the **Suppression list** view.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |

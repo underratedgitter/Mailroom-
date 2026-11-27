@@ -575,25 +575,55 @@ export const defaultSuppressionPath = (env = process.env) => resolve(env.SUPPRES
 
 const suppressionCache = new Map();
 
-export function loadSuppressed(path) {
+const unquoteField = (value) => String(value ?? '').trim().replace(/^"|"$/g, '').trim();
+
+function parseSuppressionLine(line) {
+  const parts = String(line).split(/[,;\t]/);
+  const email = unquoteField(parts[0]).toLowerCase();
+  if (!emailRe.test(email)) return null;
+  return {
+    email,
+    reason: unquoteField(parts[1]),
+    added: unquoteField(parts[2]),
+  };
+}
+
+function readSuppressionSnapshot(path) {
   let stamp;
   try {
     const stats = statSync(path);
     stamp = `${stats.mtimeMs}:${stats.size}`;
   } catch {
     suppressionCache.delete(path);
-    return new Set();
+    return { set: new Set(), entries: [] };
   }
   const hit = suppressionCache.get(path);
-  if (hit && hit.stamp === stamp) return hit.set;
+  if (hit && hit.stamp === stamp) return hit;
 
-  const set = new Set();
+  const byEmail = new Map();
   for (const line of readFileSync(path, 'utf8').split(/\r?\n/)) {
-    const first = line.split(/[,;\t]/)[0].trim().replace(/^"|"$/g, '').toLowerCase();
-    if (emailRe.test(first)) set.add(first);
+    const entry = parseSuppressionLine(line);
+    if (!entry) continue;
+    const prev = byEmail.get(entry.email);
+    byEmail.set(entry.email, {
+      email: entry.email,
+      reason: entry.reason || prev?.reason || '',
+      added: entry.added || prev?.added || '',
+    });
   }
-  suppressionCache.set(path, { stamp, set });
-  return set;
+  const entries = [...byEmail.values()].sort((a, b) => a.email.localeCompare(b.email));
+  const snapshot = { stamp, set: new Set(entries.map((e) => e.email)), entries };
+  suppressionCache.set(path, snapshot);
+  return snapshot;
+}
+
+export function loadSuppressed(path) {
+  return readSuppressionSnapshot(path).set;
+}
+
+/** Returns suppression rows `{ email, reason, added }` sorted by email, backward compatible with plain files. */
+export function loadSuppressionEntries(path) {
+  return readSuppressionSnapshot(path).entries.map((entry) => ({ ...entry }));
 }
 
 export const isSuppressed = (path, email) => loadSuppressed(path).has(String(email).trim().toLowerCase());
@@ -619,7 +649,52 @@ export function addSuppressed(path, emails, reason = 'manual') {
   const rows = added.map((email) => `${email},${label},${at}\n`).join('');
   const lead = !existing ? 'email,reason,added\n' : existing.endsWith('\n') ? '' : '\n';
   appendFileSync(path, lead + rows);
+  suppressionCache.delete(path);
   return { added, already, invalid };
+}
+
+/** Removes addresses from the suppression file atomically while keeping header and untouched rows intact. */
+export function removeSuppressed(path, emails) {
+  const targets = [];
+  const invalid = [];
+  for (const raw of (Array.isArray(emails) ? emails : [emails])) {
+    const trimmed = String(raw ?? '').trim();
+    const email = trimmed.toLowerCase();
+    if (!emailRe.test(email)) invalid.push(trimmed);
+    else if (!targets.includes(email)) targets.push(email);
+  }
+  if (!targets.length || !existsSync(path)) {
+    return { removed: [], notFound: targets, invalid };
+  }
+
+  const wanted = new Set(targets);
+  const removedSet = new Set();
+  const rawText = readFileSync(path, 'utf8').replace(/\r?\n$/, '');
+  const kept = [];
+  for (const line of rawText.split(/\r?\n/)) {
+    const entry = parseSuppressionLine(line);
+    if (entry && wanted.has(entry.email)) {
+      removedSet.add(entry.email);
+      continue;
+    }
+    kept.push(line);
+  }
+
+  const removed = targets.filter((email) => removedSet.has(email));
+  const notFound = targets.filter((email) => !removedSet.has(email));
+  if (!removed.length) return { removed, notFound, invalid };
+
+  const next = kept.length ? kept.join('\n') + '\n' : '';
+  const staging = `${path}.${process.pid}.tmp`;
+  try {
+    writeFileSync(staging, next);
+    renameSync(staging, path);
+  } catch (err) {
+    rmSync(staging, { force: true });
+    throw err;
+  }
+  suppressionCache.delete(path);
+  return { removed, notFound, invalid };
 }
 
 // ── Rate ceiling ─────────────────────────────────────────────────────

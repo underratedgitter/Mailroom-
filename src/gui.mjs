@@ -22,6 +22,7 @@
  *   POST /api/recipients       save (or dry-run) a pasted list or an uploaded CSV into data/
  *   GET  /api/suppression      the suppression list
  *   POST /api/suppress         add addresses to it
+ *   POST /api/unsuppress       remove addresses from it
  *   GET  /api/schedule         queued campaigns (POST creates one; POST /api/schedule/:id/cancel|run)
  *   POST /api/verify           SMTP connect + auth check
  *   POST /api/test             send one real message to one address
@@ -58,7 +59,9 @@ import {
   defaultLogPath,
   defaultSuppressionPath,
   loadSuppressed,
+  loadSuppressionEntries,
   addSuppressed,
+  removeSuppressed,
   isSuppressed,
   rateLimitsFromEnv,
   sentAddresses,
@@ -1274,22 +1277,42 @@ async function route(req, res) {
   }
 
   // ── Suppression list ──────────────────────────────────────────────
+  const suppressionInput = (raw) => {
+    const list = typeof raw === 'string' ? raw.split(/[\s,;]+/) : raw;
+    if (!Array.isArray(list) || list.some((item) => typeof item !== 'string')) return null;
+    return list.map((item) => item.trim()).filter(Boolean);
+  };
+
   if (req.method === 'GET' && pathname === '/api/suppression') {
-    const emails = [...loadSuppressed(SUPPRESSION_PATH)].sort();
-    return json(res, 200, { path: rel(SUPPRESSION_PATH), count: emails.length, emails });
+    const entries = loadSuppressionEntries(SUPPRESSION_PATH);
+    return json(res, 200, {
+      path: rel(SUPPRESSION_PATH),
+      count: entries.length,
+      emails: entries.map((e) => e.email),
+      entries,
+    });
   }
 
   // Body: { emails: "a@x.com\nb@x.com" | ["a@x.com"], reason?: "unsubscribe" }
   if (req.method === 'POST' && pathname === '/api/suppress') {
     const body = await readJson(req);
-    const list = typeof body.emails === 'string' ? body.emails.split(/[\s,;]+/) : body.emails;
-    if (!Array.isArray(list) || list.some((item) => typeof item !== 'string')) {
-      return fail(res, 400, 'emails must be a string or an array of strings');
-    }
-    const emails = list.map((item) => item.trim()).filter(Boolean);
+    const emails = suppressionInput(body.emails);
+    if (!emails) return fail(res, 400, 'emails must be a string or an array of strings');
     if (!emails.length) return fail(res, 400, 'Give at least one address to suppress');
     const result = addSuppressed(SUPPRESSION_PATH, emails, typeof body.reason === 'string' ? body.reason : 'manual');
     if (!result.added.length && !result.already.length) return fail(res, 400, `Not an email address: ${result.invalid.join(', ')}`);
+    return json(res, 200, { ...result, count: loadSuppressed(SUPPRESSION_PATH).size });
+  }
+
+  // Body: { email: "a@x.com" } | { emails: "a@x.com\nb@x.com" | ["a@x.com"] }
+  if (req.method === 'POST' && pathname === '/api/unsuppress') {
+    const body = await readJson(req);
+    const raw = body.emails !== undefined ? body.emails : body.email;
+    const emails = suppressionInput(raw);
+    if (!emails) return fail(res, 400, 'emails must be a string or an array of strings');
+    if (!emails.length) return fail(res, 400, 'Give at least one address to remove');
+    const result = removeSuppressed(SUPPRESSION_PATH, emails);
+    if (!result.removed.length && !result.notFound.length) return fail(res, 400, `Not an email address: ${result.invalid.join(', ')}`);
     return json(res, 200, { ...result, count: loadSuppressed(SUPPRESSION_PATH).size });
   }
 

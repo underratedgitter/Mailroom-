@@ -487,7 +487,7 @@ Supported SMTP environment variables:
 ## Tests
 
 ```bash
-npm test            # 176 tests: parsing, rendering, resume, retries, scheduling, shutdown, log rotation, config validation, suppression, headers, rate ceiling, CLI, API, auth, TLS, guards
+npm test            # 183 tests: parsing, rendering, resume, retries, scheduling, shutdown, log rotation, config validation, suppression, headers, rate ceiling, CLI, API, template studio, auth, TLS, guards
 npm run check       # parse every JS file in bin/, src/ and public/ without running it
 ```
 
@@ -509,4 +509,7 @@ leaves the machine.
 - Mailroom sends the unsubscribe headers and honours a suppression list, but it
   does not receive unsubscribe requests, late bounces or complaints; you feed them
   in (see above). For large, regulated, or marketing lists use a real ESP.
-- Templates are HTML files on disk, not a visual editor.
+- Templates are edited as raw HTML and inline `cid:` images (PNG, JPG, GIF, or
+  WEBP up to 5 MB) in the Compose **Template studio** tab rather than a
+  drag-and-drop visual designer; bundled templates are read-only (duplicate one
+  to edit a copy).

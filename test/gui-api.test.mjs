@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { CSV, startServer, post } from './helpers/server.mjs';
+import { CSV, startServer, post, get } from './helpers/server.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const TEMPLATE = 'templates/bcci-connect.html';
@@ -99,4 +99,96 @@ test('a CSV with an unclosed quote is reported to the user, not silently truncat
   const dry = await post(server.base, '/api/recipients', { text, format: 'csv', dryRun: true });
   assert.equal(dry.status, 400);
   assert.match(dry.data.error, /Unclosed quote starting on line 3/);
+});
+
+test('template studio creates, reads, saves, uploads/deletes assets, duplicates, deletes, and guards paths', async (t) => {
+  const server = await startServer();
+  const stem = `studio-test-${process.pid}`;
+  const copyStem = `${stem}-copy`;
+  const cleanup = () => {
+    for (const s of [stem, copyStem, `sym-${process.pid}`]) {
+      rmSync(join(ROOT, 'templates', `${s}.html`), { force: true });
+      rmSync(join(ROOT, 'templates', `${s}-assets`), { recursive: true, force: true });
+    }
+    rmSync(join(ROOT, 'templates', `.hidden-${process.pid}.html`), { force: true });
+  };
+  t.after(async () => { cleanup(); await server.stop(); });
+
+  // Read existing bundled template + assets.
+  const bundled = await get(server.base, '/api/templates/read?path=' + encodeURIComponent(TEMPLATE));
+  assert.equal(bundled.status, 200);
+  assert.match(bundled.data.html, /<html/i);
+  assert.ok(bundled.data.assets.length > 0);
+
+  // Create new template.
+  const created = await post(server.base, '/api/templates/save', {
+    name: stem,
+    html: '<p>Hi {{name}} <img src="cid:badge"><a href="{{unsubscribe_url}}">u</a></p>',
+  });
+  assert.equal(created.status, 201);
+  assert.equal(created.data.path, `templates/${stem}.html`);
+
+  // Update existing template HTML.
+  const updated = await post(server.base, '/api/templates/save', {
+    path: created.data.path,
+    html: '<p>Updated {{name}} <img src="cid:badge"><a href="{{unsubscribe_url}}">u</a></p>',
+  });
+  assert.equal(updated.status, 200);
+
+  // Upload valid PNG asset and verify read + preview embed.
+  const pngBytes = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex').toString('base64');
+  const uploaded = await post(server.base, '/api/templates/assets', {
+    template: created.data.path,
+    filename: 'badge.png',
+    dataBase64: `data:image/png;base64,${pngBytes}`,
+  });
+  assert.equal(uploaded.status, 201);
+  assert.equal(uploaded.data.cid, 'badge');
+  assert.equal(uploaded.data.filename, 'badge.png');
+
+  const readBack = await get(server.base, '/api/templates/read?path=' + encodeURIComponent(created.data.path));
+  assert.equal(readBack.status, 200);
+  assert.match(readBack.data.html, /Updated \{\{name\}\}/);
+  assert.equal(readBack.data.assets.length, 1);
+  assert.equal(readBack.data.assets[0].cid, 'badge');
+
+  const preview = await post(server.base, '/api/preview', { csv: CSV, html: created.data.path, subject: 'Hi' });
+  assert.equal(preview.status, 200);
+  assert.equal(preview.data.inline, 1);
+
+  // Duplicate template + its assets; reject duplicate target name with 409.
+  const dup = await post(server.base, '/api/templates/duplicate', { path: created.data.path, name: copyStem });
+  assert.equal(dup.status, 201);
+  assert.equal(dup.data.path, `templates/${copyStem}.html`);
+  assert.equal(existsSync(join(ROOT, 'templates', `${copyStem}-assets`, 'badge.png')), true);
+  assert.equal((await post(server.base, '/api/templates/duplicate', { path: created.data.path, name: copyStem })).status, 409);
+
+  // Delete single asset, then delete templates (removing asset folder too).
+  const rmAsset = await post(server.base, '/api/templates/assets/delete', { template: created.data.path, filename: 'badge.png' });
+  assert.equal(rmAsset.status, 200);
+  assert.equal(existsSync(join(ROOT, 'templates', `${stem}-assets`, 'badge.png')), false);
+
+  assert.equal((await post(server.base, '/api/templates/delete', { path: dup.data.path })).status, 200);
+  assert.equal(existsSync(join(ROOT, 'templates', `${copyStem}.html`)), false);
+  assert.equal(existsSync(join(ROOT, 'templates', `${copyStem}-assets`)), false);
+  assert.equal((await post(server.base, '/api/templates/delete', { path: created.data.path })).status, 200);
+
+  // Reject path traversal, dotfile/dot-segment names, invalid asset extensions, empty HTML, and symlinks.
+  for (const badName of ['.hidden', '../evil', 'bad/name', '..']) {
+    assert.equal((await post(server.base, '/api/templates/save', { name: badName, html: '<p>x</p>' })).status, 400, badName);
+  }
+  assert.equal((await post(server.base, '/api/templates/save', { name: stem, html: '   ' })).status, 400);
+  assert.equal((await post(server.base, '/api/templates/save', { name: stem, html: '<p>x</p>' })).status, 201);
+  assert.equal((await post(server.base, '/api/templates/assets', { template: `templates/${stem}.html`, filename: 'evil.svg', dataBase64: pngBytes })).status, 400);
+  assert.equal((await post(server.base, '/api/templates/assets', { template: `templates/${stem}.html`, filename: '.dot.png', dataBase64: pngBytes })).status, 400);
+  assert.equal((await post(server.base, '/api/templates/assets/delete', { template: `templates/${stem}.html`, filename: '.dot.png' })).status, 400);
+
+  const symPath = join(ROOT, 'templates', `sym-${process.pid}.html`);
+  symlinkSync(join(ROOT, 'package.json'), symPath);
+  assert.equal((await get(server.base, `/api/templates/read?path=templates/sym-${process.pid}.html`)).status, 400);
+  const symAssetsDir = join(ROOT, 'templates', `${stem}-assets`);
+  mkdirSync(join(ROOT, 'templates', `ext-dir-${process.pid}`), { recursive: true });
+  t.after(() => rmSync(join(ROOT, 'templates', `ext-dir-${process.pid}`), { recursive: true, force: true }));
+  symlinkSync(join(ROOT, 'templates', `ext-dir-${process.pid}`), symAssetsDir);
+  assert.equal((await post(server.base, '/api/templates/assets', { template: `templates/${stem}.html`, filename: 'ok.png', dataBase64: pngBytes })).status, 400);
 });

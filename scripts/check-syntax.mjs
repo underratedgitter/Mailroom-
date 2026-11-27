@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 const files = ['bin', 'src', 'public']
-  .flatMap((dir) => readdirSync(join(root, dir), { recursive: true }).map((name) => join(root, dir, name)))
+  .flatMap((dir) => readdirSync(join(root, dir), { encoding: 'utf8', recursive: true }).map((name) => join(root, dir, name)))
   .filter((path) => /\.m?js$/.test(path))
   .sort();
 

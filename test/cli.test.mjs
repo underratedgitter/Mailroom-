@@ -232,3 +232,16 @@ test('--send writes the log where SEND_LOG points, as the browser does', async (
   assert.equal(res.written['logs/sent.jsonl'], null);
   assert.match(res.stdout, /log\s+\S*elsewhere\/campaign\.jsonl/);
 });
+
+test('CLI --send with MAILROOM_PUBLIC_URL emits signed RFC 8058 unsubscribe headers', async (t) => {
+  const sink = await startSmtpSink();
+  t.after(() => sink.close());
+  const res = await runCli([...SEND_ARGS, '--send', '--campaign', 'pub'], {
+    env: { ...smtpEnv(sink), MAILROOM_PUBLIC_URL: 'https://mail.example.org' },
+  });
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  assert.equal(sink.messages.length, 3);
+  const raw = sink.messages[0].data.replace(/\r\n[ \t]+/g, ' ');
+  assert.match(raw, /^List-Unsubscribe: <https:\/\/mail\.example\.org\/unsubscribe\?token=[^>]+>/m);
+  assert.match(raw, /^List-Unsubscribe-Post: List-Unsubscribe=One-Click$/m);
+});

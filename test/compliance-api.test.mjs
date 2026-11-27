@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, rmSync } from 'node:fs';
+import http from 'node:http';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CSV, startServer, post, get, wait } from './helpers/server.mjs';
@@ -43,12 +45,56 @@ test('POST /api/suppress adds addresses and GET /api/suppression lists them', as
 
   const list = await get(server.base, '/api/suppression');
   assert.deepEqual(list.data.emails, ['bye@example.com', 'gone@example.com', 'new@example.com']);
+  assert.equal(list.data.entries.length, 3);
+  const goneEntry = list.data.entries.find((e) => e.email === 'gone@example.com');
+  assert.equal(goneEntry.reason, 'unsubscribe');
+  assert.match(goneEntry.added, /^\d{4}-\d\d-\d\dT/);
   assert.match(readFileSync(join(server.workDir, 'suppressed.csv'), 'utf8'), /^email,reason,added\ngone@example\.com,unsubscribe,/);
 
   assert.equal((await get(server.base, '/api/state')).data.suppression.count, 3);
   assert.equal((await post(server.base, '/api/suppress', { emails: '  ' })).status, 400);
   assert.equal((await post(server.base, '/api/suppress', { emails: 5 })).status, 400);
   assert.equal((await post(server.base, '/api/suppress', { emails: 'nonsense' })).status, 400);
+});
+
+test('POST /api/unsuppress removes addresses and makes them eligible again', async (t) => {
+  const sink = await startSmtpSink();
+  const server = await startServer({ env: smtpEnv(sink) });
+  t.after(async () => { await server.stop(); await sink.close(); });
+
+  await post(server.base, '/api/suppress', {
+    emails: ['Gone@Example.com', 'stay@example.com'],
+    reason: 'bounce',
+  });
+  const beforeTest = await post(server.base, '/api/test', {
+    csv: CSV, html: TEMPLATE, subject: 'Hi', to: 'gone@example.com',
+  });
+  assert.equal(beforeTest.status, 400);
+
+  const removed = await post(server.base, '/api/unsuppress', { email: 'GONE@example.com' });
+  assert.equal(removed.status, 200);
+  assert.deepEqual(removed.data.removed, ['gone@example.com']);
+  assert.equal(removed.data.count, 1);
+
+  const list = await get(server.base, '/api/suppression');
+  assert.deepEqual(list.data.emails, ['stay@example.com']);
+  assert.deepEqual(list.data.entries.map((e) => [e.email, e.reason]), [['stay@example.com', 'bounce']]);
+  assert.equal((await get(server.base, '/api/state')).data.suppression.count, 1);
+
+  const afterTest = await post(server.base, '/api/test', {
+    csv: CSV, html: TEMPLATE, subject: 'Hi', to: 'gone@example.com',
+  });
+  assert.equal(afterTest.status, 200);
+  assert.equal(afterTest.data.ok, true);
+
+  const missing = await post(server.base, '/api/unsuppress', { emails: ['missing@example.com'] });
+  assert.equal(missing.status, 200);
+  assert.deepEqual(missing.data.removed, []);
+  assert.deepEqual(missing.data.notFound, ['missing@example.com']);
+
+  assert.equal((await post(server.base, '/api/unsuppress', { emails: '   ' })).status, 400);
+  assert.equal((await post(server.base, '/api/unsuppress', { emails: 5 })).status, 400);
+  assert.equal((await post(server.base, '/api/unsuppress', { email: 'not-an-email' })).status, 400);
 });
 
 test('the suppression file is not offered as a recipient list', async (t) => {
@@ -131,6 +177,7 @@ test('unusable compliance settings are refused with a clear message before anyth
   for (const [env, pattern] of [
     [{ MAX_PER_HOUR: 'lots' }, /MAX_PER_HOUR must be a whole number/],
     [{ UNSUBSCRIBE_URL: 'http://x.example/u' }, /UNSUBSCRIBE_URL must be an https:\/\/ URL/],
+    [{ MAILROOM_PUBLIC_URL: 'http://x.example' }, /MAILROOM_PUBLIC_URL must be an https:\/\/ URL/],
     [{ EMAIL_FROM: 'desk' }, /EMAIL_FROM must be a full address/],
   ]) {
     const server = await startServer({ env: { ...smtpEnv(sink), ...env } });
@@ -177,4 +224,134 @@ test('a test send carries the unsubscribe link of the test address', async (t) =
   assert.equal(sent.data.ok, true, JSON.stringify(sent.data));
   // The body is quoted-printable, so "=" is "=3D".
   assert.match(sink.messages[0].data, /news\.example\.org\/u\?e=3Dme%40example\.test/);
+});
+
+test('signed /unsubscribe works without login, keeps GET side-effect-free, suppresses on POST, and persists secret', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'mailroom-unsub-'));
+  const sink = await startSmtpSink();
+  const env = { ...smtpEnv(sink), MAILROOM_PUBLIC_URL: 'https://mail.example.org', MAILROOM_PASSWORD: 'secret-pass' };
+  const server = await startServer({ dir, env });
+  t.after(async () => { await sink.close(); await server.stop(); rmSync(dir, { recursive: true, force: true }); });
+
+  const login = await post(server.base, '/api/login', { password: 'secret-pass' });
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+
+  const preview = await post(server.base, '/api/preview', {
+    csv: CSV, html: 'templates/bcci-connect-v2.html', subject: 'Hi',
+  }, { cookie });
+  assert.equal(preview.status, 200);
+  assert.deepEqual(preview.data.warnings, []);
+  const mPrev = preview.data.html.match(/href="https:\/\/mail\.example\.org\/unsubscribe\?token=([^"&]+)"/);
+  assert.ok(mPrev, 'preview must contain signed unsubscribe URL');
+
+  const sent = await post(server.base, '/api/test', {
+    csv: CSV, html: 'templates/bcci-connect-v2.html', subject: 'Hi', to: 'one@example.com',
+  }, { cookie });
+  assert.equal(sent.data.ok, true, JSON.stringify(sent.data));
+  const raw = sink.messages[0].data.replace(/\r\n[ \t]+/g, ' ');
+  assert.match(raw, /^List-Unsubscribe: <https:\/\/mail\.example\.org\/unsubscribe\?token=[^>]+>, <mailto:/m);
+  assert.match(raw, /^List-Unsubscribe-Post: List-Unsubscribe=One-Click$/m);
+
+  const tokenMatch = raw.match(/https:\/\/mail\.example\.org\/unsubscribe\?token=([^>\s]+)/);
+  assert.ok(tokenMatch);
+  const token = decodeURIComponent(tokenMatch[1]);
+
+  // GET /unsubscribe without login renders a confirmation form with no side effect (scanner-safe).
+  const page = await get(server.base, `/unsubscribe?token=${encodeURIComponent(token)}`);
+  assert.equal(page.status, 200);
+  assert.match(page.headers.get('content-type'), /^text\/html/);
+  assert.equal(page.headers.get('cache-control'), 'no-store');
+  assert.match(page.data, /<form\b[^>]*method="POST"/i);
+  assert.match(page.data, /one@example\.com/);
+  assert.equal((await get(server.base, '/api/suppression', { cookie })).data.count, 0);
+
+  // Tampered or missing token is rejected on both GET and POST without modifying suppressions.
+  assert.equal((await get(server.base, '/unsubscribe?token=bad.token')).status, 400);
+  const badPost = await fetch(`${server.base}/unsubscribe?token=bad.token`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: 'List-Unsubscribe=One-Click',
+  });
+  assert.equal(badPost.status, 400);
+  assert.equal((await get(server.base, '/api/suppression', { cookie })).data.count, 0);
+
+  // Cross-site forged POST is rejected even with a valid token.
+  const csrfPost = await fetch(`${server.base}/unsubscribe?token=${encodeURIComponent(token)}`, {
+    method: 'POST',
+    headers: { origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' },
+    body: 'List-Unsubscribe=One-Click',
+  });
+  assert.equal(csrfPost.status, 403);
+  assert.equal((await get(server.base, '/api/suppression', { cookie })).data.count, 0);
+
+  // RFC 8058 one-click POST without login adds the recipient to suppressed.csv.
+  const oneClick = await fetch(`${server.base}/unsubscribe?token=${encodeURIComponent(token)}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: 'List-Unsubscribe=One-Click',
+  });
+  assert.equal(oneClick.status, 200);
+  assert.match(readFileSync(join(dir, 'suppressed.csv'), 'utf8'), /^one@example\.com,unsubscribe,/m);
+
+  // Form POST via token in body works across a server restart (secret persisted).
+  await server.stop({ keepData: true });
+  const restarted = await startServer({ dir, env });
+  t.after(() => restarted.stop());
+
+  const rawHttp = (port, { method = 'GET', path, headers = {}, body = null }) => new Promise((done, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, path, method, headers }, (res) => {
+      res.resume();
+      res.on('end', () => done({ status: res.statusCode, headers: res.headers }));
+    });
+    req.on('error', reject);
+    req.end(body);
+  });
+
+  const tokPreview = decodeURIComponent(mPrev[1]);
+  const formBody = new URLSearchParams({ token: tokPreview }).toString();
+  const formRes = await rawHttp(restarted.port, {
+    method: 'POST',
+    path: '/unsubscribe',
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+      'content-length': Buffer.byteLength(formBody),
+      host: 'mail.example.org',
+      origin: 'https://mail.example.org',
+    },
+    body: formBody,
+  });
+  assert.equal(formRes.status, 200);
+  assert.match(readFileSync(join(dir, 'suppressed.csv'), 'utf8'), /^director@example\.com,unsubscribe,/m);
+  // Reverse-proxy Host header for /unsubscribe still keeps /api/* restricted.
+  assert.equal((await rawHttp(restarted.port, { path: '/api/state', headers: { host: 'mail.example.org' } })).status, 403);
+});
+
+test('signed /unsubscribe works when MAILROOM_PUBLIC_URL includes a subpath', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'mailroom-unsub-subpath-'));
+  const sink = await startSmtpSink();
+  const env = { ...smtpEnv(sink), MAILROOM_PUBLIC_URL: 'https://mail.example.org/mailroom', MAILROOM_PASSWORD: 'secret-pass' };
+  const server = await startServer({ dir, env });
+  t.after(async () => { await sink.close(); await server.stop(); rmSync(dir, { recursive: true, force: true }); });
+
+  const login = await post(server.base, '/api/login', { password: 'secret-pass' });
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+
+  const preview = await post(server.base, '/api/preview', {
+    csv: CSV, html: 'templates/bcci-connect-v2.html', subject: 'Hi',
+  }, { cookie });
+  const m = preview.data.html.match(/href="https:\/\/mail\.example\.org\/mailroom\/unsubscribe\?token=([^"&]+)"/);
+  assert.ok(m, 'preview must include subpath unsubscribe URL');
+  const token = decodeURIComponent(m[1]);
+
+  const page = await get(server.base, `/mailroom/unsubscribe?token=${encodeURIComponent(token)}`);
+  assert.equal(page.status, 200);
+  assert.match(page.data, /<form\b[^>]*action="\/mailroom\/unsubscribe"/i);
+
+  const subRes = await fetch(`${server.base}/mailroom/unsubscribe`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ token }).toString(),
+  });
+  assert.equal(subRes.status, 200);
+  assert.match(readFileSync(join(dir, 'suppressed.csv'), 'utf8'), /^director@example\.com,unsubscribe,/m);
 });

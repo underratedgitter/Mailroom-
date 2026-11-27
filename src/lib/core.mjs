@@ -5,15 +5,72 @@
 // drift apart. Anything fatal is thrown as an Error; the callers decide
 // whether that means a non-zero exit or an HTTP 400.
 
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync, readdirSync, statSync, realpathSync, renameSync, rmSync, linkSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, chmodSync, existsSync, readdirSync, statSync, realpathSync, renameSync, rmSync, linkSync } from 'node:fs';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import nodemailer from 'nodemailer';
 import { resolveSmtpConfig, bulkFields, addressDomain, unsubscribeLink } from './mailer.mjs';
+import { errMsg, errCode } from './errors.mjs';
+
+/** @typedef {import('./mailer.mjs').SmtpConfig} SmtpConfig */
+/** @typedef {Record<string, string> & { _email: string, _name: string, _company: string }} Recipient */
+/** @typedef {{ name: string, role: 'email' | 'name' | 'company' | 'field' }} ColumnRole */
+/** @typedef {{ recipients: Recipient[], total: number, invalid: number, duplicates: number, truncated: number, columns: string[] }} ParsedRecipients */
+/** @typedef {{ code: string, message: string }} LinkWarning */
+/** @typedef {{ filename: string, path: string, cid: string }} InlineAttachment */
+/** @typedef {{ email: string, status: string, campaign?: string | null, reason?: string, messageId?: string | null, error?: string, responseCode?: number, at: string }} SendLogEntry */
+/** @typedef {{ email: string, reason: string, added: string }} SuppressionEntry */
+/** @typedef {{ id: string, sent: number, skipped: number, failed: number, uncertain: number, last: string | null, lastError: string | null }} CampaignSummary */
+/** @typedef {{ perHour: number, perDomainPerHour: number }} RateLimits */
+/** @typedef {{ at: number | string, domain: string }} RateHistoryEntry */
+/** @typedef {{ at: number, domain: string }} RateSample */
+/** @typedef {{ email: string, error: string }} FailedRecipient */
+/** @typedef {{ success: true, messageId: string, inline: number } | { success: false, error: string, code?: string, command?: string, response?: string, responseCode?: number, uncertain: boolean }} SendResult */
+/** @typedef {{ error?: string, code?: string, command?: string, response?: string, responseCode?: number }} FailureLike */
+/** @typedef {{ cfg: SmtpConfig, getTransport: () => import('nodemailer').Transporter, verify: () => Promise<{ ok: boolean, error?: string }>, send: (opts: { to: string, name?: string, subject: string, html: string, assetsDir: string | null | undefined }) => Promise<SendResult>, close: () => void }} Mailer */
+/** @typedef {{ sent: number, failed: number, skipped: number, suppressed: number, failures: FailedRecipient[], uncertain: FailedRecipient[], stopped: boolean, total: number, remaining: number, logPath: string | null }} CampaignRunSummary */
+/** @typedef {{ type: 'progress', index: number, total: number, status: 'sent' | 'skip' | 'failed' | 'uncertain', email: string, error?: string, reason?: string } | { type: 'throttle', email: string, waitMs: number, scope: string | null } | { type: 'fatal', email: string, error: string } | { type: 'done', summary: CampaignRunSummary }} CampaignEvent */
+/**
+ * @typedef {{
+ *   recipients: Recipient[],
+ *   templateHtml: string,
+ *   subjectTemplate: string,
+ *   assetsDir: string | null | undefined,
+ *   campaignId?: string,
+ *   alreadySent?: Set<string>,
+ *   suppressionPath?: string,
+ *   limits?: RateLimits,
+ *   delayMs?: number,
+ *   mailer: Mailer,
+ *   logPath?: string | null,
+ *   onEvent?: (event: CampaignEvent) => void,
+ *   shouldStop?: () => boolean,
+ *   retryDelay?: number,
+ * }} RunCampaignOptions
+ */
+
+/**
+ * @param {unknown} err
+ * @returns {{ error: string, code?: string, command?: string, response?: string, responseCode?: number }}
+ */
+function smtpErrFields(err) {
+  const obj = err && typeof err === 'object' ? /** @type {Record<string, unknown>} */ (err) : {};
+  return {
+    error: errMsg(err),
+    code: typeof obj.code === 'string' ? obj.code : undefined,
+    command: typeof obj.command === 'string' ? obj.command : undefined,
+    response: typeof obj.response === 'string' ? obj.response : undefined,
+    responseCode: typeof obj.responseCode === 'number' ? obj.responseCode : undefined,
+  };
+}
 
 // ── CSV ──────────────────────────────────────────────────────────────
-/** Minimal CSV parser: quoted fields, embedded commas, CRLF, BOM. */
+/**
+ * Minimal CSV parser: quoted fields, embedded commas, CRLF, BOM.
+ * @param {string} raw
+ * @returns {Record<string, string>[]}
+ */
 export function parseCsv(raw) {
   const text = String(raw).replace(/^\uFEFF/, '');
   const delimiter = text.includes('\t') && !text.includes(',')
@@ -22,7 +79,9 @@ export function parseCsv(raw) {
       ? ';'
       : ',';
 
+  /** @type {string[][]} */
   const rows = [];
+  /** @type {string[]} */
   let row = [];
   let field = '';
   let quoted = false;
@@ -58,6 +117,7 @@ export function parseCsv(raw) {
 
   const headers = rows[0].map((h) => h.trim().toLowerCase());
   return rows.slice(1).map((cells) => {
+    /** @type {Record<string, string>} */
     const rec = {};
     headers.forEach((h, i) => { rec[h] = (cells[i] ?? '').trim(); });
     return rec;
@@ -68,6 +128,11 @@ const EMAIL_KEYS = ['email', 'e-mail', 'email address', 'email_address', 'mail',
 const NAME_KEYS = ['name', 'repname', 'representative', 'contact', 'contact name', 'full name'];
 const COMPANY_KEYS = ['company', 'organisation', 'organization', 'firm'];
 
+/**
+ * @param {Record<string, string>} rec
+ * @param {string[]} keys
+ * @returns {string}
+ */
 function pick(rec, keys) {
   for (const k of keys) if (rec[k]) return rec[k];
   return '';
@@ -77,17 +142,29 @@ function pick(rec, keys) {
 // display-name brackets, quoting and comments) are refused outright.
 export const emailRe = /^[^\s@,;:<>()[\]"\\]+@[^\s@,;:<>()[\]"\\]+\.[^\s@,;:<>()[\]"\\]+$/;
 
-/** What each header of a CSV does: the address, the name/company the template aliases, or a plain {{merge field}}. */
+/**
+ * What each header of a CSV does: the address, the name/company the template aliases, or a plain {{merge field}}.
+ * @param {string[]} columns
+ * @returns {ColumnRole[]}
+ */
 export function columnRoles(columns) {
+  /** @param {string} name @returns {'email' | 'name' | 'company' | 'field'} */
   const roleOf = (name) => (EMAIL_KEYS.includes(name) ? 'email'
     : NAME_KEYS.includes(name) ? 'name'
       : COMPANY_KEYS.includes(name) ? 'company' : 'field');
   return columns.map((name) => ({ name, role: roleOf(name) }));
 }
 
-/** Validates, de-duplicates and limits a list of `{_email,_name,_company}` records. */
+/**
+ * Validates, de-duplicates and limits a list of `{_email,_name,_company}` records.
+ * @param {Recipient[]} records
+ * @param {number} limit
+ * @returns {{ recipients: Recipient[], total: number, invalid: number, duplicates: number, truncated: number }}
+ */
 function finishRecords(records, limit) {
+  /** @type {Set<string>} */
   const seen = new Set();
+  /** @type {Recipient[]} */
   const recipients = [];
   let invalid = 0;
   let duplicates = 0;
@@ -113,9 +190,13 @@ function finishRecords(records, limit) {
 /**
  * Rows → valid, de-duplicated recipients with the `_email` / `_name` /
  * `_company` aliases the template uses.
+ * @param {string} raw
+ * @param {{ limit?: number }} [options]
+ * @returns {ParsedRecipients}
  */
 export function parseRecipients(raw, { limit = Infinity } = {}) {
   const rows = parseCsv(raw);
+  /** @type {Recipient[]} */
   const records = rows.map((row) => ({
     ...row,
     _email: restore(pick(row, EMAIL_KEYS)),
@@ -132,8 +213,12 @@ export function parseRecipients(raw, { limit = Infinity } = {}) {
  *   Priya Shah <priya@example.com>
  *   priya@example.com\tPriya Shah\tSunrise Chemicals
  * `#` starts a comment line.
+ * @param {string} text
+ * @param {{ limit?: number }} [options]
+ * @returns {ParsedRecipients}
  */
 export function parseRecipientsText(text, { limit = Infinity } = {}) {
+  /** @type {Recipient[]} */
   const records = [];
   for (const rawLine of String(text ?? '').split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -159,6 +244,11 @@ export function parseRecipientsText(text, { limit = Infinity } = {}) {
   return { ...finishRecords(records, limit), columns: ['email', 'name', 'company'] };
 }
 
+/**
+ * @param {string} csvPath
+ * @param {{ limit?: number }} [options]
+ * @returns {ParsedRecipients}
+ */
 export function recipientsFromFile(csvPath, options = {}) {
   return parseRecipients(readFileSync(csvPath, 'utf8'), options);
 }
@@ -167,18 +257,25 @@ export function recipientsFromFile(csvPath, options = {}) {
 // a spreadsheet. The saved list marks such cells with a leading apostrophe,
 // which spreadsheets show as plain text, and reading the list takes it off.
 const FORMULA_START = /^[=+\-@\t\r]/;
+/** @param {string} value */
 const neutralise = (value) => {
   const text = String(value ?? '');
   return FORMULA_START.test(text) ? `'${text}` : text;
 };
+/** @param {string} value */
 const restore = (value) => (/^'[=+\-@\t\r]/.test(value) ? value.slice(1) : value);
 
+/** @param {unknown} value */
 const csvCell = (value) => {
-  const text = neutralise(value);
+  const text = neutralise(String(value ?? ''));
   return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 };
 
-/** Writes recipients back out as a CSV the sender (and Excel) can read. */
+/**
+ * Writes recipients back out as a CSV the sender (and Excel) can read.
+ * @param {Recipient[]} recipients
+ * @returns {string}
+ */
 export function recipientsToCsv(recipients) {
   const lines = ['email,name,company'];
   for (const rec of recipients) {
@@ -187,7 +284,12 @@ export function recipientsToCsv(recipients) {
   return `${lines.join('\n')}\n`;
 }
 
-/** Formats arbitrary rows and `{ key, label }` specs as RFC 4180 CSV with formula neutralisation. */
+/**
+ * Formats arbitrary rows and `{ key, label }` specs as RFC 4180 CSV with formula neutralisation.
+ * @param {Record<string, unknown>[]} rows
+ * @param {Array<{ key: string, label: string }>} columns
+ * @returns {string}
+ */
 export function formatReportCsv(rows, columns) {
   const header = columns.map((c) => csvCell(c.label)).join(',');
   const body = rows.map((row) => columns.map((c) => csvCell(row[c.key])).join(','));
@@ -195,17 +297,30 @@ export function formatReportCsv(rows, columns) {
 }
 
 // ── Rendering ────────────────────────────────────────────────────────
+/**
+ * @param {string} s
+ * @returns {string}
+ */
 export const escapeHtml = (s) => String(s)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
   .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
-/** A recipient's own column; `{{constructor}}` must not reach Object.prototype. */
+/**
+ * A recipient's own column; `{{constructor}}` must not reach Object.prototype.
+ * @param {Recipient} rec
+ * @param {string} key
+ * @returns {string}
+ */
 const field = (rec, key) => (Object.hasOwn(rec, key) ? String(rec[key] ?? '') : '');
 
 /**
  * `{{column}}` substitution for HTML bodies, escaped so a name cannot inject
  * markup. `{{unsubscribe_url}}` is built from the SMTP settings `cfg` (the
  * same link the List-Unsubscribe header carries) and is empty without them.
+ * @param {string} tpl
+ * @param {Recipient} rec
+ * @param {SmtpConfig | null} [cfg]
+ * @returns {string}
  */
 export const render = (tpl, rec, cfg = null) => String(tpl).replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (_, key) => {
   const k = key.toLowerCase();
@@ -222,6 +337,9 @@ export const render = (tpl, rec, cfg = null) => String(tpl).replace(/\{\{\s*([\w
  * A subject is a plain-text header, not HTML: escaping it would deliver
  * `Shah &amp; Sons` and `O&#39;Brien` to every recipient. Newlines are
  * flattened because a line break in a header is an injection primitive.
+ * @param {string} tpl
+ * @param {Recipient} rec
+ * @returns {string}
  */
 export const renderSubject = (tpl, rec) => String(tpl).replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (_, key) => {
   const k = key.toLowerCase();
@@ -231,18 +349,27 @@ export const renderSubject = (tpl, rec) => String(tpl).replace(/\{\{\s*([\w.-]+)
   return field(rec, k);
 }).replace(/[\r\n]+/g, ' ').trim();
 
-/** Every `{{column}}` the template actually uses, in first-seen order. */
+/**
+ * Every `{{column}}` the template actually uses, in first-seen order.
+ * @param {string} tpl
+ * @returns {string[]}
+ */
 export function templateVariables(tpl) {
   return [...new Set([...String(tpl).matchAll(/\{\{\s*([\w.-]+)\s*\}\}/g)].map((m) => m[1]))];
 }
 
+/** @type {Record<string, string>} */
 const NAMED_ENTITIES = {
   amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', copy: '\u00A9', reg: '\u00AE', trade: '\u2122',
   ndash: '\u2013', mdash: '\u2014', hellip: '\u2026', lsquo: '\u2018', rsquo: '\u2019', ldquo: '\u201C',
   rdquo: '\u201D', bull: '\u2022', middot: '\u00B7', euro: '\u20AC', pound: '\u00A3', rupee: '\u20B9',
 };
 
-/** One pass, so an escaped `&amp;lt;` becomes `&lt;` and not `<`. */
+/**
+ * One pass, so an escaped `&amp;lt;` becomes `&lt;` and not `<`.
+ * @param {string} text
+ * @returns {string}
+ */
 function decodeEntities(text) {
   return text.replace(/&(?:#(\d+)|#x([\da-f]+)|([a-z]+));/gi, (match, dec, hex, name) => {
     const code = dec !== undefined ? Number(dec) : hex !== undefined ? parseInt(hex, 16) : null;
@@ -256,6 +383,9 @@ function decodeEntities(text) {
  * go nowhere (`href="#…"`, empty), relative links that only make sense on a
  * website, and no unsubscribe link at all. `unsubscribe` is this message's own
  * unsubscribe link, for a hosted URL that does not say "unsubscribe".
+ * @param {string} html
+ * @param {{ unsubscribe?: string }} [options]
+ * @returns {LinkWarning[]}
  */
 export function linkWarnings(html, { unsubscribe = '' } = {}) {
   const hrefs = [...String(html).matchAll(/<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')/gi)]
@@ -264,7 +394,9 @@ export function linkWarnings(html, { unsubscribe = '' } = {}) {
   const relative = hrefs.filter((href) => href !== '' && !href.startsWith('#') && !/^[a-z][a-z0-9+.-]*:/i.test(href));
   const hasUnsubscribe = hrefs.some((href) => (unsubscribe && href === unsubscribe) || /unsubscri|opt[-_ ]?out/i.test(href));
 
+  /** @param {string[]} list */
   const shown = (list) => list.slice(0, 2).map((href) => `“${href || '(empty)'}”`).join(', ');
+  /** @type {LinkWarning[]} */
   const warnings = [];
   if (placeholders.length) {
     warnings.push({ code: 'placeholder-link', message: `${placeholders.length} link(s) go nowhere in an inbox (${shown(placeholders)}).` });
@@ -282,8 +414,11 @@ export function linkWarnings(html, { unsubscribe = '' } = {}) {
  * Plain-text alternative for an HTML body. Mail with no text part is a spam
  * signal and unreadable in text-only clients; links keep their address so the
  * text part is still usable.
+ * @param {string} html
+ * @returns {string}
  */
 export function htmlToText(html) {
+  /** @param {string} s */
   const stripTags = (s) => s.replace(/<[^>]*>/g, '');
   const text = String(html)
     .replace(/<!--[\s\S]*?-->/g, '')
@@ -317,8 +452,14 @@ export function htmlToText(html) {
 // Keyed by directory and invalidated on mtime, so renaming or adding an image
 // while the server is running takes effect on the next send instead of
 // silently attaching nothing.
+/** @type {Map<string, { stamp: number, files: string[] }>} */
 const assetCache = new Map();
 
+/**
+ * @param {string} root
+ * @param {string} path
+ * @returns {boolean}
+ */
 function staysInside(root, path) {
   try {
     return realpathSync(path).startsWith(root + sep);
@@ -327,6 +468,10 @@ function staysInside(root, path) {
   }
 }
 
+/**
+ * @param {string | null | undefined} dir
+ * @returns {string[]}
+ */
 export function assetFiles(dir) {
   if (!dir || !existsSync(dir)) return [];
   let stamp;
@@ -344,21 +489,33 @@ export function assetFiles(dir) {
   return files;
 }
 
+/**
+ * @param {string} html
+ * @param {string | null | undefined} dir
+ * @returns {InlineAttachment[]}
+ */
 export function attachmentsFor(html, dir) {
   const files = assetFiles(dir);
   if (!files.length) return [];
   const cids = [...new Set([...String(html).matchAll(/cid:([^"'\s>)]+)/g)].map((m) => m[1]))];
-  return cids
-    .map((cid) => {
-      const file = files.find((name) => name.replace(/\.[^.]+$/, '') === cid);
-      return file ? { filename: file, path: `${dir}/${file}`, cid } : null;
-    })
-    .filter(Boolean);
+  /** @type {InlineAttachment[]} */
+  const list = [];
+  for (const cid of cids) {
+    const file = files.find((name) => name.replace(/\.[^.]+$/, '') === cid);
+    if (file) list.push({ filename: file, path: `${dir}/${file}`, cid });
+  }
+  return list;
 }
 
+/** @type {Record<string, string>} */
 const MIME = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml' };
 
-/** Preview-only: swap `cid:` refs for data URIs so a browser iframe can show them. */
+/**
+ * Preview-only: swap `cid:` refs for data URIs so a browser iframe can show them.
+ * @param {string} html
+ * @param {string | null | undefined} dir
+ * @returns {string}
+ */
 export function inlineForPreview(html, dir) {
   const files = assetFiles(dir);
   if (!files.length) return String(html);
@@ -378,8 +535,18 @@ export function inlineForPreview(html, dir) {
 const DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024;
 const DEFAULT_LOG_KEEP = 5;
 
-/** Rotation limits from SEND_LOG_MAX_BYTES (0 disables rotation) and SEND_LOG_KEEP. */
+/**
+ * Rotation limits from SEND_LOG_MAX_BYTES (0 disables rotation) and SEND_LOG_KEEP.
+ * @param {Record<string, string | undefined>} [env]
+ * @returns {{ maxBytes: number, keep: number }}
+ */
 export function logLimits(env = process.env) {
+  /**
+   * @param {string | undefined} text
+   * @param {number} fallback
+   * @param {number} min
+   * @returns {number}
+   */
   const whole = (text, fallback, min) => (/^\d+$/.test(String(text ?? '').trim()) && Number(text) >= min ? Number(text) : fallback);
   return {
     maxBytes: whole(env.SEND_LOG_MAX_BYTES, DEFAULT_LOG_MAX_BYTES, 0),
@@ -387,9 +554,14 @@ export function logLimits(env = process.env) {
   };
 }
 
-/** Archives of a log as `{ n, path }`, oldest (highest n) first. */
+/**
+ * Archives of a log as `{ n, path }`, oldest (highest n) first.
+ * @param {string} logPath
+ * @returns {{ n: number, path: string }[]}
+ */
 export function logArchives(logPath) {
   const prefix = `${basename(logPath)}.`;
+  /** @type {string[]} */
   let names;
   try {
     names = readdirSync(dirname(logPath));
@@ -402,6 +574,10 @@ export function logArchives(logPath) {
     .sort((a, b) => b.n - a.n);
 }
 
+/**
+ * @param {string} path
+ * @param {SendLogEntry[]} entries
+ */
 function parseLogFile(path, entries) {
   for (const line of readFileSync(path, 'utf8').split('\n')) {
     if (!line.trim()) continue;
@@ -409,14 +585,23 @@ function parseLogFile(path, entries) {
   }
 }
 
-/** Every entry, oldest first, across the live file and its archives. */
+/**
+ * Every entry, oldest first, across the live file and its archives.
+ * @param {string} logPath
+ * @returns {SendLogEntry[]}
+ */
 export function readLog(logPath) {
+  /** @type {SendLogEntry[]} */
   const entries = [];
   for (const { path } of logArchives(logPath)) parseLogFile(path, entries);
   if (existsSync(logPath)) parseLogFile(logPath, entries);
   return entries;
 }
 
+/**
+ * @param {string} logPath
+ * @param {number} keep
+ */
 function rotateLog(logPath, keep) {
   for (const { n, path } of logArchives(logPath)) {
     if (n >= keep) rmSync(path, { force: true });
@@ -428,9 +613,13 @@ function rotateLog(logPath, keep) {
 /**
  * Addresses already sent for this campaign. A campaign is the unit of
  * resumability; without one, any prior send to the address counts.
+ * @param {SendLogEntry[]} entries
+ * @param {string} [campaignId]
+ * @returns {Set<string>}
  */
 export function sentAddresses(entries, campaignId = '') {
   const id = String(campaignId || '').trim();
+  /** @type {Set<string>} */
   const set = new Set();
   for (const entry of entries) {
     if (entry.status !== 'sent') continue;
@@ -440,9 +629,15 @@ export function sentAddresses(entries, campaignId = '') {
   return set;
 }
 
-/** Addresses whose last attempt ended with an unknown outcome; they are not mailed again. */
+/**
+ * Addresses whose last attempt ended with an unknown outcome; they are not mailed again.
+ * @param {SendLogEntry[]} entries
+ * @param {string} [campaignId]
+ * @returns {Set<string>}
+ */
 export function uncertainAddresses(entries, campaignId = '') {
   const id = String(campaignId || '').trim();
+  /** @type {Set<string>} */
   const set = new Set();
   for (const entry of entries) {
     if (entry.status !== 'uncertain') continue;
@@ -452,17 +647,30 @@ export function uncertainAddresses(entries, campaignId = '') {
   return set;
 }
 
-/** How many of these recipients are already in `alreadySent`; the set also holds addresses of other lists. */
+/**
+ * How many of these recipients are already in `alreadySent`; the set also holds addresses of other lists.
+ * @param {Recipient[]} recipients
+ * @param {Set<string>} alreadySent
+ * @returns {number}
+ */
 export function countAlreadySent(recipients, alreadySent) {
   return recipients.filter((rec) => alreadySent.has(rec._email.toLowerCase())).length;
 }
 
+/**
+ * @param {SendLogEntry[]} entries
+ * @returns {CampaignSummary[]}
+ */
 export function campaignSummaries(entries) {
+  /** @type {Map<string, CampaignSummary>} */
   const byId = new Map();
   for (const entry of entries) {
     const id = entry.campaign || '(untagged)';
-    if (!byId.has(id)) byId.set(id, { id, sent: 0, skipped: 0, failed: 0, uncertain: 0, last: null, lastError: null });
-    const c = byId.get(id);
+    let c = byId.get(id);
+    if (!c) {
+      c = { id, sent: 0, skipped: 0, failed: 0, uncertain: 0, last: null, lastError: null };
+      byId.set(id, c);
+    }
     if (entry.status === 'sent') c.sent++;
     else if (entry.status === 'skipped') c.skipped++;
     else if (entry.status === 'uncertain') c.uncertain++;
@@ -478,15 +686,21 @@ export function campaignSummaries(entries) {
 /**
  * Resolves the latest outcome per address for `campaignId` into `{ sent, failed, unsent }`.
  * `unsent` lists addresses in `allRecipients` not yet sent/uncertain and not suppressed.
+ * @param {SendLogEntry[]} entries
+ * @param {Recipient[]} [allRecipients]
+ * @param {string} [campaignId]
+ * @param {Set<string>} [suppressed]
  */
 export function campaignDeliveryLists(entries, allRecipients = [], campaignId = '', suppressed = new Set()) {
   const target = String(campaignId || '').trim();
+  /** @type {Map<string, Recipient>} */
   const metaByEmail = new Map();
   for (const rec of allRecipients) {
     const key = String(rec._email || '').toLowerCase();
     if (key && !metaByEmail.has(key)) metaByEmail.set(key, rec);
   }
 
+  /** @type {Map<string, SendLogEntry>} */
   const latest = new Map();
   for (const entry of entries) {
     if (entry.status !== 'sent' && entry.status !== 'failed' && entry.status !== 'uncertain') continue;
@@ -506,9 +720,13 @@ export function campaignDeliveryLists(entries, allRecipients = [], campaignId = 
     }
   }
 
+  /** @type {Array<{ email: string, name: string, company: string, responseCode: number | string, error: string, at: string }>} */
   const sent = [];
+  /** @type {Array<{ email: string, name: string, company: string, responseCode: number | string, error: string, at: string }>} */
   const failed = [];
+  /** @type {Set<string>} */
   const sentSet = new Set();
+  /** @type {Set<string>} */
   const uncertainSet = new Set();
 
   for (const [key, entry] of latest) {
@@ -538,13 +756,18 @@ export function campaignDeliveryLists(entries, allRecipients = [], campaignId = 
   return { sent, failed, unsent };
 }
 
+/**
+ * @param {string} logPath
+ * @param {SendLogEntry} entry
+ * @param {{ maxBytes: number, keep: number }} [limits]
+ */
 export function appendLog(logPath, entry, { maxBytes, keep } = logLimits()) {
   try {
     if (maxBytes > 0 && existsSync(logPath) && statSync(logPath).size >= maxBytes) rotateLog(logPath, keep);
     appendFileSync(logPath, `${JSON.stringify(entry)}\n`);
   } catch (err) {
     // Mailing on without a record would send duplicates after a resume.
-    throw new Error(`Cannot write the send log ${logPath}: ${err.message}. Stopped so nobody is mailed without being recorded; fix the problem and run the campaign again to resume.`);
+    throw new Error(`Cannot write the send log ${logPath}: ${errMsg(err)}. Stopped so nobody is mailed without being recorded; fix the problem and run the campaign again to resume.`);
   }
 }
 
@@ -553,17 +776,26 @@ export function appendLog(logPath, entry, { maxBytes, keep } = logLimits()) {
 // read "not sent yet" and mail the same people. A lock file beside the log
 // names the process that is sending; a lock whose process is gone is stale and
 // is taken over.
+/** @type {Set<string>} */
 const heldLocks = new Set();
 
+/**
+ * @param {number} pid
+ * @returns {boolean}
+ */
 const processAlive = (pid) => {
   try {
     process.kill(pid, 0);
     return true;
   } catch (err) {
-    return err.code === 'EPERM';
+    return errCode(err) === 'EPERM';
   }
 };
 
+/**
+ * @param {string} lockPath
+ * @returns {{ pid: number, token: string, at?: string } | null}
+ */
 function lockHolder(lockPath) {
   try {
     const holder = JSON.parse(readFileSync(lockPath, 'utf8'));
@@ -573,7 +805,11 @@ function lockHolder(lockPath) {
   }
 }
 
-/** True while the process that wrote the lock is still sending. */
+/**
+ * True while the process that wrote the lock is still sending.
+ * @param {{ pid: number, token: string } | null} holder
+ * @returns {boolean}
+ */
 function lockIsLive(holder) {
   if (!holder) return false;
   if (heldLocks.has(holder.token)) return true;
@@ -582,7 +818,11 @@ function lockIsLive(holder) {
   return holder.pid !== process.pid && processAlive(holder.pid);
 }
 
-/** Claims the right to send with this log; returns the function that gives it up. */
+/**
+ * Claims the right to send with this log; returns the function that gives it up.
+ * @param {string} logPath
+ * @returns {() => void}
+ */
 export function lockCampaign(logPath) {
   const lockPath = `${logPath}.lock`;
   const token = randomUUID();
@@ -593,7 +833,7 @@ export function lockCampaign(logPath) {
       writeFileSync(staging, JSON.stringify({ pid: process.pid, token, at: new Date().toISOString() }));
     } catch (err) {
       // No log folder: there is nothing to share, and appendLog reports it.
-      if (err.code === 'ENOENT') return () => {};
+      if (errCode(err) === 'ENOENT') return () => {};
       throw err;
     }
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -605,10 +845,10 @@ export function lockCampaign(logPath) {
           if (lockHolder(lockPath)?.token === token) rmSync(lockPath, { force: true });
         };
       } catch (err) {
-        if (err.code !== 'EEXIST') throw err;
+        if (errCode(err) !== 'EEXIST') throw err;
       }
       const holder = lockHolder(lockPath);
-      if (lockIsLive(holder)) {
+      if (holder && lockIsLive(holder)) {
         throw new Error(`Another Mailroom campaign (process ${holder.pid}) is already sending with ${logPath}. Wait for it to finish; if that process is gone, delete ${lockPath}.`);
       }
       rmSync(lockPath, { force: true });
@@ -619,11 +859,20 @@ export function lockCampaign(logPath) {
   }
 }
 
-/** Exit codes for a run stopped by a signal (128 + signal number). */
+/**
+ * Exit codes for a run stopped by a signal (128 + signal number).
+ * @type {Record<string, number>}
+ */
 export const SIGNAL_EXIT = { SIGINT: 130, SIGTERM: 143 };
 
-/** The message printed when a signal stopped a campaign part-way. */
-export function describeInterruption(signal, summary, { campaign = '', resume } = {}) {
+/**
+ * The message printed when a signal stopped a campaign part-way.
+ * @param {string} signal
+ * @param {CampaignRunSummary} summary
+ * @param {{ campaign?: string, resume?: string }} [options]
+ * @returns {string}
+ */
+export function describeInterruption(signal, summary, { campaign = '', resume = '' } = {}) {
   const done = summary.sent + summary.failed + summary.skipped + (summary.uncertain?.length || 0);
   const label = campaign ? `campaign "${campaign}"` : 'the campaign';
   return [
@@ -644,40 +893,143 @@ export function describeInterruption(signal, summary, { campaign = '', resume } 
 // whatever directory they are started from.
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
+/** @param {Record<string, string | undefined>} [env] */
 export const defaultLogPath = (env = process.env) => resolve(env.SEND_LOG || join(PACKAGE_ROOT, 'logs', 'sent.jsonl'));
 
+/** @param {Record<string, string | undefined>} [env] */
 export const defaultSuppressionPath = (env = process.env) => resolve(env.SUPPRESSION_FILE || join(PACKAGE_ROOT, 'data', 'suppressed.csv'));
 
+/** @param {Record<string, string | undefined>} [env] */
+export const defaultUnsubscribeSecretPath = (env = process.env) =>
+  resolve(env.UNSUBSCRIBE_SECRET_FILE || join(dirname(defaultLogPath(env)), '.unsubscribe-secret'));
+
+/**
+ * Loads or creates the persisted 0600 HMAC secret used to sign /unsubscribe links.
+ * @param {Record<string, string | undefined>} [env]
+ * @returns {string}
+ */
+export function loadOrCreateUnsubscribeSecret(env = process.env) {
+  const explicit = String(env.MAILROOM_UNSUBSCRIBE_SECRET || '').trim();
+  if (explicit) return explicit;
+  const secretPath = defaultUnsubscribeSecretPath(env);
+  if (existsSync(secretPath)) {
+    const saved = readFileSync(secretPath, 'utf8').trim();
+    if (saved) {
+      env.MAILROOM_UNSUBSCRIBE_SECRET = saved;
+      return saved;
+    }
+  }
+  const generated = randomBytes(32).toString('hex');
+  mkdirSync(dirname(secretPath), { recursive: true });
+  const staging = `${secretPath}.${process.pid}.tmp`;
+  try {
+    writeFileSync(staging, `${generated}\n`, { mode: 0o600 });
+    renameSync(staging, secretPath);
+    chmodSync(secretPath, 0o600);
+  } catch (err) {
+    rmSync(staging, { force: true });
+    throw err;
+  }
+  env.MAILROOM_UNSUBSCRIBE_SECRET = generated;
+  return generated;
+}
+
+/** @type {Map<string, { stamp: string, set: Set<string>, entries: SuppressionEntry[] }>} */
 const suppressionCache = new Map();
 
-export function loadSuppressed(path) {
+/**
+ * @param {unknown} value
+ * @returns {string}
+ */
+const unquoteField = (value) => String(value ?? '').trim().replace(/^"|"$/g, '').trim();
+
+/**
+ * @param {string} line
+ * @returns {SuppressionEntry | null}
+ */
+function parseSuppressionLine(line) {
+  const parts = String(line).split(/[,;\t]/);
+  const email = unquoteField(parts[0]).toLowerCase();
+  if (!emailRe.test(email)) return null;
+  return {
+    email,
+    reason: unquoteField(parts[1]),
+    added: unquoteField(parts[2]),
+  };
+}
+
+/**
+ * @param {string} path
+ * @returns {{ stamp: string, set: Set<string>, entries: SuppressionEntry[] }}
+ */
+function readSuppressionSnapshot(path) {
   let stamp;
   try {
     const stats = statSync(path);
     stamp = `${stats.mtimeMs}:${stats.size}`;
   } catch {
     suppressionCache.delete(path);
-    return new Set();
+    return { stamp: '', set: new Set(), entries: [] };
   }
   const hit = suppressionCache.get(path);
-  if (hit && hit.stamp === stamp) return hit.set;
+  if (hit && hit.stamp === stamp) return hit;
 
-  const set = new Set();
+  /** @type {Map<string, SuppressionEntry>} */
+  const byEmail = new Map();
   for (const line of readFileSync(path, 'utf8').split(/\r?\n/)) {
-    const first = line.split(/[,;\t]/)[0].trim().replace(/^"|"$/g, '').toLowerCase();
-    if (emailRe.test(first)) set.add(first);
+    const entry = parseSuppressionLine(line);
+    if (!entry) continue;
+    const prev = byEmail.get(entry.email);
+    byEmail.set(entry.email, {
+      email: entry.email,
+      reason: entry.reason || prev?.reason || '',
+      added: entry.added || prev?.added || '',
+    });
   }
-  suppressionCache.set(path, { stamp, set });
-  return set;
+  const entries = [...byEmail.values()].sort((a, b) => a.email.localeCompare(b.email));
+  const snapshot = { stamp, set: new Set(entries.map((e) => e.email)), entries };
+  suppressionCache.set(path, snapshot);
+  return snapshot;
 }
 
+/**
+ * @param {string} path
+ * @returns {Set<string>}
+ */
+export function loadSuppressed(path) {
+  return readSuppressionSnapshot(path).set;
+}
+
+/**
+ * Returns suppression rows `{ email, reason, added }` sorted by email, backward compatible with plain files.
+ * @param {string} path
+ * @returns {SuppressionEntry[]}
+ */
+export function loadSuppressionEntries(path) {
+  return readSuppressionSnapshot(path).entries.map((entry) => ({ ...entry }));
+}
+
+/**
+ * @param {string} path
+ * @param {string} email
+ * @returns {boolean}
+ */
 export const isSuppressed = (path, email) => loadSuppressed(path).has(String(email).trim().toLowerCase());
 
-/** Adds addresses to the list; reports which were new, already there, or not addresses. */
+/**
+ * Adds addresses to the list; reports which were new, already there, or not addresses.
+ * @param {string} path
+ * @param {string[]} emails
+ * @param {string} [reason]
+ * @returns {{ added: string[], already: string[], invalid: string[] }}
+ */
 export function addSuppressed(path, emails, reason = 'manual') {
   const known = loadSuppressed(path);
+  /** @type {string[]} */
   const added = [];
+  /** @type {string[]} */
   const already = [];
+  /** @type {string[]} */
   const invalid = [];
   for (const raw of emails) {
     const email = String(raw).trim().toLowerCase();
@@ -694,7 +1046,61 @@ export function addSuppressed(path, emails, reason = 'manual') {
   const rows = added.map((email) => `${email},${label},${at}\n`).join('');
   const lead = !existing ? 'email,reason,added\n' : existing.endsWith('\n') ? '' : '\n';
   appendFileSync(path, lead + rows);
+  suppressionCache.delete(path);
   return { added, already, invalid };
+}
+
+/**
+ * Removes addresses from the suppression file atomically while keeping header and untouched rows intact.
+ * @param {string} path
+ * @param {string[] | string} emails
+ * @returns {{ removed: string[], notFound: string[], invalid: string[] }}
+ */
+export function removeSuppressed(path, emails) {
+  /** @type {string[]} */
+  const targets = [];
+  /** @type {string[]} */
+  const invalid = [];
+  for (const raw of (Array.isArray(emails) ? emails : [emails])) {
+    const trimmed = String(raw ?? '').trim();
+    const email = trimmed.toLowerCase();
+    if (!emailRe.test(email)) invalid.push(trimmed);
+    else if (!targets.includes(email)) targets.push(email);
+  }
+  if (!targets.length || !existsSync(path)) {
+    return { removed: [], notFound: targets, invalid };
+  }
+
+  const wanted = new Set(targets);
+  /** @type {Set<string>} */
+  const removedSet = new Set();
+  const rawText = readFileSync(path, 'utf8').replace(/\r?\n$/, '');
+  /** @type {string[]} */
+  const kept = [];
+  for (const line of rawText.split(/\r?\n/)) {
+    const entry = parseSuppressionLine(line);
+    if (entry && wanted.has(entry.email)) {
+      removedSet.add(entry.email);
+      continue;
+    }
+    kept.push(line);
+  }
+
+  const removed = targets.filter((email) => removedSet.has(email));
+  const notFound = targets.filter((email) => !removedSet.has(email));
+  if (!removed.length) return { removed, notFound, invalid };
+
+  const next = kept.length ? kept.join('\n') + '\n' : '';
+  const staging = `${path}.${process.pid}.tmp`;
+  try {
+    writeFileSync(staging, next);
+    renameSync(staging, path);
+  } catch (err) {
+    rmSync(staging, { force: true });
+    throw err;
+  }
+  suppressionCache.delete(path);
+  return { removed, notFound, invalid };
 }
 
 // ── Rate ceiling ─────────────────────────────────────────────────────
@@ -702,8 +1108,17 @@ export function addSuppressed(path, emails, reason = 'manual') {
 // the starting point is rebuilt from the send log.
 const HOUR_MS = 3600000;
 
-/** MAX_PER_HOUR (default 500, 0 = off) and MAX_PER_DOMAIN_PER_HOUR (default off). */
+/**
+ * MAX_PER_HOUR (default 500, 0 = off) and MAX_PER_DOMAIN_PER_HOUR (default off).
+ * @param {Record<string, string | undefined>} [env]
+ * @returns {RateLimits}
+ */
 export function rateLimitsFromEnv(env = process.env) {
+  /**
+   * @param {string} name
+   * @param {number} fallback
+   * @returns {number}
+   */
   const read = (name, fallback) => {
     const text = env[name];
     if (text === undefined || text === '') return fallback;
@@ -717,11 +1132,19 @@ export function rateLimitsFromEnv(env = process.env) {
  * `check(domain)` says how long to wait before the next send is within the
  * ceilings (`scope` is 'hour' or the throttled domain); `record` notes a send.
  * `history` is `[{ at, domain }]`, oldest first.
+ * @param {{ perHour?: number, perDomainPerHour?: number, history?: RateHistoryEntry[], now?: () => number }} options
+ * @returns {{ check: (domain: string) => { waitMs: number, scope: string | null }, record: (domain: string) => void }}
  */
 export function createRateLimiter({ perHour = 0, perDomainPerHour = 0, history = [], now = Date.now }) {
+  /** @type {RateSample[]} */
   const sends = history.map(({ at, domain }) => ({ at: typeof at === 'number' ? at : Date.parse(at), domain }));
 
   // The send that must age out before another fits under `limit`.
+  /**
+   * @param {RateSample[]} list
+   * @param {number} limit
+   * @returns {number}
+   */
   const releaseAt = (list, limit) => (limit && list.length >= limit ? list[list.length - limit].at + HOUR_MS : 0);
 
   return {
@@ -746,9 +1169,18 @@ export function createRateLimiter({ perHour = 0, perDomainPerHour = 0, history =
 // message; a shorter limit abandons a message it is about to accept.
 const SOCKET_TIMEOUT_MS = 120000;
 
+/**
+ * @param {{ code?: string, responseCode?: number }} err
+ * @returns {boolean}
+ */
 const isConnectionLevel = (err) => err.responseCode === 421 || /^(ECONN\w*|ESOCKET|ETIMEDOUT|EAI_AGAIN|EPIPE)$/.test(err.code || '');
 
+/**
+ * @param {SmtpConfig} [cfg]
+ * @returns {Mailer}
+ */
 export function createMailer(cfg = resolveSmtpConfig()) {
+  /** @type {import('nodemailer').Transporter | null} */
   let transport = null;
 
   function getTransport() {
@@ -772,7 +1204,8 @@ export function createMailer(cfg = resolveSmtpConfig()) {
     // Tells send() the moment the message body starts to stream, which is when
     // the server can no longer be assumed not to have it.
     transport.use('stream', (mail, done) => {
-      const onDataStart = mail.data.onDataStart;
+      const dataWithHook = /** @type {{ onDataStart?: () => void }} */ (/** @type {unknown} */ (mail.data));
+      const onDataStart = dataWithHook.onDataStart;
       if (typeof onDataStart === 'function') {
         const open = mail.message.createReadStream.bind(mail.message);
         mail.message.createReadStream = () => {
@@ -792,15 +1225,20 @@ export function createMailer(cfg = resolveSmtpConfig()) {
       return { ok: true };
     } catch (err) {
       close();
-      return { ok: false, error: err.message };
+      return { ok: false, error: errMsg(err) };
     }
   }
 
+  /**
+   * @param {{ to: string, name?: string, subject: string, html: string, assetsDir: string | null | undefined }} opts
+   * @returns {Promise<SendResult>}
+   */
   async function send({ to, name = '', subject, html, assetsDir }) {
     const attachments = attachmentsFor(html, assetsDir);
     let dataStarted = false;
     try {
-      const info = await getTransport().sendMail({
+      /** @type {import('nodemailer').SendMailOptions & { onDataStart?: () => void }} */
+      const mailOptions = {
         from: cfg.from,
         to: name ? { name, address: to } : to,
         subject,
@@ -809,16 +1247,18 @@ export function createMailer(cfg = resolveSmtpConfig()) {
         attachments,
         ...bulkFields(cfg, to),
         onDataStart: () => { dataStarted = true; },
-      });
+      };
+      const info = await getTransport().sendMail(mailOptions);
       return { success: true, messageId: info.messageId, inline: attachments.length };
     } catch (err) {
+      const fields = smtpErrFields(err);
       // A dead link gets a fresh pool on the next attempt (the old one is closed,
       // not leaked); a refusal of one recipient says nothing about the pool.
-      if (isConnectionLevel(err)) close();
+      if (isConnectionLevel(fields)) close();
       // Without a reply after the body went out (timeout, dropped link) the
       // server may well have accepted the message: the outcome is unknown.
-      const uncertain = dataStarted && !Number.isInteger(err.responseCode);
-      return { success: false, error: err.message, code: err.code, command: err.command, response: err.response, responseCode: err.responseCode, uncertain };
+      const uncertain = dataStarted && !Number.isInteger(fields.responseCode);
+      return { success: false, ...fields, uncertain };
     }
   }
 
@@ -838,30 +1278,50 @@ export function createMailer(cfg = resolveSmtpConfig()) {
 // carry neither field.
 const TRANSIENT_CODES = /^(ECONN\w*|ETIMEDOUT|EAI_AGAIN|ESOCKET|EPIPE)$/;
 
+/**
+ * @param {FailureLike | string} failure
+ * @returns {boolean}
+ */
 export function isTransient(failure) {
+  /** @type {FailureLike} */
   const { error, code, responseCode } = typeof failure === 'object' && failure ? failure : { error: failure };
-  if (Number.isInteger(responseCode)) return responseCode >= 400 && responseCode < 500;
+  if (responseCode !== undefined && Number.isInteger(responseCode)) return responseCode >= 400 && responseCode < 500;
   if (code) return TRANSIENT_CODES.test(code);
   return /timeout|timed out|ECONN|ETIMEDOUT|EAI_AGAIN|ESOCKET|EPIPE|socket hang up|connection closed|connection lost|421|450|451|452|try again|rate/i.test(error || '');
 }
 
-/** A refusal of one recipient says nothing about the account sending it. */
+/**
+ * A refusal of one recipient says nothing about the account sending it.
+ * @param {FailureLike} info
+ * @returns {boolean}
+ */
 const isRecipientStage = ({ code, command }) => command === 'RCPT TO' || (code === 'EENVELOPE' && command !== 'MAIL FROM');
 
 /**
  * The recipient's own server said the address cannot receive mail: 5.1.x (bad
  * destination) or 5.2.1 (mailbox disabled) in a permanent RCPT-stage reply.
+ * @param {FailureLike} failure
+ * @returns {boolean}
  */
 export function isHardBounce({ code, command, response, responseCode }) {
   return isRecipientStage({ code, command })
-    && Number.isInteger(responseCode) && responseCode >= 500
+    && responseCode !== undefined && Number.isInteger(responseCode) && responseCode >= 500
     && /^5\d\d[ -]\s*(?:5\.1\.\d+|5\.2\.1)\b/.test(String(response ?? ''));
 }
 
-/** What the send log keeps of a failed send. */
+/**
+ * What the send log keeps of a failed send.
+ * @param {{ error: string, responseCode?: number }} info
+ * @returns {{ error: string, responseCode?: number }}
+ */
 const failureDetails = ({ error, responseCode }) => ({ error, ...(Number.isInteger(responseCode) ? { responseCode } : {}) });
 
+/**
+ * @param {FailureLike | string} failure
+ * @returns {boolean}
+ */
 export function isFatal(failure) {
+  /** @type {FailureLike} */
   const { error, code, command } = typeof failure === 'object' && failure ? failure : { error: failure };
   if (code === 'EAUTH') return true;
   // "over quota" or "account disabled" in a RCPT reply (or in the address it
@@ -871,6 +1331,10 @@ export function isFatal(failure) {
 }
 
 // ── Send loop ────────────────────────────────────────────────────────
+/**
+ * @param {RunCampaignOptions} opts
+ * @returns {Promise<CampaignRunSummary>}
+ */
 async function sendCampaign({
   recipients,
   templateHtml,
@@ -887,10 +1351,12 @@ async function sendCampaign({
   shouldStop = () => false,
   retryDelay = 5000,
 }) {
+  /** @param {number} ms */
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // Waiting in small slices keeps "stop" responsive during the gap between
   // messages and during retry backoff, however long they are.
+  /** @param {number} ms */
   const pause = async (ms) => {
     let left = ms;
     while (left > 0) {
@@ -921,7 +1387,9 @@ async function sendCampaign({
   // server and delays the real fix, so stop the run after a run of these.
   let transportFailures = 0;
   const MAX_TRANSPORT_FAILURES = 10;
+  /** @type {FailedRecipient[]} */
   const failures = [];
+  /** @type {FailedRecipient[]} */
   const uncertain = [];
 
   for (let i = 0; i < total && !stopped; i++) {
@@ -930,6 +1398,7 @@ async function sendCampaign({
     const rec = recipients[i];
     const addr = rec._email;
 
+    /** @param {string} reason */
     const skip = (reason) => {
       skipped++;
       if (reason === 'suppressed') suppressed++;
@@ -953,6 +1422,7 @@ async function sendCampaign({
     const subject = renderSubject(subjectTemplate, rec);
     const html = render(templateHtml, rec, mailer.cfg);
 
+    /** @type {SendResult | undefined} */
     let result;
     for (let attempt = 1; attempt <= 3; attempt++) {
       result = await mailer.send({ to: addr, name: rec._name, subject, html, assetsDir });
@@ -1029,6 +1499,8 @@ async function sendCampaign({
  *   { type: 'throttle', email, waitMs, scope }   waiting for the hourly ceiling
  *   { type: 'fatal', email, error }
  *   { type: 'done', summary }
+ * @param {RunCampaignOptions} options
+ * @returns {Promise<CampaignRunSummary>}
  */
 export async function runCampaign(options) {
   const unlock = options.logPath ? lockCampaign(options.logPath) : () => {};
@@ -1040,3 +1512,4 @@ export async function runCampaign(options) {
 }
 
 export { resolveSmtpConfig };
+export { signUnsubscribeToken, verifyUnsubscribeToken } from './mailer.mjs';

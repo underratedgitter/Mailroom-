@@ -4,6 +4,11 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      # Hold @types/node to Node 20 because package.json engines.node (>=20.6) and
+      # .github/workflows/tests.yml include Node 20; newer majors expose APIs missing at runtime.
+      - dependency-name: "@types/node"
+        versions: [">=21.0.0"]
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

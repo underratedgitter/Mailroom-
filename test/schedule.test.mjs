@@ -386,3 +386,50 @@ test('a schedule remembers its template by hash and refuses to send if the file 
   assert.match(done.error, /Template changed since scheduling/);
   assert.equal(sink.messages.length, 0);
 });
+
+test('pending and missed schedules can be rescheduled and reject past times or finished entries', async (t) => {
+  const sink = await startSmtpSink();
+  const dir = mkdtempSync(join(tmpdir(), 'mailroom-resched-'));
+  t.after(async () => {
+    await sink.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const pastMissed = {
+    id: randomUUID(),
+    at: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+    createdAt: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
+    campaign: 'resched-missed',
+    subject: 'Recovered {{name}}',
+    template: TEMPLATE,
+    delay: 0,
+    recipients: [{ email: 'one@example.com', name: 'One', company: 'Co' }],
+    status: 'missed',
+    error: 'The server was not running at the scheduled time',
+    result: null,
+  };
+  writeFileSync(join(dir, 'schedule.json'), JSON.stringify([pastMissed]));
+
+  const server = await startServer({
+    dir,
+    env: { ...FAST, SMTP_HOST: '127.0.0.1', SMTP_PORT: String(sink.port), EMAIL_FROM: 'Desk <desk@local.test>' },
+  });
+  t.after(() => server.stop({ keepData: true }));
+
+  assert.equal((await post(server.base, `/api/schedule/${pastMissed.id}/reschedule`, { at: new Date(Date.now() - 1000).toISOString() })).status, 400);
+  assert.equal((await post(server.base, `/api/schedule/${pastMissed.id}/reschedule`, { at: 'not-a-date' })).status, 400);
+  assert.equal((await post(server.base, `/api/schedule/${randomUUID()}/reschedule`, { at: new Date(Date.now() + 60_000).toISOString() })).status, 404);
+
+  const soon = new Date(Date.now() + 1400).toISOString();
+  const res = await post(server.base, `/api/schedule/${pastMissed.id}/reschedule`, { at: soon });
+  assert.equal(res.status, 200);
+  assert.equal(res.data.ok, true);
+  assert.equal(res.data.entry.status, 'pending');
+  assert.equal(res.data.entry.error, null);
+
+  const done = await waitForStatus(server.base, pastMissed.id, ['sent', 'failed']);
+  assert.equal(done.status, 'sent');
+  assert.equal(sink.messages.length, 1);
+
+  assert.equal((await post(server.base, `/api/schedule/${pastMissed.id}/reschedule`, { at: new Date(Date.now() + 60_000).toISOString() })).status, 409);
+});

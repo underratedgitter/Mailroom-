@@ -424,6 +424,34 @@ function describeTemplate() {
 function describeCsv() {
   const c = state.csvs.find((x) => x.path === ui.csv.value);
   setText(ui.csvHint, c?.error || '');
+  ui.deleteCsvBtn.disabled = !ui.csv.value;
+}
+
+async function deleteCsv() {
+  const path = ui.csv.value;
+  if (!path) return;
+  const ok = await confirmDialog({
+    title: 'Delete saved list?',
+    body: h('p', {}, baseName(path) + ' will be removed from data/ and cannot be undone.'),
+    confirmLabel: 'Delete list',
+    cancelLabel: 'Keep list',
+    danger: true,
+  });
+  if (!ok) return;
+  ui.deleteCsvBtn.disabled = true;
+  try {
+    await api('/api/csv/delete', { path });
+    if (store.get('csv') === path) store.set('csv', '');
+    ui.csv.value = '';
+    toast('Deleted ' + baseName(path) + '.');
+    await loadState();
+    await loadRoster();
+    await refreshPreview({ resetIndex: true });
+  } catch (err) {
+    toast(err.message, 'bad');
+  } finally {
+    describeCsv();
+  }
 }
 
 async function loadHealth() {
@@ -1393,6 +1421,7 @@ function renderQueue() {
       if (e.status === 'pending' || e.status === 'missed') {
         actions.append(
           h('button', { type: 'button', class: 'btn btn--sm', dataset: { action: 'run' } }, 'Send now'),
+          h('button', { type: 'button', class: 'btn btn--sm', dataset: { action: 'reschedule' } }, 'Reschedule'),
           h('button', { type: 'button', class: 'btn btn--sm btn--danger-quiet', dataset: { action: 'cancel' } }, e.status === 'missed' ? 'Discard' : 'Cancel'));
       }
     });
@@ -1452,6 +1481,41 @@ async function cancelScheduled(id) {
     await loadQueue();
   } catch (err) {
     toast(err.message, 'bad');
+  }
+}
+
+let rescheduleId = null;
+
+function openReschedule(id) {
+  const entry = state.queue.find((e) => e.id === id);
+  if (!entry) return;
+  rescheduleId = id;
+  setText(ui.rescheduleMeta, (entry.campaign || entry.subject) + ' · ' + plural(entry.recipients, 'recipient'));
+  setText(ui.rescheduleStatus, '');
+  const current = Date.parse(entry.at);
+  ui.rescheduleAt.value = toLocalInput(new Date(Number.isFinite(current) && current > Date.now() ? current : Date.now() + 60 * 60 * 1000));
+  ui.rescheduleSave.disabled = false;
+  ui.rescheduleDialog.showModal();
+  ui.rescheduleAt.focus();
+}
+
+async function submitReschedule(event) {
+  event.preventDefault();
+  if (!rescheduleId) return;
+  const when = ui.rescheduleAt.value ? new Date(ui.rescheduleAt.value) : null;
+  if (!when || Number.isNaN(when.getTime())) { setText(ui.rescheduleStatus, 'Pick a date and time.'); return; }
+  ui.rescheduleSave.disabled = true;
+  setText(ui.rescheduleStatus, '');
+  try {
+    await api('/api/schedule/' + rescheduleId + '/reschedule', { at: when.toISOString() });
+    rescheduleId = null;
+    ui.rescheduleDialog.close();
+    toast('Rescheduled for ' + formatWhen(when.toISOString()) + '.', 'ok');
+    await loadQueue();
+  } catch (err) {
+    setText(ui.rescheduleStatus, err.message);
+  } finally {
+    ui.rescheduleSave.disabled = false;
   }
 }
 
@@ -1689,6 +1753,7 @@ ui.pasteBox.addEventListener('input', debounce(() => {
   refreshPreview({ resetIndex: true });
 }, 500));
 ui.saveCsvBtn.addEventListener('click', savePastedList);
+ui.deleteCsvBtn.addEventListener('click', deleteCsv);
 ui.limit.addEventListener('input', debounce(() => {
   refreshPreview({ resetIndex: true });
   loadRoster();
@@ -1741,6 +1806,7 @@ ui.queueList.addEventListener('click', (event) => {
   if (!button) return;
   const id = button.closest('li').dataset.key;
   if (button.dataset.action === 'run') runScheduled(id);
+  else if (button.dataset.action === 'reschedule') openReschedule(id);
   else cancelScheduled(id);
 });
 
@@ -1774,6 +1840,13 @@ ui.confirmDialog.addEventListener('close', () => {
   confirmResolve = null;
   resolve?.(ui.confirmDialog.returnValue === 'ok');
 });
+
+ui.rescheduleForm.addEventListener('submit', submitReschedule);
+ui.rescheduleCancel.addEventListener('click', () => ui.rescheduleDialog.close());
+ui.rescheduleDialog.addEventListener('click', (event) => {
+  if (event.target === ui.rescheduleDialog) ui.rescheduleDialog.close();
+});
+ui.rescheduleDialog.addEventListener('close', () => { rescheduleId = null; });
 
 // ── Background refresh ───────────────────────────────────────────────
 // The scheduler runs on the server; poll so counts, the queue and progress

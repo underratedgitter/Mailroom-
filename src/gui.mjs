@@ -20,9 +20,10 @@
  *   POST /api/preview          render one recipient, with images inlined, plus column and {{field}} checks
  *   POST /api/roster           who is in a saved CSV, and how its columns map to merge fields
  *   POST /api/recipients       save (or dry-run) a pasted list or an uploaded CSV into data/
+ *   POST /api/csv/delete       delete a saved CSV in data/ (never the suppression list)
  *   GET  /api/suppression      the suppression list
  *   POST /api/suppress         add addresses to it
- *   GET  /api/schedule         queued campaigns (POST creates one; POST /api/schedule/:id/cancel|run)
+ *   GET  /api/schedule         queued campaigns (POST creates one; POST /api/schedule/:id/cancel|run|reschedule)
  *   POST /api/verify           SMTP connect + auth check
  *   POST /api/test             send one real message to one address
  *   POST /api/send             start a campaign job → { jobId }
@@ -1208,6 +1209,22 @@ async function route(req, res) {
     });
   }
 
+  if (req.method === 'POST' && pathname === '/api/csv/delete') {
+    const body = await readJson(req);
+    const rawPath = String(body.path ?? body.csv ?? '').trim();
+    if (!rawPath) return fail(res, 400, 'Missing file path');
+    const resolved = resolve(ROOT, rawPath);
+    if (existsSync(resolved) && lstatSync(resolved).isSymbolicLink()) {
+      return fail(res, 400, `Not allowed: ${rawPath}`);
+    }
+    const csvPath = safePath(rawPath, { roots: [DATA_DIR], ext: ['.csv'] });
+    if (csvPath === SUPPRESSION_PATH || resolved === SUPPRESSION_PATH) {
+      return fail(res, 400, 'Not allowed: cannot delete the suppression list');
+    }
+    rmSync(csvPath, { force: true });
+    return json(res, 200, { ok: true, deleted: rel(csvPath) });
+  }
+
   if (req.method === 'POST' && pathname === '/api/verify') {
     const cfg = resolveSmtpConfig();
     if (!cfg.configured) {
@@ -1294,6 +1311,13 @@ async function route(req, res) {
   }
 
   // ── Scheduled campaigns ───────────────────────────────────────────
+  const parseFutureAt = (raw) => {
+    const at = Date.parse(String(raw || ''));
+    if (!Number.isFinite(at)) return { error: 'Pick a date and time' };
+    if (at < Date.now() + 1000) return { error: 'Pick a time in the future' };
+    return { at };
+  };
+
   if (req.method === 'GET' && pathname === '/api/schedule') {
     return json(res, 200, {
       entries: scheduleView(),
@@ -1311,9 +1335,9 @@ async function route(req, res) {
     const issue = smtp.configured ? complianceIssue(smtp) : null;
     if (issue) return fail(res, 400, issue);
 
-    const at = Date.parse(String(body.at || ''));
-    if (!Number.isFinite(at)) return fail(res, 400, 'Pick a date and time');
-    if (at < Date.now() + 1000) return fail(res, 400, 'Pick a time in the future');
+    const parsedAt = parseFutureAt(body.at);
+    if (parsedAt.error) return fail(res, 400, parsedAt.error);
+    const at = parsedAt.at;
 
     const list = readSchedule();
     const active = list.filter((e) => e.status === 'pending' || e.status === 'sending').length;
@@ -1350,7 +1374,7 @@ async function route(req, res) {
     });
   }
 
-  const scheduleMatch = pathname.match(/^\/api\/schedule\/([\w-]+)\/(cancel|run)$/);
+  const scheduleMatch = pathname.match(/^\/api\/schedule\/([\w-]+)\/(cancel|run|reschedule)$/);
   if (req.method === 'POST' && scheduleMatch) {
     const list = readSchedule();
     const entry = list.find((e) => e.id === scheduleMatch[1]);
@@ -1363,6 +1387,21 @@ async function route(req, res) {
       entry.status = 'cancelled';
       writeSchedule(list);
       return json(res, 200, { ok: true });
+    }
+
+    if (scheduleMatch[2] === 'reschedule') {
+      if (entry.status !== 'pending' && entry.status !== 'missed') {
+        return fail(res, 409, `Cannot reschedule a campaign that is ${entry.status}`);
+      }
+      const body = await readJson(req);
+      const parsedAt = parseFutureAt(body.at);
+      if (parsedAt.error) return fail(res, 400, parsedAt.error);
+      entry.at = new Date(parsedAt.at).toISOString();
+      entry.status = 'pending';
+      entry.error = null;
+      delete entry.interrupted;
+      writeSchedule(list);
+      return json(res, 200, { ok: true, entry: scheduleView().find((e) => e.id === entry.id) });
     }
 
     if (entry.status === 'sending') return fail(res, 409, 'That campaign is sending already');

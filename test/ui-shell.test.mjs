@@ -37,7 +37,7 @@ test('each navigation link opens a view with a heading, and every view has a lin
     const view = 'view' + route[0].toUpperCase() + route.slice(1);
     assert.ok(ids.has(view), view + ' is missing');
     assert.match(html, new RegExp('<section[^>]*id="' + view + '"[^>]*aria-labelledby="h' + route[0].toUpperCase() + route.slice(1) + '"'));
-    assert.ok(app.includes("id: '" + route + "'"), route + ' is not routed in app.js');
+    assert.ok(app.includes("id: '" + route + "'"), route + ' is not routed in public/js');
     assert.match(html, new RegExp('href="#/' + route + '"'));
   }
 });
@@ -116,6 +116,6 @@ test('compose includes the template studio tabs, editor, asset manager, and name
   }
   assert.match(html, /<div class="tabpanel"[^>]*id="panelComposeStudio"[^>]*\shidden>/);
   for (const route of ['/api/templates/read', '/api/templates/save', '/api/templates/duplicate', '/api/templates/delete', '/api/templates/assets', '/api/templates/assets/delete']) {
-    assert.ok(app.includes(route), route + ' missing from app.js');
+    assert.ok(app.includes(route), route + ' missing from public/js');
   }
 });

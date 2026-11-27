@@ -185,11 +185,13 @@ delivery settings: Reply-To (`EMAIL_REPLY_TO`), an https unsubscribe link
 an `http://` unsubscribe URL or a non-numeric ceiling is refused) and a blank
 field removes the setting.
 
-**Compose** — every `templates/*.html` file is offered as a template. A folder
-next to it named `<template>-assets/` (for example, `bcci-connect-v2-assets/`) is
-picked up automatically and its images attached inline with `cid:` (Gmail blocks
-`data:` URIs). Bundled templates include `bcci-connect-v2.html`,
-`bcci-connect.html`, and `bcci-membership.html`.
+**Compose** — every `templates/*.html` file is offered as a template, and you can
+create, duplicate, delete, or edit template HTML and upload/delete inline
+images (PNG, JPG, GIF, WEBP up to 5 MB) directly in the Template studio tab. A
+folder next to a template named `<template>-assets/` (for example,
+`bcci-connect-v2-assets/`) is picked up automatically and its images attached
+inline with `cid:` (Gmail blocks `data:` URIs). Bundled templates include
+`bcci-connect-v2.html`, `bcci-connect.html`, and `bcci-membership.html`.
 
 **Recipients** — a saved `data/*.csv`, a CSV you upload, or addresses pasted straight in:
 
@@ -488,7 +490,7 @@ Supported SMTP environment variables:
 ## Tests
 
 ```bash
-npm test            # 176 tests: parsing, rendering, resume, retries, scheduling, shutdown, log rotation, config validation, suppression, headers, rate ceiling, CLI, API, auth, TLS, guards
+npm test            # 183 tests: parsing, rendering, resume, retries, scheduling, shutdown, log rotation, config validation, suppression, headers, rate ceiling, CLI, API, template studio, auth, TLS, guards
 npm run check       # parse every JS file in bin/, src/ and public/ without running it
 ```
 
@@ -510,4 +512,7 @@ leaves the machine.
 - Mailroom sends the unsubscribe headers and honours a suppression list, but it
   does not receive unsubscribe requests, late bounces or complaints; you feed them
   in (see above). For large, regulated, or marketing lists use a real ESP.
-- Templates are HTML files on disk, not a visual editor.
+- Templates are edited as raw HTML and inline `cid:` images (PNG, JPG, GIF, or
+  WEBP up to 5 MB) in the Compose **Template studio** tab rather than a
+  drag-and-drop visual designer; bundled templates are read-only (duplicate one
+  to edit a copy).

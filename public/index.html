@@ -201,37 +201,79 @@
 
       <div class="split">
         <form class="card form" id="composeForm" autocomplete="off" novalidate>
-          <h2 class="card__title">Message</h2>
+          <h2 class="card__title">Template &amp; message</h2>
 
-          <div class="field">
-            <label for="template">Template</label>
-            <select id="template"></select>
-            <p class="hint" id="templateHint"></p>
+          <div class="tabs" role="tablist" aria-label="Compose workspace" id="composeTabs">
+            <button class="tab" role="tab" type="button" id="tabComposeMessage" data-tab="message" aria-controls="panelComposeMessage" aria-selected="true">Message</button>
+            <button class="tab" role="tab" type="button" id="tabComposeStudio" data-tab="studio" aria-controls="panelComposeStudio" aria-selected="false" tabindex="-1">Template studio</button>
           </div>
 
-          <div class="field">
-            <label for="subject">Subject line</label>
-            <input id="subject" type="text" placeholder="e.g. Invitation to our November meetup" spellcheck="false" aria-describedby="tokensLabel">
-            <div class="tokens">
-              <span class="tokens__label" id="tokensLabel">Insert merge field</span>
-              <span class="chips" id="tokens" role="group" aria-labelledby="tokensLabel"></span>
+          <div class="tabpanel" role="tabpanel" id="panelComposeMessage" aria-labelledby="tabComposeMessage">
+            <div class="field">
+              <div class="field__bar">
+                <label for="template">Template</label>
+                <div class="actions">
+                  <button class="btn btn--ghost btn--sm" id="newTemplateBtn" type="button">New</button>
+                  <button class="btn btn--ghost btn--sm" id="duplicateTemplateBtn" type="button">Duplicate</button>
+                  <button class="btn btn--ghost btn--danger-quiet btn--sm" id="deleteTemplateBtn" type="button">Delete</button>
+                </div>
+              </div>
+              <select id="template"></select>
+              <p class="hint" id="templateHint"></p>
+            </div>
+
+            <div class="field">
+              <label for="subject">Subject line</label>
+              <input id="subject" type="text" placeholder="e.g. Invitation to our November meetup" spellcheck="false" aria-describedby="tokensLabel">
+              <div class="tokens">
+                <span class="tokens__label" id="tokensLabel">Insert merge field</span>
+                <span class="chips" id="tokens" role="group" aria-labelledby="tokensLabel"></span>
+              </div>
+            </div>
+
+            <div class="field">
+              <label for="campaign">Campaign name</label>
+              <input id="campaign" type="text" spellcheck="false" placeholder="e.g. connect-nov-2026">
+              <p class="hint">A re-run of the same campaign skips addresses it already sent to.</p>
+            </div>
+
+            <div class="field">
+              <span class="label" id="placeholdersLabel">Merge fields in this message</span>
+              <div class="chips" id="placeholders" role="list" aria-labelledby="placeholdersLabel"></div>
+              <p class="hint" id="placeholdersHint">Use {{name}}, {{company}}, {{email}} or any column of your list.</p>
+            </div>
+
+            <div class="form__foot">
+              <span class="hint" id="recipientSummary">No recipients chosen yet.</span>
             </div>
           </div>
 
-          <div class="field">
-            <label for="campaign">Campaign name</label>
-            <input id="campaign" type="text" spellcheck="false" placeholder="e.g. connect-nov-2026">
-            <p class="hint">A re-run of the same campaign skips addresses it already sent to.</p>
-          </div>
+          <div class="tabpanel" role="tabpanel" id="panelComposeStudio" aria-labelledby="tabComposeStudio" hidden>
+            <div class="studio__bar">
+              <span class="mono studio__file" id="studioFile">No template selected</span>
+              <div class="actions">
+                <span class="status" id="studioStatus" role="status"></span>
+                <button class="btn btn--primary btn--sm" id="studioSaveBtn" type="button" disabled>Save HTML</button>
+              </div>
+            </div>
 
-          <div class="field">
-            <span class="label" id="placeholdersLabel">Merge fields in this message</span>
-            <div class="chips" id="placeholders" role="list" aria-labelledby="placeholdersLabel"></div>
-            <p class="hint" id="placeholdersHint">Use {{name}}, {{company}}, {{email}} or any column of your list.</p>
-          </div>
+            <div class="field">
+              <label for="studioHtml">Template HTML</label>
+              <textarea class="code-editor" id="studioHtml" rows="14" spellcheck="false" placeholder="Select or create a template to edit its HTML."></textarea>
+              <p class="hint">Save to refresh the live preview. Include {{unsubscribe_url}} for opt-out links.</p>
+            </div>
 
-          <div class="form__foot">
-            <span class="hint" id="recipientSummary">No recipients chosen yet.</span>
+            <div class="studio__assets">
+              <div class="studio__bar">
+                <label class="label" for="assetInput">Inline images (cid:)</label>
+                <div class="actions">
+                  <input class="visually-hidden" id="assetInput" type="file" accept=".png,.jpg,.jpeg,.gif,.webp,image/png,image/jpeg,image/gif,image/webp">
+                  <button class="btn btn--sm" id="assetBtn" type="button" disabled>Upload image</button>
+                </div>
+              </div>
+              <ul class="asset-list" id="assetList"></ul>
+              <p class="hint" id="assetEmpty">No inline images yet. Upload a PNG, JPG, GIF or WEBP up to 5 MB.</p>
+            </div>
           </div>
         </form>
 
@@ -669,8 +711,25 @@
   </div>
 </dialog>
 
+<!-- ── Template name dialog ──────────────────────────────────── -->
+<dialog class="dialog" id="nameDialog" aria-labelledby="nameTitle">
+  <form class="dialog__card" id="nameForm" method="dialog" novalidate>
+    <h2 id="nameTitle">New template</h2>
+    <p class="hint" id="nameHint"></p>
+    <div class="field">
+      <label for="nameInput">Template name</label>
+      <input id="nameInput" type="text" spellcheck="false" placeholder="e.g. spring-invite">
+    </div>
+    <p class="status is-bad" id="nameError" role="status"></p>
+    <div class="dialog__actions">
+      <button class="btn" id="nameCancel" type="button">Cancel</button>
+      <button class="btn btn--primary" id="nameOk" type="submit">Create</button>
+    </div>
+  </form>
+</dialog>
+
 <div class="toasts" id="toasts" role="region" aria-label="Notifications"></div>
 
-<script src="/app.js"></script>
+<script type="module" src="/js/main.mjs"></script>
 </body>
 </html>

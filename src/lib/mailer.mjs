@@ -13,26 +13,68 @@
 
 import { randomUUID } from 'node:crypto';
 
-/** `Desk <desk@example.com>` -> `desk@example.com`. */
+/**
+ * @typedef {{
+ *   host: string,
+ *   port: number,
+ *   secure: boolean,
+ *   requireTLS: boolean,
+ *   user: string,
+ *   pass: string,
+ *   from: string,
+ *   replyTo: string,
+ *   unsubscribeMailto?: string,
+ *   unsubscribeUrl: string,
+ *   isLocal: boolean,
+ *   configured: boolean,
+ *   socketTimeout?: number,
+ *   maxPerHour?: string,
+ * }} SmtpConfig
+ */
+
+/** @typedef {{ 'List-Unsubscribe'?: string, 'List-Unsubscribe-Post'?: string }} MailHeaders */
+/** @typedef {{ messageId: string, date: Date, replyTo?: string, headers: MailHeaders }} BulkFields */
+
+/**
+ * `Desk <desk@example.com>` -> `desk@example.com`.
+ * @param {unknown} value
+ * @returns {string}
+ */
 export function bareAddress(value) {
   const text = String(value ?? '').trim();
   const angled = text.match(/<([^<>]+)>\s*$/);
   return (angled ? angled[1] : text).trim();
 }
 
-/** The part after the last @, lower-cased; empty when there is none. */
+/**
+ * The part after the last at-sign, lower-cased; empty when there is none.
+ * @param {unknown} value
+ * @returns {string}
+ */
 export function addressDomain(value) {
   const address = bareAddress(value);
   const at = address.lastIndexOf('@');
   return at > 0 ? address.slice(at + 1).toLowerCase() : '';
 }
 
-/** The settings a send still needs; a local relay needs none. */
+/**
+ * The settings a send still needs; a local relay needs none.
+ * @param {SmtpConfig} cfg
+ * @returns {string[]}
+ */
 export function missingSmtpFields(cfg) {
   if (cfg.isLocal) return [];
-  return [!cfg.user && 'SMTP_USER', !cfg.pass && 'SMTP_PASS'].filter(Boolean);
+  /** @type {string[]} */
+  const missing = [];
+  if (!cfg.user) missing.push('SMTP_USER');
+  if (!cfg.pass) missing.push('SMTP_PASS');
+  return missing;
 }
 
+/**
+ * @param {Record<string, string | undefined>} [env]
+ * @returns {SmtpConfig}
+ */
 export function resolveSmtpConfig(env = process.env) {
   const user = (env.SMTP_USER || env.GMAIL_USER || '').trim();
   // Strip internal/surrounding whitespace (Google shows App Passwords in
@@ -63,7 +105,11 @@ export function resolveSmtpConfig(env = process.env) {
   };
 }
 
-/** Why an UNSUBSCRIBE_URL cannot be used, or null (empty means none). */
+/**
+ * Why an UNSUBSCRIBE_URL cannot be used, or null (empty means none).
+ * @param {string} url
+ * @returns {string | null}
+ */
 export function unsubscribeUrlIssue(url) {
   if (url && !/^https:\/\/[^\s<>]+$/i.test(url)) {
     return 'UNSUBSCRIBE_URL must be an https:// URL with no spaces (RFC 8058 one-click needs HTTPS).';
@@ -71,7 +117,11 @@ export function unsubscribeUrlIssue(url) {
   return null;
 }
 
-/** Why this configuration cannot send compliant mail, or null when it can. */
+/**
+ * Why this configuration cannot send compliant mail, or null when it can.
+ * @param {SmtpConfig} cfg
+ * @returns {string | null}
+ */
 export function configIssue(cfg) {
   if (!addressDomain(cfg.from)) {
     return 'EMAIL_FROM must be a full address such as news@example.com: Message-ID and unsubscribe headers are built from its domain.';
@@ -79,7 +129,11 @@ export function configIssue(cfg) {
   return unsubscribeUrlIssue(cfg.unsubscribeUrl);
 }
 
-/** `mailto:` link to the unsubscribe mailbox (UNSUBSCRIBE_MAILTO, else Reply-To, else From), or ''. */
+/**
+ * `mailto:` link to the unsubscribe mailbox (UNSUBSCRIBE_MAILTO, else Reply-To, else From), or ''.
+ * @param {SmtpConfig} cfg
+ * @returns {string}
+ */
 function unsubscribeMailtoLink(cfg) {
   const mailbox = bareAddress(cfg.unsubscribeMailto || cfg.replyTo || cfg.from);
   if (!mailbox) return '';
@@ -87,9 +141,19 @@ function unsubscribeMailtoLink(cfg) {
   return `mailto:${encodeURIComponent(mailbox.slice(0, at))}${mailbox.slice(at)}?subject=unsubscribe`;
 }
 
+/**
+ * @param {SmtpConfig} cfg
+ * @param {string} to
+ * @returns {string}
+ */
 const unsubscribeUrlFor = (cfg, to) => cfg.unsubscribeUrl.replaceAll('{email}', encodeURIComponent(to));
 
-/** What `{{unsubscribe_url}}` stands for: the hosted URL for this recipient, else the mailto link; '' when neither exists. */
+/**
+ * What `{{unsubscribe_url}}` stands for: the hosted URL for this recipient, else the mailto link; '' when neither exists.
+ * @param {SmtpConfig} cfg
+ * @param {string} to
+ * @returns {string}
+ */
 export function unsubscribeLink(cfg, to) {
   return cfg.unsubscribeUrl ? unsubscribeUrlFor(cfg, to) : unsubscribeMailtoLink(cfg);
 }
@@ -97,9 +161,14 @@ export function unsubscribeLink(cfg, to) {
 /**
  * Message-ID, Date, Reply-To and List-Unsubscribe fields for one recipient.
  * The Message-ID is unique per message and on the sender's own domain.
+ * @param {SmtpConfig} cfg
+ * @param {string} to
+ * @returns {BulkFields}
  */
 export function bulkFields(cfg, to) {
+  /** @type {string[]} */
   const targets = [];
+  /** @type {MailHeaders} */
   const headers = {};
   if (cfg.unsubscribeUrl) {
     targets.push(`<${unsubscribeUrlFor(cfg, to)}>`);

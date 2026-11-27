@@ -64,12 +64,14 @@ for (let i = 0; i < args.length; i++) {
 // Set before importing: the server reads these at module load.
 const { startServer, tlsEnabled } = await import('../src/gui.mjs');
 const { resolveConfigPath } = await import('../src/lib/config.mjs');
+const { errMsg } = await import('../src/lib/errors.mjs');
 
-let address;
+/** @type {import('node:net').AddressInfo | string | null} */
+let address = null;
 try {
   address = await startServer();
 } catch (err) {
-  console.error(`\n  ${err.message}\n`);
+  console.error(`\n  ${errMsg(err)}\n`);
   process.exit(1);
 }
 
@@ -87,6 +89,7 @@ console.log(`\n  Ctrl+C to stop.\n`);
 
 if (opts.open) openBrowser(url);
 
+/** @param {string} target */
 function openBrowser(target) {
   const [command, argv] = process.platform === 'darwin'
     ? ['open', [target]]

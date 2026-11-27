@@ -39,5 +39,14 @@ jobs:
       - name: Syntax check (bin, src, public)
         run: npm run check
 
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Dependency audit
+        run: npm audit --omit=dev --audit-level=high
+
       - name: Run tests
         run: npm test

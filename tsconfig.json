@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2023"],
+    "allowJs": true,
+    "checkJs": true,
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true
+  },
+  "include": [
+    "bin/**/*.mjs",
+    "scripts/**/*.mjs",
+    "src/**/*.mjs"
+  ],
+  "exclude": [
+    "node_modules",
+    "public"
+  ]
+}

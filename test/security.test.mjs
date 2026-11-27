@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { networkInterfaces } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { CSV, startServer, expectStartupFailure, post, get, wait } from './helpers/server.mjs';
 import { hashPassword, verifyPassword } from '../src/lib/auth.mjs';
 
@@ -473,4 +473,44 @@ test('template HTML cannot execute in app origin or be served as raw HTML', asyn
 
   // Server never exposes templates/* directly over HTTP.
   assert.equal((await get(server.base, `/templates/${stem}.html`)).status, 404);
+});
+
+/** Turn a route regex like /^\/api\/schedule\/([\w-]+)\/(cancel|run)$/ into a concrete pathname. */
+function samplePathForPattern(pattern) {
+  const sample = pattern.source
+    .replace(/^\^/, '')
+    .replace(/\$$/, '')
+    .replace(/\\\//g, '/')
+    .replace(/\(\[\\w-\]\+\)/g, 'sample-id')
+    .replace(/\(([^()|]+)\|[^()]+\)/g, '$1');
+  assert.ok(pattern.test(sample), `sample path "${sample}" did not match ${pattern}`);
+  return sample;
+}
+
+test('every non-public route in src/routes returns 401 without a session', async (t) => {
+  const { apiRoutes } = await import('../src/routes/index.mjs');
+  const routeFiles = readdirSync(join(ROOT, 'src/routes'))
+    .filter((name) => name.endsWith('.mjs') && name !== 'index.mjs')
+    .sort();
+  assert.ok(routeFiles.length >= 6);
+
+  const collected = [];
+  for (const file of routeFiles) {
+    const mod = await import(pathToFileURL(join(ROOT, 'src/routes', file)).href);
+    assert.ok(Array.isArray(mod.routes) && mod.routes.length > 0, `${file} must export non-empty routes`);
+    for (const def of mod.routes) collected.push({ file, ...def });
+  }
+  assert.equal(collected.length, apiRoutes.length, 'src/routes/index.mjs must register every module route');
+
+  const server = await startServer({ env: { MAILROOM_PASSWORD: 'secret-pass' } });
+  t.after(server.stop);
+
+  assert.equal((await get(server.base, '/api/health')).status, 200);
+  for (const def of collected) {
+    const target = def.path || samplePathForPattern(def.pattern);
+    const res = def.method === 'POST'
+      ? await post(server.base, target, {})
+      : await get(server.base, target);
+    assert.equal(res.status, 401, `${def.method} ${target} (${def.file}) must require auth`);
+  }
 });

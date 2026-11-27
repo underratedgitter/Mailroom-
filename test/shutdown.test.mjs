@@ -5,7 +5,6 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
 import { startSmtpSink } from './helpers/smtp-sink.mjs';
 import { startServer, post, get, wait, CSV } from './helpers/server.mjs';
 

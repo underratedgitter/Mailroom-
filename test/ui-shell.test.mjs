@@ -1,15 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (path) => readFileSync(join(ROOT, path), 'utf8');
 const html = read('public/index.html');
-const app = read('public/app.js');
+const appFiles = readdirSync(join(ROOT, 'public/js'))
+  .filter((f) => f.endsWith('.mjs'))
+  .sort()
+  .map((f) => read(`public/js/${f}`));
+const app = appFiles.join('\n');
 const css = read('public/styles.css');
 const gui = read('src/gui.mjs');
+const routeFiles = existsSync(join(ROOT, 'src/routes'))
+  ? readdirSync(join(ROOT, 'src/routes')).filter((f) => f.endsWith('.mjs')).map((f) => read(`src/routes/${f}`))
+  : [];
 
 const ids = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map((m) => m[1]));
 const routes = [...html.matchAll(/data-route="([^"]+)"/g)].map((m) => m[1]);
@@ -30,7 +37,7 @@ test('each navigation link opens a view with a heading, and every view has a lin
     const view = 'view' + route[0].toUpperCase() + route.slice(1);
     assert.ok(ids.has(view), view + ' is missing');
     assert.match(html, new RegExp('<section[^>]*id="' + view + '"[^>]*aria-labelledby="h' + route[0].toUpperCase() + route.slice(1) + '"'));
-    assert.ok(app.includes("id: '" + route + "'"), route + ' is not routed in app.js');
+    assert.ok(app.includes("id: '" + route + "'"), route + ' is not routed in public/js');
     assert.match(html, new RegExp('href="#/' + route + '"'));
   }
 });
@@ -54,7 +61,11 @@ test('the page has landmarks, a skip link and labelled controls', () => {
 
 test('every API endpoint the server offers is reachable from the page', () => {
   const login = read('public/login.js');
-  const literal = [...gui.matchAll(/pathname === '(\/api\/[^']+)'/g)].map((m) => m[1]);
+  const serverSources = [gui, ...routeFiles].join('\n');
+  const literal = [
+    ...[...serverSources.matchAll(/pathname === '(\/api\/[^']+)'/g)].map((m) => m[1]),
+    ...[...serverSources.matchAll(/\bpath:\s*'(\/api\/[^']+)'/g)].map((m) => m[1]),
+  ];
   const wanted = new Set([...literal, '/api/schedule/', '/api/jobs/']);
   assert.ok(wanted.size >= 15, 'expected the server routes to be found');
 
@@ -105,6 +116,6 @@ test('compose includes the template studio tabs, editor, asset manager, and name
   }
   assert.match(html, /<div class="tabpanel"[^>]*id="panelComposeStudio"[^>]*\shidden>/);
   for (const route of ['/api/templates/read', '/api/templates/save', '/api/templates/duplicate', '/api/templates/delete', '/api/templates/assets', '/api/templates/assets/delete']) {
-    assert.ok(app.includes(route), route + ' missing from app.js');
+    assert.ok(app.includes(route), route + ' missing from public/js');
   }
 });

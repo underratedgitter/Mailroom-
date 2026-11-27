@@ -99,7 +99,7 @@ function tlsOptions() {
   try {
     return { cert: readFileSync(TLS_CERT_PATH), key: readFileSync(TLS_KEY_PATH) };
   } catch (err) {
-    throw new Error(`Cannot read the TLS certificate or key: ${errMsg(err)}`);
+    throw new Error(`Cannot read the TLS certificate or key: ${errMsg(err)}`, { cause: err });
   }
 }
 

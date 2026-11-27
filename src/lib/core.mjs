@@ -224,22 +224,12 @@ export function parseRecipientsText(text, { limit = Infinity } = {}) {
     const line = rawLine.trim();
     if (!line || line.startsWith('#')) continue;
 
-    let email = '';
-    let name = '';
-    let company = '';
-
     const angled = line.match(/^(.*?)<([^>]+)>\s*$/);
-    if (angled) {
-      name = angled[1].replace(/^["']|["']$/g, '').trim();
-      email = angled[2].trim();
-    } else {
-      const parts = line.split(/\s*[,;\t]\s*/).filter((part) => part !== '');
-      email = parts[0] || '';
-      name = parts[1] || '';
-      company = parts[2] || '';
-    }
+    const parts = angled
+      ? [angled[2].trim(), angled[1].replace(/^["']|["']$/g, '').trim(), '']
+      : line.split(/\s*[,;\t]\s*/).filter((part) => part !== '');
 
-    records.push({ _email: email, _name: name, _company: company });
+    records.push({ _email: parts[0] || '', _name: parts[1] || '', _company: parts[2] || '' });
   }
   return { ...finishRecords(records, limit), columns: ['email', 'name', 'company'] };
 }
@@ -767,7 +757,10 @@ export function appendLog(logPath, entry, { maxBytes, keep } = logLimits()) {
     appendFileSync(logPath, `${JSON.stringify(entry)}\n`);
   } catch (err) {
     // Mailing on without a record would send duplicates after a resume.
-    throw new Error(`Cannot write the send log ${logPath}: ${errMsg(err)}. Stopped so nobody is mailed without being recorded; fix the problem and run the campaign again to resume.`);
+    throw new Error(
+      `Cannot write the send log ${logPath}: ${errMsg(err)}. Stopped so nobody is mailed without being recorded; fix the problem and run the campaign again to resume.`,
+      { cause: err },
+    );
   }
 }
 

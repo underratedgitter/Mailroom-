@@ -140,6 +140,11 @@ const state = {
   total: 0,
   lastPreview: null,
   previewError: '',
+  composeTab: 'message',
+  studioPath: '',
+  studioDirty: false,
+  studioAssets: [],
+  studioSeq: 0,
 
   sending: false,
   stream: null,
@@ -212,6 +217,41 @@ function confirmDialog({ title, body, confirmLabel = 'Confirm', cancelLabel = 'C
     (check ? ui.confirmCheck : ui.confirmCancel).focus();
   });
 }
+
+let nameResolve = null;
+
+/** A modal text prompt for naming or duplicating a template. */
+function nameDialog({ title, hint = '', value = '', confirmLabel = 'Create' }) {
+  ui.nameTitle.textContent = title;
+  setText(ui.nameHint, hint);
+  ui.nameInput.value = value;
+  setText(ui.nameError, '');
+  ui.nameOk.textContent = confirmLabel;
+  ui.nameDialog.returnValue = '';
+
+  return new Promise((resolve) => {
+    nameResolve = resolve;
+    ui.nameDialog.showModal();
+    ui.nameInput.focus();
+    ui.nameInput.select();
+  });
+}
+
+const DEFAULT_TEMPLATE_HTML = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{{subject}}</title>
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.6; color: #1f2430;">
+  <p>Hi {{name}},</p>
+  <p>Write your message here.</p>
+  <p style="font-size: 12px; color: #667085;">
+    <a href="{{unsubscribe_url}}">Unsubscribe</a>
+  </p>
+</body>
+</html>
+`;
 
 function currentLimit() {
   const n = Number(ui.limit.value);
@@ -410,11 +450,15 @@ function applyState(data) {
   describeCsv();
   renderConn();
   renderDraft();
+  if (state.composeTab === 'studio' && ui.template.value && state.studioPath !== ui.template.value) {
+    loadStudioTemplate();
+  }
 }
 
 function describeTemplate() {
+  renderTemplateControls();
   const t = state.templates.find((x) => x.path === ui.template.value);
-  if (!state.templates.length) { setText(ui.templateHint, 'No templates found. Add an .html file to the templates folder.'); return; }
+  if (!state.templates.length) { setText(ui.templateHint, 'No templates found. Create one above or add an .html file to templates/.'); return; }
   if (!t) { setText(ui.templateHint, ''); return; }
   setText(ui.templateHint, t.assets
     ? plural(t.assets, 'file') + ' in ' + t.assetsDir + ' — attached inline via cid:'
@@ -576,14 +620,17 @@ function renderPlaceholders(placeholders) {
       : 'Use {{name}}, {{company}}, {{email}} or any column of your list.');
 }
 
-function insertToken(token) {
-  const input = ui.subject;
+function insertAtCursor(input, text) {
   const start = input.selectionStart ?? input.value.length;
   const end = input.selectionEnd ?? input.value.length;
-  input.value = input.value.slice(0, start) + token + input.value.slice(end);
+  input.value = input.value.slice(0, start) + text + input.value.slice(end);
   input.focus();
-  input.setSelectionRange(start + token.length, start + token.length);
-  store.set('subject', input.value);
+  input.setSelectionRange(start + text.length, start + text.length);
+}
+
+function insertToken(token) {
+  insertAtCursor(ui.subject, token);
+  store.set('subject', ui.subject.value);
   refreshPreview();
 }
 
@@ -661,6 +708,245 @@ function applyPreview(data) {
   renderTokens();
   markRosterCurrent();
   renderDraft();
+}
+
+// ── Template studio ──────────────────────────────────────────────────
+function setComposeTab(tab, { focus = false } = {}) {
+  const next = tab === 'studio' ? 'studio' : 'message';
+  state.composeTab = next;
+  for (const button of ui.composeTabs.querySelectorAll('[role="tab"]')) {
+    const on = button.dataset.tab === next;
+    setAttr(button, 'aria-selected', String(on));
+    button.tabIndex = on ? 0 : -1;
+    setHidden(button.dataset.tab === 'studio' ? ui.panelComposeStudio : ui.panelComposeMessage, !on);
+    if (on && focus) button.focus();
+  }
+  if (next === 'studio') loadStudioTemplate();
+}
+
+function selectedTemplate() {
+  return state.templates.find((x) => x.path === ui.template.value);
+}
+
+function renderTemplateControls() {
+  const t = selectedTemplate();
+  const hasSelection = Boolean(t);
+  const editable = Boolean(t && !t.bundled);
+  ui.duplicateTemplateBtn.disabled = !hasSelection;
+  ui.deleteTemplateBtn.disabled = !editable;
+  ui.studioHtml.disabled = !hasSelection;
+  ui.studioHtml.readOnly = Boolean(t?.bundled);
+  ui.studioSaveBtn.disabled = !editable;
+  ui.assetBtn.disabled = !editable;
+}
+
+function setStudioStatus(text, kind = '') {
+  setText(ui.studioStatus, text);
+  setClass(ui.studioStatus, 'is-ok', kind === 'ok');
+  setClass(ui.studioStatus, 'is-bad', kind === 'bad');
+}
+
+function renderAssets() {
+  const readOnly = Boolean(selectedTemplate()?.bundled);
+  setHidden(ui.assetEmpty, state.studioAssets.length > 0);
+  reconcile(ui.assetList, state.studioAssets, (a) => a.filename,
+    () => h('li', { class: 'asset-item' },
+      h('div', { class: 'asset-item__meta' },
+        h('span', { class: 'asset-item__name' }),
+        h('span', { class: 'asset-item__cid mono' })),
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn btn--ghost btn--sm', type: 'button', dataset: { action: 'insert' } }, 'Insert'),
+        h('button', { class: 'btn btn--ghost btn--danger-quiet btn--sm', type: 'button', dataset: { action: 'delete' } }, 'Delete'))),
+    (li, asset) => {
+      const kb = asset.size < 1024 ? asset.size + ' B' : Math.max(1, Math.round(asset.size / 1024)) + ' KB';
+      setText(li.firstElementChild.firstElementChild, asset.filename);
+      setText(li.firstElementChild.lastElementChild, 'cid:' + asset.cid + ' · ' + kb);
+      for (const btn of li.lastElementChild.children) btn.disabled = readOnly;
+    });
+}
+
+async function loadStudioTemplate({ force = false } = {}) {
+  const path = ui.template.value;
+  if (!path) {
+    state.studioPath = '';
+    state.studioDirty = false;
+    state.studioAssets = [];
+    ui.studioHtml.value = '';
+    setText(ui.studioFile, 'No template selected');
+    setStudioStatus('');
+    renderAssets();
+    renderTemplateControls();
+    return;
+  }
+  if (!force && state.studioPath === path && state.studioDirty) return;
+
+  const seq = ++state.studioSeq;
+  try {
+    const data = await api('/api/templates/read?path=' + encodeURIComponent(path));
+    if (seq !== state.studioSeq) return;
+    state.studioPath = data.path;
+    state.studioDirty = false;
+    state.studioAssets = data.assets || [];
+    ui.studioHtml.value = data.html || '';
+    setText(ui.studioFile, data.path);
+    setStudioStatus(data.bundled ? 'Bundled template (read-only) — click Duplicate to edit a copy.' : '');
+    renderAssets();
+    renderTemplateControls();
+  } catch (err) {
+    if (seq !== state.studioSeq) return;
+    setStudioStatus(err.message, 'bad');
+  }
+}
+
+async function selectTemplateAndSync(path) {
+  store.set('template', path);
+  await loadState();
+  ui.template.value = path;
+  describeTemplate();
+  await refreshPreview({ resetIndex: true });
+  if (state.composeTab === 'studio') await loadStudioTemplate({ force: true });
+}
+
+async function createTemplate() {
+  const name = await nameDialog({
+    title: 'New template',
+    hint: 'Created in templates/ as a .html file with unsubscribe and greeting placeholders.',
+    confirmLabel: 'Create',
+  });
+  if (!name) return;
+  try {
+    const data = await api('/api/templates/save', { name, html: DEFAULT_TEMPLATE_HTML });
+    await selectTemplateAndSync(data.path);
+    setComposeTab('studio');
+    toast('Created ' + data.name, 'ok');
+  } catch (err) {
+    toast(err.message, 'bad');
+  }
+}
+
+async function duplicateTemplate() {
+  const path = ui.template.value;
+  if (!path) return;
+  const stem = path.replace(/^.*\//, '').replace(/\.html?$/i, '');
+  const name = await nameDialog({
+    title: 'Duplicate template',
+    hint: 'Copies both the template HTML and its inline images folder.',
+    value: stem + '-copy',
+    confirmLabel: 'Duplicate',
+  });
+  if (!name) return;
+  try {
+    const data = await api('/api/templates/duplicate', { path, name });
+    await selectTemplateAndSync(data.path);
+    toast('Duplicated as ' + data.name, 'ok');
+  } catch (err) {
+    toast(err.message, 'bad');
+  }
+}
+
+async function deleteTemplate() {
+  const path = ui.template.value;
+  if (!path) return;
+  const t = state.templates.find((x) => x.path === path);
+  const note = t?.assets
+    ? 'This removes the template file and its ' + plural(t.assets, 'inline image') + '.'
+    : 'This removes the template file from templates/.';
+  const ok = await confirmDialog({
+    title: 'Delete template?',
+    body: [h('p', {}, 'Delete ', h('strong', {}, t?.name || path), '?'), h('p', {}, note)],
+    confirmLabel: 'Delete template',
+    danger: true,
+  });
+  if (!ok) return;
+
+  try {
+    await api('/api/templates/delete', { path });
+    if (store.get('template') === path) store.set('template', '');
+    state.studioPath = '';
+    state.studioDirty = false;
+    await loadState();
+    if (!state.templates.length) ui.template.value = '';
+    store.set('template', ui.template.value || '');
+    describeTemplate();
+    await refreshPreview({ resetIndex: true });
+    await loadStudioTemplate({ force: true });
+    toast('Deleted ' + (t?.name || path), 'ok');
+  } catch (err) {
+    toast(err.message, 'bad');
+  }
+}
+
+async function saveStudioTemplate() {
+  const path = ui.template.value;
+  if (!path) return;
+  ui.studioSaveBtn.disabled = true;
+  setStudioStatus('Saving…');
+  try {
+    await api('/api/templates/save', { path, html: ui.studioHtml.value });
+    state.studioDirty = false;
+    setStudioStatus('Saved', 'ok');
+    await loadState();
+    await refreshPreview();
+  } catch (err) {
+    setStudioStatus(err.message, 'bad');
+  } finally {
+    renderTemplateControls();
+  }
+}
+
+const readFileAsDataUrl = (file) => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onload = () => resolve(String(reader.result || ''));
+  reader.onerror = () => reject(new Error('Could not read ' + file.name));
+  reader.readAsDataURL(file);
+});
+
+async function handleAssetFile(file) {
+  const path = ui.template.value;
+  if (!file || !path) return;
+  if (file.size > 5 * 1024 * 1024) {
+    toast('Images must be 5 MB or smaller.', 'bad');
+    ui.assetInput.value = '';
+    return;
+  }
+  ui.assetBtn.disabled = true;
+  setStudioStatus('Uploading image…');
+  try {
+    const dataBase64 = await readFileAsDataUrl(file);
+    const data = await api('/api/templates/assets', { template: path, filename: file.name, dataBase64 });
+    await loadState();
+    await loadStudioTemplate({ force: true });
+    await refreshPreview();
+    setStudioStatus('Uploaded ' + data.filename, 'ok');
+    toast('Added ' + data.filename + ' (cid:' + data.cid + ')', 'ok');
+  } catch (err) {
+    setStudioStatus(err.message, 'bad');
+    toast(err.message, 'bad');
+  } finally {
+    ui.assetInput.value = '';
+    renderTemplateControls();
+  }
+}
+
+async function deleteAsset(filename) {
+  const path = ui.template.value;
+  if (!path || !filename) return;
+  const ok = await confirmDialog({
+    title: 'Delete image?',
+    body: h('p', {}, 'Remove ', h('strong', {}, filename), ' from this template?'),
+    confirmLabel: 'Delete image',
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await api('/api/templates/assets/delete', { template: path, filename });
+    await loadState();
+    await loadStudioTemplate({ force: true });
+    await refreshPreview();
+    toast('Removed ' + filename, 'ok');
+  } catch (err) {
+    toast(err.message, 'bad');
+  }
 }
 
 // ── Recipients: source tabs, roster and columns ──────────────────────
@@ -1639,10 +1925,51 @@ ui.signOutBtn.addEventListener('click', signOut);
 ui.signOutBtn2.addEventListener('click', signOut);
 
 // Compose
+ui.composeTabs.addEventListener('click', (event) => {
+  const tab = event.target.closest('[role="tab"]');
+  if (tab) setComposeTab(tab.dataset.tab);
+});
+ui.composeTabs.addEventListener('keydown', (event) => {
+  const tabs = [...ui.composeTabs.querySelectorAll('[role="tab"]')];
+  const at = tabs.indexOf(document.activeElement);
+  if (at === -1) return;
+  const next = { ArrowRight: (at + 1) % tabs.length, ArrowLeft: (at + tabs.length - 1) % tabs.length, Home: 0, End: tabs.length - 1 }[event.key];
+  if (next === undefined) return;
+  event.preventDefault();
+  setComposeTab(tabs[next].dataset.tab, { focus: true });
+});
+ui.newTemplateBtn.addEventListener('click', createTemplate);
+ui.duplicateTemplateBtn.addEventListener('click', duplicateTemplate);
+ui.deleteTemplateBtn.addEventListener('click', deleteTemplate);
 ui.template.addEventListener('change', () => {
   store.set('template', ui.template.value);
+  state.studioDirty = false;
   describeTemplate();
   refreshPreview({ resetIndex: true });
+  if (state.composeTab === 'studio') loadStudioTemplate({ force: true });
+});
+ui.studioHtml.addEventListener('input', () => {
+  state.studioDirty = true;
+  setStudioStatus('Unsaved changes');
+});
+ui.studioSaveBtn.addEventListener('click', saveStudioTemplate);
+ui.assetBtn.addEventListener('click', () => ui.assetInput.click());
+ui.assetInput.addEventListener('change', () => {
+  if (ui.assetInput.files?.[0]) handleAssetFile(ui.assetInput.files[0]);
+});
+ui.assetList.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-action]');
+  if (!button) return;
+  const filename = button.closest('li')?.dataset.key;
+  const asset = state.studioAssets.find((a) => a.filename === filename);
+  if (!asset) return;
+  if (button.dataset.action === 'insert') {
+    insertAtCursor(ui.studioHtml, '<img src="cid:' + asset.cid + '" alt="">');
+    state.studioDirty = true;
+    setStudioStatus('Unsaved changes');
+  } else if (button.dataset.action === 'delete') {
+    deleteAsset(asset.filename);
+  }
 });
 ui.subject.addEventListener('input', debounce(() => {
   store.set('subject', ui.subject.value);
@@ -1773,6 +2100,27 @@ ui.confirmDialog.addEventListener('close', () => {
   const resolve = confirmResolve;
   confirmResolve = null;
   resolve?.(ui.confirmDialog.returnValue === 'ok');
+});
+
+// Name dialog
+ui.nameInput.addEventListener('input', () => setText(ui.nameError, ''));
+ui.nameForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  if (!ui.nameInput.value.trim()) {
+    setText(ui.nameError, 'Enter a template name.');
+    ui.nameInput.focus();
+    return;
+  }
+  ui.nameDialog.close('ok');
+});
+ui.nameCancel.addEventListener('click', () => ui.nameDialog.close('cancel'));
+ui.nameDialog.addEventListener('click', (event) => {
+  if (event.target === ui.nameDialog) ui.nameDialog.close('cancel');
+});
+ui.nameDialog.addEventListener('close', () => {
+  const resolve = nameResolve;
+  nameResolve = null;
+  resolve?.(ui.nameDialog.returnValue === 'ok' ? ui.nameInput.value.trim() : null);
 });
 
 // ── Background refresh ───────────────────────────────────────────────

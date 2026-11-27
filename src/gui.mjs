@@ -20,6 +20,12 @@
  *   POST /api/preview          render one recipient, with images inlined, plus column and {{field}} checks
  *   POST /api/roster           who is in a saved CSV, and how its columns map to merge fields
  *   POST /api/recipients       save (or dry-run) a pasted list or an uploaded CSV into data/
+ *   GET  /api/templates/read   read a template's HTML and inline assets
+ *   POST /api/templates/save   create or update a template HTML file in templates/
+ *   POST /api/templates/duplicate copy a template and its -assets folder
+ *   POST /api/templates/delete delete a template and its -assets folder
+ *   POST /api/templates/assets upload an inline image (<= 5 MB) into <template>-assets/
+ *   POST /api/templates/assets/delete delete one inline image from <template>-assets/
  *   GET  /api/suppression      the suppression list
  *   POST /api/suppress         add addresses to it
  *   GET  /api/schedule         queued campaigns (POST creates one; POST /api/schedule/:id/cancel|run)
@@ -40,7 +46,7 @@ import { hashPassword, verifyPassword, parsePasswordHash } from './lib/auth.mjs'
 import { configIssue, unsubscribeUrlIssue, bareAddress, unsubscribeLink } from './lib/mailer.mjs';
 import { loadConfig, saveConfig, resolveConfigPath, smtpFileValues, assertConfig } from './lib/config.mjs';
 import { readFileSync, writeFileSync, renameSync, rmSync, existsSync, readdirSync, statSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
-import { dirname, extname, join, resolve, sep } from 'node:path';
+import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   recipientsFromFile,
@@ -332,6 +338,9 @@ const json = (res, code, body) => {
 };
 
 const fail = (res, code, message) => json(res, code, { error: message });
+const badRequest = (message) => Object.assign(new Error(message), { status: 400 });
+const forbidden = (message) => Object.assign(new Error(message), { status: 403 });
+const conflict = (message) => Object.assign(new Error(message), { status: 409 });
 
 async function readJson(req, limit = 2 * 1024 * 1024) {
   let size = 0;
@@ -369,23 +378,39 @@ function isInside(candidate, roots) {
   return roots.some((root) => candidate === root || candidate.startsWith(root + sep));
 }
 
+const ENCODED_TRAVERSAL_RE = /%(?:2e|2f|5c|00)/i;
+const DOT_SEGMENT_RE = /(^|[\\/])\.\.([\\/]|$)/;
+
+function assertSafeRelativeInput(input, label) {
+  if (typeof input !== 'string') throw badRequest(`Invalid ${label}`);
+  const value = input.trim();
+  if (!value) throw badRequest(`Missing ${label}`);
+  if (value.includes('\0') || value.includes('\\') || ENCODED_TRAVERSAL_RE.test(value) || DOT_SEGMENT_RE.test(value)) {
+    throw badRequest(`Not allowed: ${value}`);
+  }
+  return value;
+}
+
 /** Only files inside data/ or templates/ may be referenced by the page. */
 function safePath(input, { roots = [DATA_DIR, TEMPLATE_DIR], ext = null } = {}) {
-  const value = String(input || '').trim();
-  if (!value) throw new Error('Missing file path');
+  const value = assertSafeRelativeInput(input, 'file path');
   const absolute = resolve(ROOT, value);
-  if (!isInside(absolute, roots)) throw new Error(`Not allowed: ${value}`);
+  if (!isInside(absolute, roots)) throw badRequest(`Not allowed: ${value}`);
   if (ext && !ext.includes(extname(absolute).toLowerCase())) {
-    throw new Error(`Expected ${ext.join(' / ')}: ${value}`);
+    throw badRequest(`Expected ${ext.join(' / ')}: ${value}`);
   }
-  if (!existsSync(absolute) || !statSync(absolute).isFile()) {
-    throw new Error(`File not found: ${value}`);
+  let stat;
+  try {
+    stat = lstatSync(absolute);
+  } catch {
+    throw badRequest(`File not found: ${value}`);
   }
-  // statSync and readFileSync follow symlinks, so a link placed inside data/
-  // would otherwise pass the prefix check and read any file the server can.
+  // Reject symlinks directly (even within the same root or when dangling).
+  if (stat.isSymbolicLink()) throw badRequest(`Not allowed: ${value}`);
+  if (!stat.isFile()) throw badRequest(`File not found: ${value}`);
   const real = realpathSync(absolute);
   if (!isInside(real, roots.map(realRoot))) {
-    throw new Error(`Not allowed: ${value}`);
+    throw badRequest(`Not allowed: ${value}`);
   }
   return real;
 }
@@ -394,13 +419,206 @@ const rel = (absolute) => (absolute.startsWith(ROOT + sep)
   ? absolute.slice(ROOT.length + 1).split(sep).join('/')
   : absolute);
 
+const BUNDLED_TEMPLATES = new Set([
+  'bcci-connect.html',
+  'bcci-connect-v2.html',
+  'bcci-membership.html',
+]);
+const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']);
+const EXT_TO_FORMAT = { '.png': 'png', '.jpg': 'jpeg', '.jpeg': 'jpeg', '.gif': 'gif', '.webp': 'webp' };
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+const isBundledTemplate = (templatePath) => BUNDLED_TEMPLATES.has(basename(templatePath));
+
+function assertEditableTemplate(templatePath) {
+  if (isBundledTemplate(templatePath)) {
+    throw forbidden('Bundled templates are read-only — duplicate it to edit a copy');
+  }
+}
+
+/** Top-level template HTML files inside templates/ only (excludes -assets/ and subfolders). */
+function safeTemplatePath(input) {
+  const real = safePath(input, { roots: [TEMPLATE_DIR], ext: ['.html', '.htm'] });
+  const file = basename(real);
+  if (file.startsWith('.') || dirname(real) !== realRoot(TEMPLATE_DIR)) {
+    throw badRequest(`Not allowed: ${input}`);
+  }
+  return real;
+}
+
+function resolveSafeAssetsDir(templatePath, { create = false } = {}) {
+  const guess = templatePath.replace(/\.html?$/i, '') + '-assets';
+  try {
+    const stat = lstatSync(guess);
+    // A symlinked assets folder must not become a window into the filesystem.
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw badRequest('Not allowed: invalid assets folder');
+    }
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+    if (!create) return null;
+    mkdirSync(guess, { recursive: true });
+  }
+  const real = realpathSync(guess);
+  if (!isInside(real, [realRoot(TEMPLATE_DIR)])) {
+    throw badRequest('Not allowed: invalid assets folder');
+  }
+  return real;
+}
+
 /** The `-assets` folder that sits beside a template, if there is one. */
 function assetsDirFor(templatePath) {
-  const guess = templatePath.replace(/\.html?$/i, '') + '-assets';
-  if (!existsSync(guess) || !statSync(guess).isDirectory()) return null;
-  // A symlinked assets folder must not become a window into the filesystem.
-  const real = realpathSync(guess);
-  return isInside(real, [realRoot(TEMPLATE_DIR)]) ? real : null;
+  try {
+    return resolveSafeAssetsDir(templatePath, { create: false });
+  } catch {
+    return null;
+  }
+}
+
+function writeAtomicFile(target, data) {
+  const dir = dirname(target);
+  mkdirSync(dir, { recursive: true });
+  const staging = join(dir, `.${basename(target)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`);
+  try {
+    writeFileSync(staging, data, { flag: 'wx' });
+    renameSync(staging, target);
+  } catch (err) {
+    rmSync(staging, { force: true });
+    throw err;
+  }
+}
+
+function normalizeTemplateName(rawName) {
+  if (typeof rawName !== 'string') throw badRequest('Template name is required');
+  let value = rawName.trim();
+  if (!value) throw badRequest('Template name is required');
+  if (value.includes('/') || value.includes('\\') || value.includes('\0') || value.includes(':')
+    || value.includes('..') || ENCODED_TRAVERSAL_RE.test(value) || value.startsWith('.')) {
+    throw badRequest(`Invalid template name: ${value}`);
+  }
+  value = value.replace(/\.html?$/i, '').trim();
+  const slug = value
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  if (!slug || slug === '.' || slug === '..' || slug.startsWith('.')) {
+    throw badRequest(`Invalid template name: ${rawName}`);
+  }
+  if (slug.length > 80) throw badRequest('Template name is too long');
+  return `${slug}.html`;
+}
+
+function safeAssetFilename(rawName) {
+  if (typeof rawName !== 'string') throw badRequest('Asset filename is required');
+  const value = rawName.trim();
+  if (!value) throw badRequest('Asset filename is required');
+  if (value.includes('/') || value.includes('\\') || value.includes('\0') || value.includes(':')
+    || value.includes('..') || ENCODED_TRAVERSAL_RE.test(value) || value.startsWith('.')) {
+    throw badRequest(`Invalid asset filename: ${value}`);
+  }
+  const ext = extname(value).toLowerCase();
+  if (!IMAGE_EXTS.has(ext)) {
+    throw badRequest('Invalid image format: expected PNG, JPG, GIF, or WEBP');
+  }
+  const rawStem = value.slice(0, value.length - ext.length).trim();
+  if (!rawStem || rawStem.startsWith('.')) {
+    throw badRequest(`Invalid asset filename: ${value}`);
+  }
+  const stem = rawStem
+    .replace(/[^a-zA-Z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  if (!stem || stem === '.' || stem === '..' || stem.startsWith('.')) {
+    throw badRequest(`Invalid asset filename: ${value}`);
+  }
+  return { filename: `${stem}${ext}`, cid: stem, ext };
+}
+
+function listAssetsFor(assetsDir) {
+  if (!assetsDir) return [];
+  return readdirSync(assetsDir)
+    .filter((name) => !name.startsWith('.'))
+    .sort()
+    .flatMap((name) => {
+      const full = join(assetsDir, name);
+      let stat;
+      try { stat = lstatSync(full); } catch { return []; }
+      if (stat.isSymbolicLink() || !stat.isFile()) return [];
+      const ext = extname(name).toLowerCase();
+      if (!IMAGE_EXTS.has(ext)) return [];
+      return [{ filename: name, cid: basename(name, ext), size: stat.size }];
+    });
+}
+
+function detectImageFormat(buf) {
+  if (buf.length >= 8
+    && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47
+    && buf[4] === 0x0d && buf[5] === 0x0a && buf[6] === 0x1a && buf[7] === 0x0a) {
+    return 'png';
+  }
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+    return 'jpeg';
+  }
+  if (buf.length >= 6) {
+    const head6 = buf.subarray(0, 6).toString('ascii');
+    if (head6 === 'GIF87a' || head6 === 'GIF89a') return 'gif';
+  }
+  if (buf.length >= 12
+    && buf.subarray(0, 4).toString('ascii') === 'RIFF'
+    && buf.subarray(8, 12).toString('ascii') === 'WEBP') {
+    return 'webp';
+  }
+  return null;
+}
+
+function decodeImageBase64(raw, expectedExt) {
+  if (typeof raw !== 'string') throw badRequest('Image data is required');
+  let payload = raw.trim();
+  if (!payload) throw badRequest('Image data is required');
+  const expectedFormat = EXT_TO_FORMAT[expectedExt];
+  if (!expectedFormat) throw badRequest('Invalid image format');
+
+  if (payload.startsWith('data:')) {
+    const match = payload.match(/^data:image\/(png|jpeg|jpg|gif|webp);base64,(.+)$/is);
+    if (!match) throw badRequest('Invalid image data URL: expected PNG, JPG, GIF, or WEBP');
+    const urlFormat = match[1].toLowerCase() === 'jpg' ? 'jpeg' : match[1].toLowerCase();
+    if (urlFormat !== expectedFormat) {
+      throw badRequest('Invalid image data URL: MIME type does not match file extension');
+    }
+    payload = match[2];
+  }
+  const compact = payload.replace(/\s+/g, '');
+  if (!compact || !/^[A-Za-z0-9+/]+={0,2}$/.test(compact) || compact.length % 4 !== 0) {
+    throw badRequest('Invalid base64 image payload');
+  }
+  const buf = Buffer.from(compact, 'base64');
+  if (!buf.length) throw badRequest('Image payload is empty');
+  if (buf.length > MAX_IMAGE_BYTES) throw Object.assign(new Error('Image exceeds 5 MB limit'), { status: 413 });
+  if (detectImageFormat(buf) !== expectedFormat) {
+    throw badRequest('Invalid image content: file signature does not match format');
+  }
+  return buf;
+}
+
+function templateTargetForNew(rawName) {
+  const filename = normalizeTemplateName(rawName);
+  assertEditableTemplate(filename);
+  mkdirSync(TEMPLATE_DIR, { recursive: true });
+  if (lstatSync(TEMPLATE_DIR).isSymbolicLink()) {
+    throw badRequest('Not allowed: templates directory is a symlink');
+  }
+  const templatesReal = realpathSync(TEMPLATE_DIR);
+  if (!isInside(templatesReal, [realRoot(TEMPLATE_DIR)])) {
+    throw badRequest('Not allowed: invalid templates directory');
+  }
+  const target = join(templatesReal, filename);
+  try {
+    const stat = lstatSync(target);
+    if (stat.isSymbolicLink()) throw badRequest(`Not allowed: ${filename}`);
+    throw conflict(`A template named ${filename} already exists`);
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+  return target;
 }
 
 function listCsvs() {
@@ -428,17 +646,18 @@ function listCsvs() {
 function listTemplates() {
   if (!existsSync(TEMPLATE_DIR)) return [];
   return readdirSync(TEMPLATE_DIR)
-    .filter((name) => /\.html?$/i.test(name))
+    .filter((name) => !name.startsWith('.') && /\.html?$/i.test(name))
     .filter((name) => !lstatSync(join(TEMPLATE_DIR, name)).isSymbolicLink())
     .sort()
     .map((name) => {
       const path = join(TEMPLATE_DIR, name);
-      const assets = assetsDirFor(path);
+      const assetsDir = assetsDirFor(path);
       return {
         path: rel(path),
         name,
-        assetsDir: assets ? rel(assets) : null,
-        assets: assets ? readdirSync(assets).filter((f) => !f.startsWith('.')).length : 0,
+        bundled: isBundledTemplate(path),
+        assetsDir: assetsDir ? rel(assetsDir) : null,
+        assets: listAssetsFor(assetsDir).length,
       };
     });
 }
@@ -1206,6 +1425,128 @@ async function route(req, res) {
       duplicates: parsed.duplicates,
       invalid: parsed.invalid,
     });
+  }
+
+  if (req.method === 'GET' && pathname === '/api/templates/read') {
+    const templatePath = safeTemplatePath(url.searchParams.get('path'));
+    const assetsDir = assetsDirFor(templatePath);
+    return json(res, 200, {
+      path: rel(templatePath),
+      name: basename(templatePath),
+      bundled: isBundledTemplate(templatePath),
+      html: readFileSync(templatePath, 'utf8'),
+      assetsDir: assetsDir ? rel(assetsDir) : null,
+      assets: listAssetsFor(assetsDir),
+    });
+  }
+
+  if (req.method === 'POST' && pathname === '/api/templates/save') {
+    const body = await readJson(req);
+    const html = typeof body.html === 'string' ? body.html : '';
+    if (!html.trim()) return fail(res, 400, 'Template HTML cannot be empty');
+
+    if (body.path !== undefined) {
+      if (typeof body.path !== 'string') return fail(res, 400, 'Invalid template path');
+      if (body.path.trim()) {
+        const target = safeTemplatePath(body.path);
+        assertEditableTemplate(target);
+        writeAtomicFile(target, html);
+        return json(res, 200, { path: rel(target), name: basename(target) });
+      }
+    }
+
+    const target = templateTargetForNew(body.name);
+    writeAtomicFile(target, html);
+    return json(res, 201, { path: rel(target), name: basename(target) });
+  }
+
+  if (req.method === 'POST' && pathname === '/api/templates/duplicate') {
+    const body = await readJson(req);
+    const srcPath = safeTemplatePath(body.path);
+    const target = templateTargetForNew(body.name);
+    const srcAssets = assetsDirFor(srcPath);
+    const destAssetsGuess = target.replace(/\.html?$/i, '') + '-assets';
+
+    // Validate destination assets folder does not pre-exist as a symlink before writing.
+    let assetsCreated = false;
+    if (srcAssets) {
+      try {
+        const stat = lstatSync(destAssetsGuess);
+        if (stat.isSymbolicLink() || !stat.isDirectory()) {
+          return fail(res, 400, 'Not allowed: invalid destination assets folder');
+        }
+      } catch (err) {
+        if (err.code !== 'ENOENT') throw err;
+        assetsCreated = true;
+      }
+    }
+
+    writeAtomicFile(target, readFileSync(srcPath, 'utf8'));
+    if (srcAssets) {
+      try {
+        const destAssets = resolveSafeAssetsDir(target, { create: true });
+        for (const asset of listAssetsFor(srcAssets)) {
+          writeAtomicFile(join(destAssets, asset.filename), readFileSync(join(srcAssets, asset.filename)));
+        }
+      } catch (err) {
+        rmSync(target, { force: true });
+        if (assetsCreated) rmSync(destAssetsGuess, { recursive: true, force: true });
+        throw err;
+      }
+    }
+    return json(res, 201, {
+      path: rel(target),
+      name: basename(target),
+      assetsDir: srcAssets ? rel(destAssetsGuess) : null,
+    });
+  }
+
+  if (req.method === 'POST' && pathname === '/api/templates/delete') {
+    const body = await readJson(req);
+    const target = safeTemplatePath(body.path);
+    assertEditableTemplate(target);
+    const assetsDir = assetsDirFor(target);
+    rmSync(target, { force: true });
+    if (assetsDir) rmSync(assetsDir, { recursive: true, force: true });
+    return json(res, 200, { deleted: rel(target) });
+  }
+
+  if (req.method === 'POST' && pathname === '/api/templates/assets') {
+    // 5 MB binary decoded -> ~6.7 MB base64 + JSON envelope.
+    const body = await readJson(req, 8 * 1024 * 1024);
+    const templatePath = safeTemplatePath(body.template);
+    assertEditableTemplate(templatePath);
+    const { filename, cid, ext } = safeAssetFilename(body.filename);
+    const bytes = decodeImageBase64(body.dataBase64, ext);
+    const assetsDir = resolveSafeAssetsDir(templatePath, { create: true });
+    const target = join(assetsDir, filename);
+    try {
+      if (lstatSync(target).isSymbolicLink()) return fail(res, 400, 'Not allowed');
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+    writeAtomicFile(target, bytes);
+    return json(res, 201, { filename, cid, size: bytes.length, assetsDir: rel(assetsDir) });
+  }
+
+  if (req.method === 'POST' && pathname === '/api/templates/assets/delete') {
+    const body = await readJson(req);
+    const templatePath = safeTemplatePath(body.template);
+    assertEditableTemplate(templatePath);
+    const { filename } = safeAssetFilename(body.filename);
+    const assetsDir = resolveSafeAssetsDir(templatePath, { create: false });
+    if (!assetsDir) return fail(res, 404, 'Asset folder not found');
+    const target = join(assetsDir, filename);
+    let stat;
+    try {
+      stat = lstatSync(target);
+    } catch {
+      return fail(res, 404, 'Asset not found');
+    }
+    if (stat.isSymbolicLink() || !stat.isFile()) return fail(res, 400, 'Not allowed');
+    if (!isInside(realpathSync(target), [realRoot(TEMPLATE_DIR)])) return fail(res, 400, 'Not allowed');
+    rmSync(target, { force: true });
+    return json(res, 200, { deleted: filename });
   }
 
   if (req.method === 'POST' && pathname === '/api/verify') {

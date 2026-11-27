@@ -3,11 +3,11 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { networkInterfaces } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { startServer, expectStartupFailure, post, get, wait } from './helpers/server.mjs';
+import { CSV, startServer, expectStartupFailure, post, get, wait } from './helpers/server.mjs';
 import { hashPassword, verifyPassword } from '../src/lib/auth.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -315,4 +315,162 @@ test('with no GUI_HOST the server listens on loopback only', async (t) => {
     sock.on('error', () => resolveDone(true));
   });
   assert.equal(refused, true, 'reachable from a non-loopback address');
+});
+
+// ── Template studio security ─────────────────────────────────────────
+test('template studio routes require authentication and reject cross-site requests', async (t) => {
+  const server = await startServer({ env: { MAILROOM_PASSWORD: 'secret-pass' } });
+  t.after(server.stop);
+  const routes = [
+    ['/api/templates/save', { name: `auth-check-${process.pid}`, html: '<p>hi</p>' }],
+    ['/api/templates/duplicate', { path: 'templates/bcci-connect.html', name: `auth-dup-${process.pid}` }],
+    ['/api/templates/delete', { path: 'templates/bcci-connect.html' }],
+    ['/api/templates/assets', { template: 'templates/bcci-connect.html', filename: 'x.png', dataBase64: 'iVBORw0KGgo=' }],
+    ['/api/templates/assets/delete', { template: 'templates/bcci-connect.html', filename: 'x.png' }],
+  ];
+
+  assert.equal((await get(server.base, '/api/templates/read?path=templates/bcci-connect.html')).status, 401);
+  for (const [path, body] of routes) {
+    assert.equal((await post(server.base, path, body)).status, 401, `${path} unauth`);
+  }
+
+  const login = await post(server.base, '/api/login', { password: 'secret-pass' });
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+  for (const [path, body] of routes) {
+    assert.equal((await post(server.base, path, body, { cookie, origin: 'https://evil.example' })).status, 403, `${path} origin`);
+    assert.equal((await post(server.base, path, body, { cookie, 'sec-fetch-site': 'cross-site' })).status, 403, `${path} cross-site`);
+    assert.equal((await post(server.base, path, body, { cookie, 'sec-fetch-site': 'same-site' })).status, 403, `${path} same-site`);
+  }
+});
+
+test('template asset upload checks magic bytes and rejects spoofed or mismatched files', async (t) => {
+  const server = await startServer();
+  const stem = `sec-asset-${process.pid}`;
+  const path = `templates/${stem}.html`;
+  t.after(async () => {
+    rmSync(join(ROOT, path), { force: true });
+    rmSync(join(ROOT, `templates/${stem}-assets`), { recursive: true, force: true });
+    await server.stop();
+  });
+
+  assert.equal((await post(server.base, '/api/templates/save', { name: stem, html: '<p>ok</p>' })).status, 201);
+
+  const scriptPayload = Buffer.from('<svg onload="alert(1)"><script>alert(1)</script></svg>').toString('base64');
+  assert.equal((await post(server.base, '/api/templates/assets', {
+    template: path, filename: 'spoof.png', dataBase64: `data:image/png;base64,${scriptPayload}`,
+  })).status, 400);
+  assert.equal((await post(server.base, '/api/templates/assets', {
+    template: path, filename: 'spoof.jpg', dataBase64: Buffer.from('<!doctype html><script>x</script>').toString('base64'),
+  })).status, 400);
+
+  const gifBytes = Buffer.from('GIF89a01000100', 'ascii').toString('base64');
+  assert.equal((await post(server.base, '/api/templates/assets', {
+    template: path, filename: 'mismatch.png', dataBase64: `data:image/png;base64,${gifBytes}`,
+  })).status, 400);
+
+  const pngBytes = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex').toString('base64');
+  assert.equal((await post(server.base, '/api/templates/assets', {
+    template: path, filename: 'mismatch.jpg', dataBase64: `data:image/png;base64,${pngBytes}`,
+  })).status, 400);
+
+  const valid = [
+    ['ok.png', `data:image/png;base64,${pngBytes}`],
+    ['ok.jpg', `data:image/jpeg;base64,${Buffer.from('ffd8ffe000104a464946', 'hex').toString('base64')}`],
+    ['ok.gif', `data:image/gif;base64,${gifBytes}`],
+    ['ok.webp', `data:image/webp;base64,${Buffer.concat([Buffer.from('RIFF'), Buffer.from([0x10, 0, 0, 0]), Buffer.from('WEBP')]).toString('base64')}`],
+  ];
+  for (const [filename, dataBase64] of valid) {
+    assert.equal((await post(server.base, '/api/templates/assets', { template: path, filename, dataBase64 })).status, 201, filename);
+  }
+});
+
+test('template studio blocks modifying or deleting bundled templates and nested template files', async (t) => {
+  const server = await startServer();
+  const copyStem = `sec-bundled-copy-${process.pid}`;
+  const nestedRel = `templates/bcci-connect-assets/nested-${process.pid}.html`;
+  mkdirSync(join(ROOT, 'templates/bcci-connect-assets'), { recursive: true });
+  writeFileSync(join(ROOT, nestedRel), '<p>nested</p>');
+  t.after(async () => {
+    rmSync(join(ROOT, nestedRel), { force: true });
+    rmSync(join(ROOT, `templates/${copyStem}.html`), { force: true });
+    rmSync(join(ROOT, `templates/${copyStem}-assets`), { recursive: true, force: true });
+    await server.stop();
+  });
+
+  const before = readFileSync(join(ROOT, 'templates/bcci-connect.html'), 'utf8');
+  assert.equal((await post(server.base, '/api/templates/save', { path: 'templates/bcci-connect.html', html: '<p>pwned</p>' })).status, 403);
+  assert.equal((await post(server.base, '/api/templates/delete', { path: 'templates/bcci-connect.html' })).status, 403);
+  assert.equal((await post(server.base, '/api/templates/assets', {
+    template: 'templates/bcci-connect.html',
+    filename: 'pwn.png',
+    dataBase64: Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex').toString('base64'),
+  })).status, 403);
+  assert.equal((await post(server.base, '/api/templates/assets/delete', {
+    template: 'templates/bcci-connect.html',
+    filename: 'BCCI-Connect-Logo.png',
+  })).status, 403);
+  assert.equal(readFileSync(join(ROOT, 'templates/bcci-connect.html'), 'utf8'), before);
+
+  // Reading and duplicating a bundled template remain allowed.
+  assert.equal((await get(server.base, '/api/templates/read?path=templates/bcci-connect.html')).status, 200);
+  assert.equal((await post(server.base, '/api/templates/duplicate', { path: 'templates/bcci-connect.html', name: copyStem })).status, 201);
+
+  // Nested files inside -assets or subdirectories are outside the template set.
+  assert.equal((await get(server.base, `/api/templates/read?path=${encodeURIComponent(nestedRel)}`)).status, 400);
+  assert.equal((await post(server.base, '/api/templates/save', { path: nestedRel, html: '<p>x</p>' })).status, 400);
+  assert.equal((await post(server.base, '/api/templates/delete', { path: nestedRel })).status, 400);
+});
+
+test('template studio rejects path traversal, encoded separators, null bytes, and nested dot segments', async (t) => {
+  const server = await startServer();
+  const stem = `sec-paths-${process.pid}`;
+  const path = `templates/${stem}.html`;
+  t.after(async () => {
+    rmSync(join(ROOT, path), { force: true });
+    rmSync(join(ROOT, `templates/${stem}-assets`), { recursive: true, force: true });
+    await server.stop();
+  });
+  assert.equal((await post(server.base, '/api/templates/save', { name: stem, html: '<p>ok</p>' })).status, 201);
+
+  for (const badPath of [
+    'templates/../templates/bcci-connect.html',
+    'templates%2F..%2Fpackage.json',
+    '/etc/passwd',
+    'templates/bcci-connect.html\0.png',
+  ]) {
+    assert.equal((await get(server.base, `/api/templates/read?path=${encodeURIComponent(badPath)}`)).status, 400, badPath);
+  }
+  for (const badName of ['a%2fb', 'bad%5cfile', 'foo%00bar', 'foo..bar', 123]) {
+    assert.equal((await post(server.base, '/api/templates/save', { name: badName, html: '<p>x</p>' })).status, 400, String(badName));
+  }
+  const pngBytes = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex').toString('base64');
+  for (const badFile of ['a%2fb.png', 'bad%5c.png', 'a%00b.png', 'a..b.png', 'foo\0.png']) {
+    assert.equal((await post(server.base, '/api/templates/assets', { template: path, filename: badFile, dataBase64: pngBytes })).status, 400, badFile);
+  }
+});
+
+test('template HTML cannot execute in app origin or be served as raw HTML', async (t) => {
+  const server = await startServer();
+  const stem = `sec-xss-${process.pid}`;
+  const path = `templates/${stem}.html`;
+  t.after(async () => {
+    rmSync(join(ROOT, path), { force: true });
+    await server.stop();
+  });
+
+  const payload = '<img src=x onerror="fetch(\'/api/send\')"><script src="/app.js"></script><script>alert(1)</script>';
+  assert.equal((await post(server.base, '/api/templates/save', { name: stem, html: payload })).status, 201);
+
+  const readRes = await get(server.base, `/api/templates/read?path=${encodeURIComponent(path)}`);
+  assert.equal(readRes.status, 200);
+  assert.match(readRes.headers.get('content-type'), /^application\/json/);
+  assert.equal(readRes.headers.get('x-content-type-options'), 'nosniff');
+
+  const previewRes = await post(server.base, '/api/preview', { csv: CSV, html: path, subject: 'XSS test' });
+  assert.equal(previewRes.status, 200);
+  assert.match(previewRes.headers.get('content-type'), /^application\/json/);
+  assert.equal(previewRes.headers.get('x-content-type-options'), 'nosniff');
+
+  // Server never exposes templates/* directly over HTTP.
+  assert.equal((await get(server.base, `/templates/${stem}.html`)).status, 404);
 });

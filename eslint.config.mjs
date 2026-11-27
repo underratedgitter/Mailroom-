@@ -23,6 +23,14 @@ export default [
     },
   },
   {
+    files: ['public/**/*.mjs'],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: 'module',
+      globals: globals.browser,
+    },
+  },
+  {
     rules: {
       'no-unused-vars': ['error', {
         argsIgnorePattern: '^_',

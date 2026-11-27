@@ -7,7 +7,11 @@ import { fileURLToPath } from 'node:url';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (path) => readFileSync(join(ROOT, path), 'utf8');
 const html = read('public/index.html');
-const app = read('public/app.js');
+const appFiles = readdirSync(join(ROOT, 'public/js'))
+  .filter((f) => f.endsWith('.mjs'))
+  .sort()
+  .map((f) => read(`public/js/${f}`));
+const app = appFiles.join('\n');
 const css = read('public/styles.css');
 const gui = read('src/gui.mjs');
 const routeFiles = existsSync(join(ROOT, 'src/routes'))

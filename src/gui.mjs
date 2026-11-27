@@ -270,16 +270,24 @@ const STATIC = {
   '/': ['index.html', 'text/html; charset=utf-8'],
   '/index.html': ['index.html', 'text/html; charset=utf-8'],
   '/styles.css': ['styles.css', 'text/css; charset=utf-8'],
-  '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
   '/login.html': ['login.html', 'text/html; charset=utf-8'],
   '/login.css': ['login.css', 'text/css; charset=utf-8'],
   '/login.js': ['login.js', 'text/javascript; charset=utf-8'],
   '/favicon.svg': ['favicon.svg', 'image/svg+xml'],
 };
 
+const JS_MODULE_PATH_RE = /^\/js\/([a-z0-9-]+\.mjs)$/;
+
+/** @param {string} pathname @returns {[string, string] | null} */
+function staticEntry(pathname) {
+  if (STATIC[pathname]) return STATIC[pathname];
+  const match = pathname.match(JS_MODULE_PATH_RE);
+  return match ? [`js/${match[1]}`, 'text/javascript; charset=utf-8'] : null;
+}
+
 /** @param {ServerResponse} res @param {string} pathname */
 function serveStatic(res, pathname) {
-  const entry = STATIC[pathname];
+  const entry = staticEntry(pathname);
   if (!entry) return false;
   const [file, type] = entry;
   const full = join(PUBLIC_DIR, file);

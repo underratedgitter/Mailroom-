@@ -67,10 +67,10 @@ loadConfig();
  * @param {string} msg
  * @returns {never}
  */
-const die = (msg) => {
+function die(msg) {
   console.error(`\nError: ${msg}\n`);
   process.exit(1);
-};
+}
 
 let values;
 try {

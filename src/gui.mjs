@@ -45,6 +45,7 @@ import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { hashPassword, verifyPassword, parsePasswordHash } from './lib/auth.mjs';
 import { configIssue, unsubscribeUrlIssue, bareAddress, unsubscribeLink } from './lib/mailer.mjs';
 import { loadConfig, saveConfig, smtpFileValues, assertConfig } from './lib/config.mjs';
+import { errMsg, errCode, errStatus, httpError, badRequest, forbidden, conflict } from './lib/errors.mjs';
 import { readFileSync, writeFileSync, renameSync, rmSync, existsSync, readdirSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -88,7 +89,7 @@ import { missingSmtpFields } from './lib/mailer.mjs';
 /** @typedef {import('./lib/core.mjs').ParsedRecipients} ParsedRecipients */
 /** @typedef {import('./lib/core.mjs').CampaignEvent} CampaignEvent */
 /** @typedef {import('./lib/core.mjs').CampaignRunSummary} CampaignRunSummary */
-/** @typedef {Error & { status?: number, code?: string }} HttpError */
+/** @typedef {import('./lib/errors.mjs').HttpError} HttpError */
 /** @typedef {{ sent: number, failed: number, skipped: number, failures: unknown[], stopped: boolean, error?: string, remaining?: number, total?: number, logPath?: string | null, suppressed?: number, uncertain?: unknown[] }} JobSummary */
 /**
  * @typedef {CampaignEvent
@@ -151,13 +152,6 @@ import { missingSmtpFields } from './lib/mailer.mjs';
  *   result: { sent: number, failed: number, skipped: number, uncertain?: number } | null,
  * }} ScheduleEntry
  */
-
-/** @param {unknown} err @returns {string} */
-const errMsg = (err) => (err instanceof Error ? err.message : String(err));
-/** @param {unknown} err @returns {string | undefined} */
-const errCode = (err) => (err && typeof err === 'object' && 'code' in err && typeof err.code === 'string' ? err.code : undefined);
-/** @param {unknown} err @returns {number | undefined} */
-const errStatus = (err) => (err && typeof err === 'object' && 'status' in err && typeof err.status === 'number' ? err.status : undefined);
 
 // Read the product config before anything looks at process.env.
 const configFile = loadConfig();
@@ -459,12 +453,6 @@ const json = (res, code, body) => {
  * @param {string} message
  */
 const fail = (res, code, message) => json(res, code, { error: message });
-/** @param {string} message @returns {HttpError} */
-const badRequest = (message) => Object.assign(new Error(message), { status: 400 });
-/** @param {string} message @returns {HttpError} */
-const forbidden = (message) => Object.assign(new Error(message), { status: 403 });
-/** @param {string} message @returns {HttpError} */
-const conflict = (message) => Object.assign(new Error(message), { status: 409 });
 
 /**
  * @param {IncomingMessage} req
@@ -478,7 +466,7 @@ async function readJson(req, limit = 2 * 1024 * 1024) {
   for await (const chunk of req) {
     const buf = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
     size += buf.length;
-    if (size > limit) throw Object.assign(new Error('Request body too large'), { status: 413 });
+    if (size > limit) throw httpError(413, 'Request body too large');
     chunks.push(buf);
   }
   if (!chunks.length) return {};
@@ -777,7 +765,7 @@ function decodeImageBase64(raw, expectedExt) {
   }
   const buf = Buffer.from(compact, 'base64');
   if (!buf.length) throw badRequest('Image payload is empty');
-  if (buf.length > MAX_IMAGE_BYTES) throw Object.assign(new Error('Image exceeds 5 MB limit'), { status: 413 });
+  if (buf.length > MAX_IMAGE_BYTES) throw httpError(413, 'Image exceeds 5 MB limit');
   if (detectImageFormat(buf) !== expectedFormat) {
     throw badRequest('Invalid image content: file signature does not match format');
   }
@@ -1130,11 +1118,11 @@ let shuttingDown = false;
 /** @returns {CampaignJob} */
 function createJob() {
   if (shuttingDown) {
-    throw Object.assign(new Error('Mailroom is shutting down'), { status: 503 });
+    throw httpError(503, 'Mailroom is shutting down');
   }
   // One campaign at a time: two runs would double-send whatever they share.
   if (runningJob()) {
-    throw Object.assign(new Error('A campaign is already running — wait for it to finish'), { status: 409 });
+    throw conflict('A campaign is already running — wait for it to finish');
   }
 
   /** @type {(value: unknown) => void} */

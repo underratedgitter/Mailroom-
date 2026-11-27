@@ -57,15 +57,10 @@ import {
 } from './lib/core.mjs';
 import { loadConfig, smtpProblems } from './lib/config.mjs';
 import { missingSmtpFields, configIssue } from './lib/mailer.mjs';
+import { errMsg } from './lib/errors.mjs';
 
 // Same settings the browser writes: ./.env or ~/.mailroom/config.env.
 loadConfig();
-
-/**
- * @param {unknown} err
- * @returns {string}
- */
-const errMsg = (err) => (err instanceof Error ? err.message : String(err));
 
 /**
  * @param {string} msg

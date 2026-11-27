@@ -26,6 +26,7 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { errMsg, errCode } from './errors.mjs';
 
 const KEYS = ['SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM', 'EMAIL_FROM', 'SMTP_SECURE'];
 
@@ -34,22 +35,6 @@ const KEYS = ['SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM', '
 /** @typedef {{ templatesDir?: string, writableDirs?: WritableDir[] }} ConfigProblemsOptions */
 /** @typedef {Record<string, string | undefined>} ConfigValues */
 /** @typedef {{ host: string, port: number | string, secure?: boolean, user: string, pass: string, from: string, replyTo: string, unsubscribeUrl: string, maxPerHour: string }} SmtpFileInput */
-
-/**
- * @param {unknown} err
- * @returns {string | undefined}
- */
-function errCode(err) {
-  return err && typeof err === 'object' && 'code' in err && typeof err.code === 'string' ? err.code : undefined;
-}
-
-/**
- * @param {unknown} err
- * @returns {string}
- */
-function errMessage(err) {
-  return err instanceof Error ? err.message : String(err);
-}
 
 /**
  * @param {string | null} problem
@@ -247,13 +232,13 @@ function templatesProblem(dir) {
     const code = errCode(err);
     return code === 'ENOENT' || code === 'ENOTDIR'
       ? `Templates folder not found: ${dir}`
-      : `Cannot read the templates folder ${dir}: ${errMessage(err)}`;
+      : `Cannot read the templates folder ${dir}: ${errMsg(err)}`;
   }
   if (!info.isDirectory()) return `Templates folder ${dir} is not a folder`;
   try {
     accessSync(dir, constants.R_OK | constants.X_OK);
   } catch (err) {
-    return `Cannot read the templates folder ${dir}: ${errMessage(err)}`;
+    return `Cannot read the templates folder ${dir}: ${errMsg(err)}`;
   }
   return null;
 }
@@ -268,7 +253,7 @@ function writableProblem({ label, path }) {
     accessSync(path, constants.W_OK);
     return null;
   } catch (err) {
-    return `Cannot use the ${label} ${path}: ${errMessage(err)}`;
+    return `Cannot use the ${label} ${path}: ${errMsg(err)}`;
   }
 }
 

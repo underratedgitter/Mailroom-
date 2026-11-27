@@ -64,13 +64,14 @@ for (let i = 0; i < args.length; i++) {
 // Set before importing: the server reads these at module load.
 const { startServer, tlsEnabled } = await import('../src/gui.mjs');
 const { resolveConfigPath } = await import('../src/lib/config.mjs');
+const { errMsg } = await import('../src/lib/errors.mjs');
 
 /** @type {import('node:net').AddressInfo | string | null} */
 let address = null;
 try {
   address = await startServer();
 } catch (err) {
-  console.error(`\n  ${err instanceof Error ? err.message : String(err)}\n`);
+  console.error(`\n  ${errMsg(err)}\n`);
   process.exit(1);
 }
 

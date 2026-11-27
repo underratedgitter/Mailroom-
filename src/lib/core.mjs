@@ -11,6 +11,7 @@ import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import nodemailer from 'nodemailer';
 import { resolveSmtpConfig, bulkFields, addressDomain, unsubscribeLink } from './mailer.mjs';
+import { errMsg, errCode } from './errors.mjs';
 
 /** @typedef {import('./mailer.mjs').SmtpConfig} SmtpConfig */
 /** @typedef {Record<string, string> & { _email: string, _name: string, _company: string }} Recipient */
@@ -47,18 +48,6 @@ import { resolveSmtpConfig, bulkFields, addressDomain, unsubscribeLink } from '.
  *   retryDelay?: number,
  * }} RunCampaignOptions
  */
-
-/**
- * @param {unknown} err
- * @returns {string}
- */
-const errMsg = (err) => (err instanceof Error ? err.message : String(err));
-
-/**
- * @param {unknown} err
- * @returns {string | undefined}
- */
-const errCode = (err) => (err && typeof err === 'object' && 'code' in err && typeof err.code === 'string' ? err.code : undefined);
 
 /**
  * @param {unknown} err

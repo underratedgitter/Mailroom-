@@ -173,17 +173,25 @@ const neutralise = (value) => {
 };
 const restore = (value) => (/^'[=+\-@\t\r]/.test(value) ? value.slice(1) : value);
 
+const csvCell = (value) => {
+  const text = neutralise(value);
+  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+};
+
 /** Writes recipients back out as a CSV the sender (and Excel) can read. */
 export function recipientsToCsv(recipients) {
-  const cell = (value) => {
-    const text = neutralise(value);
-    return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-  };
   const lines = ['email,name,company'];
   for (const rec of recipients) {
-    lines.push([rec._email, rec._name, rec._company].map(cell).join(','));
+    lines.push([rec._email, rec._name, rec._company].map(csvCell).join(','));
   }
   return `${lines.join('\n')}\n`;
+}
+
+/** Formats arbitrary rows and `{ key, label }` specs as RFC 4180 CSV with formula neutralisation. */
+export function formatReportCsv(rows, columns) {
+  const header = columns.map((c) => csvCell(c.label)).join(',');
+  const body = rows.map((row) => columns.map((c) => csvCell(row[c.key])).join(','));
+  return `${[header, ...body].join('\n')}\n`;
 }
 
 // ── Rendering ────────────────────────────────────────────────────────
@@ -453,14 +461,81 @@ export function campaignSummaries(entries) {
   const byId = new Map();
   for (const entry of entries) {
     const id = entry.campaign || '(untagged)';
-    if (!byId.has(id)) byId.set(id, { id, sent: 0, skipped: 0, failed: 0, last: null });
+    if (!byId.has(id)) byId.set(id, { id, sent: 0, skipped: 0, failed: 0, uncertain: 0, last: null, lastError: null });
     const c = byId.get(id);
     if (entry.status === 'sent') c.sent++;
     else if (entry.status === 'skipped') c.skipped++;
-    else if (entry.status === 'failed') c.failed++;
+    else if (entry.status === 'uncertain') c.uncertain++;
+    else if (entry.status === 'failed') {
+      c.failed++;
+      if (entry.error) c.lastError = entry.error;
+    }
     if (!c.last || String(entry.at) > String(c.last)) c.last = entry.at;
   }
   return [...byId.values()].sort((a, b) => String(b.last).localeCompare(String(a.last)));
+}
+
+/**
+ * Resolves the latest outcome per address for `campaignId` into `{ sent, failed, unsent }`.
+ * `unsent` lists addresses in `allRecipients` not yet sent/uncertain and not suppressed.
+ */
+export function campaignDeliveryLists(entries, allRecipients = [], campaignId = '', suppressed = new Set()) {
+  const target = String(campaignId || '').trim();
+  const metaByEmail = new Map();
+  for (const rec of allRecipients) {
+    const key = String(rec._email || '').toLowerCase();
+    if (key && !metaByEmail.has(key)) metaByEmail.set(key, rec);
+  }
+
+  const latest = new Map();
+  for (const entry of entries) {
+    if (entry.status !== 'sent' && entry.status !== 'failed' && entry.status !== 'uncertain') continue;
+    const entryCampaign = entry.campaign || '(untagged)';
+    if (target) {
+      if (target === '(untagged)') {
+        if (entry.campaign) continue;
+      } else if (entryCampaign !== target) {
+        continue;
+      }
+    }
+    const key = String(entry.email || '').toLowerCase();
+    if (!key) continue;
+    const prev = latest.get(key);
+    if (!prev || String(entry.at || '') >= String(prev.at || '')) {
+      latest.set(key, entry);
+    }
+  }
+
+  const sent = [];
+  const failed = [];
+  const sentSet = new Set();
+  const uncertainSet = new Set();
+
+  for (const [key, entry] of latest) {
+    const meta = metaByEmail.get(key);
+    const row = {
+      email: meta?._email || entry.email,
+      name: meta?._name || '',
+      company: meta?._company || '',
+      responseCode: entry.responseCode ?? '',
+      error: entry.error || '',
+      at: entry.at || '',
+    };
+    if (entry.status === 'sent') {
+      sentSet.add(key);
+      sent.push(row);
+    } else if (entry.status === 'uncertain') {
+      uncertainSet.add(key);
+    } else {
+      failed.push(row);
+    }
+  }
+
+  const unsent = allRecipients.filter((rec) => {
+    const key = String(rec._email || '').toLowerCase();
+    return !sentSet.has(key) && !uncertainSet.has(key) && !suppressed.has(key);
+  });
+  return { sent, failed, unsent };
 }
 
 export function appendLog(logPath, entry, { maxBytes, keep } = logLimits()) {

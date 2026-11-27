@@ -98,3 +98,12 @@ test('the send checklist shows link warnings, and the suppression copy does not 
   for (const text of [html, app]) assert.doesNotMatch(text, /or that unsubscribe, appear here/);
   assert.match(html, /Unsubscribe requests are not added automatically/);
 });
+
+test('overview exposes campaign reports and sent/failed/unsent CSV export links', () => {
+  assert.match(app, /\/api\/campaigns/);
+  assert.match(app, /\/export\?/);
+  assert.match(app, /exportHref\([^)]*'sent'/);
+  assert.match(app, /exportHref\([^)]*'failed'/);
+  assert.match(app, /exportHref\([^)]*'unsent'/);
+  assert.ok(ids.has('reportCsv'));
+});

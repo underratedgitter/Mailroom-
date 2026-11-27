@@ -403,3 +403,63 @@ test('settings save, validate and clear the reply-to, unsubscribe URL and hourly
   }
   assert.doesNotMatch(fileText(), /attacker\.example/);
 });
+
+test('campaign reports and export generate formula-safe sent, failed, and unsent CSVs', async (t) => {
+  const sink = await startSmtpSink({
+    rcpt: (addr) => (addr.includes('director@example.com') ? '550 5.7.1 Delivery declined' : null),
+  });
+  const server = await startServer();
+  t.after(async () => { await server.stop(); await sink.close(); });
+  const base = server.base;
+
+  const saved = await post(base, '/api/recipients', {
+    text: 'email,name,company\ndirector@example.com,Director,Acme\none@example.com,=SUM(1+1),Beta\ntwo@example.com,Two,Gamma\nthree@example.com,Three,Delta\n',
+    format: 'csv',
+    name: 'report-export-list',
+  });
+  assert.equal(saved.status, 201);
+  const customCsv = saved.data.path;
+  t.after(() => rmSync(join(ROOT, customCsv), { force: true }));
+
+  await post(base, '/api/settings', {
+    host: '127.0.0.1', port: sink.port, user: 'desk@local.test', pass: 'x', from: 'Desk <desk@local.test>',
+  });
+  await post(base, '/api/suppress', { emails: 'two@example.com', reason: 'unsubscribe' });
+
+  const started = await post(base, '/api/send', {
+    csv: customCsv, html: TEMPLATE, subject: 'Hi {{name}}', campaign: 'rep-2026', delay: 0, confirm: true,
+  });
+  assert.equal(started.status, 202);
+  const evText = await (await fetch(`${base}/api/jobs/${started.data.jobId}/events`)).text();
+  assert.match(evText, /"type":"done"/);
+
+  const reports = await get(base, '/api/campaigns');
+  assert.equal(reports.status, 200);
+  const rep = reports.data.campaigns.find((c) => c.id === 'rep-2026');
+  assert.equal(rep.sent, 2);
+  assert.equal(rep.failed, 1);
+  assert.equal(rep.skipped, 1);
+
+  const sentCsv = await get(base, '/api/campaigns/rep-2026/export?kind=sent&csv=' + encodeURIComponent(customCsv));
+  assert.equal(sentCsv.status, 200);
+  assert.match(sentCsv.headers.get('content-type'), /^text\/csv/);
+  assert.match(sentCsv.headers.get('content-disposition'), /attachment; filename="rep-2026-sent\.csv"/);
+  assert.match(sentCsv.data, /one@example\.com,'=SUM\(1\+1\),Beta/);
+  assert.match(sentCsv.data, /three@example\.com,Three,Delta/);
+
+  const failedCsv = await get(base, '/api/campaigns/rep-2026/export?kind=failed&csv=' + encodeURIComponent(customCsv));
+  assert.equal(failedCsv.status, 200);
+  assert.match(failedCsv.data, /director@example\.com,Director,Acme,550,/);
+
+  // Unsent excludes both sent recipients and suppressed two@example.com, keeping failed director@example.com.
+  const unsentCsv = await get(base, '/api/campaigns/rep-2026/export?kind=unsent&csv=' + encodeURIComponent(customCsv));
+  assert.equal(unsentCsv.status, 200);
+  assert.match(unsentCsv.data, /director@example\.com,Director,Acme/);
+  assert.doesNotMatch(unsentCsv.data, /two@example\.com|one@example\.com|three@example\.com/);
+
+  // Validation & security checks.
+  assert.equal((await get(base, '/api/campaigns/rep-2026/export?kind=unsent')).status, 400);
+  assert.equal((await get(base, '/api/campaigns/rep-2026/export?kind=bogus')).status, 400);
+  assert.equal((await get(base, '/api/campaigns/rep-2026/export?kind=sent&csv=../package.json')).status, 400);
+  assert.equal((await get(base, '/api/campaigns/%E0%A4%A/export?kind=sent')).status, 400);
+});

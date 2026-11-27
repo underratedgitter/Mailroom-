@@ -121,6 +121,7 @@ const state = {
   csvs: [],
   templates: [],
   log: { path: '', entries: 0, campaigns: [] },
+  campaigns: null,
   suppression: { path: '', count: 0 },
   queue: null,
   suppressed: null,
@@ -282,7 +283,7 @@ function toLocalInput(date) {
 
 // ── Routing ──────────────────────────────────────────────────────────
 const ROUTES = [
-  { id: 'overview', title: 'Overview', view: 'viewOverview', heading: 'hOverview', enter: () => loadHealth() },
+  { id: 'overview', title: 'Overview', view: 'viewOverview', heading: 'hOverview', enter: () => { loadHealth(); loadCampaigns(); } },
   { id: 'compose', title: 'Compose', view: 'viewCompose', heading: 'hCompose' },
   { id: 'recipients', title: 'Recipients', view: 'viewRecipients', heading: 'hRecipients' },
   { id: 'send', title: 'Send', view: 'viewSend', heading: 'hSend' },
@@ -399,6 +400,11 @@ function applyState(data) {
     value: c.path,
     label: c.error ? c.name + ' (unreadable)' : c.name + ' — ' + plural(c.recipients, 'recipient'),
   })), store.get('csv'));
+  options(ui.reportCsv, data.csvs.filter((c) => !c.error).map((c) => ({
+    value: c.path,
+    label: c.name,
+  })), ui.csv.value || store.get('csv'));
+  setHidden(ui.reportCsvWrap, data.csvs.every((c) => c.error));
   setHidden(ui.csvEmpty, data.csvs.length > 0);
   setHidden(ui.csv.closest('.field'), data.csvs.length === 0);
 
@@ -440,16 +446,53 @@ async function loadHealth() {
 }
 
 // ── Overview ─────────────────────────────────────────────────────────
+async function loadCampaigns() {
+  try {
+    const data = await api('/api/campaigns');
+    state.campaigns = data.campaigns || [];
+    renderCampaigns();
+  } catch { /* fallback to /api/state recent list */ }
+}
+
+function exportHref(campaignId, kind, csvPath = '') {
+  const params = new URLSearchParams({ kind });
+  if (csvPath) params.set('csv', csvPath);
+  return '/api/campaigns/' + encodeURIComponent(campaignId) + '/export?' + params.toString();
+}
+
 function renderCampaigns() {
-  const rows = state.log.campaigns || [];
+  const rows = state.campaigns || state.log.campaigns || [];
   setHidden(ui.campaignsEmpty, rows.length > 0);
   setHidden(ui.campaignsWrap, rows.length === 0);
-  const cells = (c) => [c.id, String(c.sent), String(c.failed), String(c.skipped), c.last ? formatWhen(c.last) : '—'];
+  const csvPath = ui.reportCsv.value || '';
+
   reconcile(ui.campaignsBody, rows, (c) => c.id,
-    () => h('tr', {}, h('th', { scope: 'row' }), h('td', { class: 'num' }), h('td', { class: 'num' }), h('td', { class: 'num' }), h('td')),
+    () => h('tr', {},
+      h('th', { scope: 'row' }, h('div'), h('div', { class: 'queue__meta' })),
+      h('td', { class: 'num' }),
+      h('td', { class: 'num' }),
+      h('td', { class: 'num' }),
+      h('td', {},
+        h('div', { class: 'export-links' },
+          h('a', { class: 'export-link', download: '' }, 'Sent'),
+          h('a', { class: 'export-link', download: '' }, 'Failed'),
+          h('a', { class: 'export-link', download: '' }, 'Unsent')))),
     (tr, c) => {
-      cells(c).forEach((text, i) => setText(tr.children[i], text));
-      setClass(tr.children[2], 'is-bad', c.failed > 0);
+      const [head, sentCell, failedCell, skippedCell, exportCell] = tr.children;
+      setText(head.children[0], c.id);
+      setText(head.children[1], c.last ? formatWhen(c.last) : '—');
+      setText(sentCell, c.sent);
+      setText(failedCell, c.failed);
+      setText(skippedCell, c.skipped);
+      setClass(failedCell, 'is-bad', c.failed > 0);
+
+      const [sentLink, failedLink, unsentLink] = exportCell.children[0].children;
+      setAttr(sentLink, 'href', exportHref(c.id, 'sent', csvPath));
+      setHidden(sentLink, !c.sent);
+      setAttr(failedLink, 'href', exportHref(c.id, 'failed', csvPath));
+      setHidden(failedLink, !c.failed);
+      setAttr(unsentLink, 'href', csvPath ? exportHref(c.id, 'unsent', csvPath) : '#');
+      setHidden(unsentLink, !csvPath);
     });
 }
 
@@ -1635,6 +1678,7 @@ ui.retryBtn.addEventListener('click', () => { loadHealth(); refreshBackground();
 
 ui.verifyBtn.addEventListener('click', verify);
 ui.verifyBtn2.addEventListener('click', verify);
+ui.reportCsv.addEventListener('change', renderCampaigns);
 ui.signOutBtn.addEventListener('click', signOut);
 ui.signOutBtn2.addEventListener('click', signOut);
 
@@ -1791,7 +1835,8 @@ async function refreshBackground() {
   }
   await loadQueue();
   if (currentRoute().id === 'suppression') await loadSuppression();
-  if (currentRoute().id === 'settings' || currentRoute().id === 'overview') await loadHealth();
+  if (currentRoute().id === 'overview') await Promise.all([loadHealth(), loadCampaigns()]);
+  else if (currentRoute().id === 'settings') await loadHealth();
 }
 
 let tick = 0;

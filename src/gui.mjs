@@ -22,6 +22,8 @@
  *   POST /api/recipients       save (or dry-run) a pasted list or an uploaded CSV into data/
  *   GET  /api/suppression      the suppression list
  *   POST /api/suppress         add addresses to it
+ *   GET  /api/campaigns        all campaign summaries from the send log
+ *   GET  /api/campaigns/:id/export  download formula-safe CSV (?kind=sent|failed|unsent&csv=...)
  *   GET  /api/schedule         queued campaigns (POST creates one; POST /api/schedule/:id/cancel|run)
  *   POST /api/verify           SMTP connect + auth check
  *   POST /api/test             send one real message to one address
@@ -64,6 +66,8 @@ import {
   sentAddresses,
   countAlreadySent,
   campaignSummaries,
+  campaignDeliveryLists,
+  formatReportCsv,
   createMailer,
   runCampaign,
   resolveSmtpConfig,
@@ -1291,6 +1295,76 @@ async function route(req, res) {
     const result = addSuppressed(SUPPRESSION_PATH, emails, typeof body.reason === 'string' ? body.reason : 'manual');
     if (!result.added.length && !result.already.length) return fail(res, 400, `Not an email address: ${result.invalid.join(', ')}`);
     return json(res, 200, { ...result, count: loadSuppressed(SUPPRESSION_PATH).size });
+  }
+
+  // ── Campaign reports & CSV export ─────────────────────────────────
+  if (req.method === 'GET' && pathname === '/api/campaigns') {
+    return json(res, 200, { campaigns: campaignSummaries(readLog(LOG_PATH)) });
+  }
+
+  const exportMatch = pathname.match(/^\/api\/campaigns\/([^/]+)\/export$/);
+  if (req.method === 'GET' && exportMatch) {
+    let campaignId;
+    try {
+      campaignId = decodeURIComponent(exportMatch[1]);
+    } catch {
+      return fail(res, 400, 'Invalid campaign name');
+    }
+    const kind = url.searchParams.get('kind') || 'sent';
+    if (!['sent', 'failed', 'unsent'].includes(kind)) {
+      return fail(res, 400, 'Invalid export kind (expected sent, failed, or unsent)');
+    }
+    const csvParam = url.searchParams.get('csv') || '';
+    let csvRecipients = [];
+    if (csvParam) {
+      const csvPath = safePath(csvParam, { roots: [DATA_DIR], ext: ['.csv'] });
+      if (csvPath === SUPPRESSION_PATH) throw new Error(`Not allowed: ${csvParam}`);
+      csvRecipients = recipientsFromFile(csvPath).recipients;
+    }
+    if (kind === 'unsent' && !csvParam) {
+      return fail(res, 400, 'Select a recipient list to compute unsent addresses');
+    }
+
+    const entries = readLog(LOG_PATH);
+    const suppressed = loadSuppressed(SUPPRESSION_PATH);
+    const lists = campaignDeliveryLists(entries, csvRecipients, campaignId, suppressed);
+
+    let csvText;
+    if (kind === 'sent') {
+      csvText = formatReportCsv(lists.sent, [
+        { key: 'email', label: 'email' },
+        { key: 'name', label: 'name' },
+        { key: 'company', label: 'company' },
+        { key: 'at', label: 'sent_at' },
+      ]);
+    } else if (kind === 'failed') {
+      csvText = formatReportCsv(lists.failed, [
+        { key: 'email', label: 'email' },
+        { key: 'name', label: 'name' },
+        { key: 'company', label: 'company' },
+        { key: 'responseCode', label: 'response_code' },
+        { key: 'error', label: 'error' },
+        { key: 'at', label: 'failed_at' },
+      ]);
+    } else {
+      csvText = formatReportCsv(
+        lists.unsent.map((r) => ({ email: r._email, name: r._name, company: r._company })),
+        [
+          { key: 'email', label: 'email' },
+          { key: 'name', label: 'name' },
+          { key: 'company', label: 'company' },
+        ],
+      );
+    }
+
+    const safeName = campaignId.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'campaign';
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}-${kind}.csv"`);
+    res.setHeader('Content-Length', Buffer.byteLength(csvText));
+    res.end(csvText);
+    return;
   }
 
   // ── Scheduled campaigns ───────────────────────────────────────────

@@ -98,3 +98,13 @@ test('the send checklist shows link warnings, and the suppression copy does not 
   for (const text of [html, app]) assert.doesNotMatch(text, /or that unsubscribe, appear here/);
   assert.match(html, /Unsubscribe requests are not added automatically/);
 });
+
+test('compose includes the template studio tabs, editor, asset manager, and name dialog', () => {
+  for (const id of ['composeTabs', 'panelComposeStudio', 'studioHtml', 'assetList', 'nameDialog']) {
+    assert.ok(ids.has(id), id + ' is missing');
+  }
+  assert.match(html, /<div class="tabpanel"[^>]*id="panelComposeStudio"[^>]*\shidden>/);
+  for (const route of ['/api/templates/read', '/api/templates/save', '/api/templates/duplicate', '/api/templates/delete', '/api/templates/assets', '/api/templates/assets/delete']) {
+    assert.ok(app.includes(route), route + ' missing from app.js');
+  }
+});

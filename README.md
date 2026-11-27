@@ -185,11 +185,13 @@ delivery settings: Reply-To (`EMAIL_REPLY_TO`), an https unsubscribe link
 an `http://` unsubscribe URL or a non-numeric ceiling is refused) and a blank
 field removes the setting.
 
-**Compose** — every `templates/*.html` file is offered as a template. A folder
-next to it named `<template>-assets/` (for example, `bcci-connect-v2-assets/`) is
-picked up automatically and its images attached inline with `cid:` (Gmail blocks
-`data:` URIs). Bundled templates include `bcci-connect-v2.html`,
-`bcci-connect.html`, and `bcci-membership.html`.
+**Compose** — every `templates/*.html` file is offered as a template, and you can
+create, duplicate, delete, or edit template HTML and upload/delete inline
+images (PNG, JPG, GIF, WEBP up to 5 MB) directly in the Template studio tab. A
+folder next to a template named `<template>-assets/` (for example,
+`bcci-connect-v2-assets/`) is picked up automatically and its images attached
+inline with `cid:` (Gmail blocks `data:` URIs). Bundled templates include
+`bcci-connect-v2.html`, `bcci-connect.html`, and `bcci-membership.html`.
 
 **Recipients** — a saved `data/*.csv`, a CSV you upload, or addresses pasted straight in:
 

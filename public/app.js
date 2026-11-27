@@ -606,7 +606,7 @@ function renderPlaceholders(placeholders) {
   const labels = { builtin: 'built in', column: 'from your list', missing: 'not in your list' };
   setHidden(ui.placeholdersHint, false);
   reconcile(ui.placeholders, placeholders, (p) => p.name,
-    (p) => h('span', { class: 'chip', role: 'listitem' }, h('code'), h('span', { class: 'chip__note' })),
+    () => h('span', { class: 'chip', role: 'listitem' }, h('code'), h('span', { class: 'chip__note' })),
     (node, p) => {
       setAttr(node, 'data-status', p.status);
       setText(node.firstElementChild, '{{' + p.name + '}}');
@@ -1653,7 +1653,7 @@ function renderQueue() {
   setHidden(ui.queueEmpty, entries.length > 0);
 
   reconcile(ui.queueList, entries, (e) => e.id,
-    (e) => h('li', {},
+    () => h('li', {},
       h('div', {},
         h('div', { class: 'queue__line' }, h('span', { class: 'queue__when' }), h('span', { class: 'tag' }), h('span', { class: 'queue__meta' })),
         h('div', { class: 'queue__meta' }),
@@ -1762,7 +1762,7 @@ function renderSuppression() {
   const shown = matches.slice(0, SUPPRESS_SHOWN);
 
   setText(ui.suppressCount, plural(data.count, 'address', 'addresses'));
-  reconcile(ui.suppressList, shown, (email) => email, (email) => h('li'), (li, email) => setText(li, email));
+  reconcile(ui.suppressList, shown, (email) => email, () => h('li'), (li, email) => setText(li, email));
   setHidden(ui.suppressEmpty, shown.length > 0);
   setText(ui.suppressEmptyTitle, data.count ? 'No matches' : 'No suppressed addresses');
   setText(ui.suppressEmptyText, data.count ? 'Nothing on the list matches “' + ui.suppressSearch.value.trim() + '”.' : 'Addresses you add, and hard bounces found while sending, appear here. Unsubscribe requests are not added automatically: add them here when they arrive.');

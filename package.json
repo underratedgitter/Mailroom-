@@ -18,6 +18,8 @@
     "gui": "node src/gui.mjs",
     "send": "node src/send.mjs",
     "check": "node scripts/check-syntax.mjs",
+    "typecheck": "tsc -p .",
+    "lint": "eslint .",
     "test": "node --test test/*.test.mjs"
   },
   "engines": {
@@ -25,5 +27,12 @@
   },
   "dependencies": {
     "nodemailer": "^10.4.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@types/node": "^20.19.43",
+    "eslint": "^9.39.5",
+    "globals": "^17.14.0",
+    "typescript": "^5.9.3"
   }
 }

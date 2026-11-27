@@ -39,5 +39,11 @@ jobs:
       - name: Syntax check (bin, src, public)
         run: npm run check
 
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
       - name: Run tests
         run: npm test

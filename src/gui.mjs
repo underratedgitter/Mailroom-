@@ -44,8 +44,8 @@ import https from 'node:https';
 import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { hashPassword, verifyPassword, parsePasswordHash } from './lib/auth.mjs';
 import { configIssue, unsubscribeUrlIssue, bareAddress, unsubscribeLink } from './lib/mailer.mjs';
-import { loadConfig, saveConfig, resolveConfigPath, smtpFileValues, assertConfig } from './lib/config.mjs';
-import { readFileSync, writeFileSync, renameSync, rmSync, existsSync, readdirSync, statSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
+import { loadConfig, saveConfig, smtpFileValues, assertConfig } from './lib/config.mjs';
+import { readFileSync, writeFileSync, renameSync, rmSync, existsSync, readdirSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -78,6 +78,86 @@ import {
   describeInterruption,
 } from './lib/core.mjs';
 import { missingSmtpFields } from './lib/mailer.mjs';
+
+/** @typedef {import('node:http').IncomingMessage} IncomingMessage */
+/** @typedef {import('node:http').ServerResponse} ServerResponse */
+/** @typedef {import('node:http').Server | import('node:https').Server} WebServer */
+/** @typedef {import('node:net').AddressInfo | string | null} ListenAddress */
+/** @typedef {import('./lib/mailer.mjs').SmtpConfig} SmtpConfig */
+/** @typedef {import('./lib/core.mjs').Recipient} Recipient */
+/** @typedef {import('./lib/core.mjs').ParsedRecipients} ParsedRecipients */
+/** @typedef {import('./lib/core.mjs').CampaignEvent} CampaignEvent */
+/** @typedef {import('./lib/core.mjs').CampaignRunSummary} CampaignRunSummary */
+/** @typedef {Error & { status?: number, code?: string }} HttpError */
+/** @typedef {{ sent: number, failed: number, skipped: number, failures: unknown[], stopped: boolean, error?: string, remaining?: number, total?: number, logPath?: string | null, suppressed?: number, uncertain?: unknown[] }} JobSummary */
+/**
+ * @typedef {CampaignEvent
+ *   | { type: 'start', total: number, skipped: number, delay: number, campaign: string | null }
+ *   | { type: 'error', error: string }
+ *   | { type: 'done', summary: JobSummary }} JobEvent
+ */
+/**
+ * @typedef {{
+ *   id: string,
+ *   events: JobEvent[],
+ *   clients: Set<ServerResponse>,
+ *   cancelled: boolean,
+ *   done: boolean,
+ *   summary: JobSummary | null,
+ *   startedAt: string,
+ *   scheduleId?: string,
+ *   finished: Promise<unknown>,
+ *   resolveFinished: (value: unknown) => void,
+ * }} CampaignJob
+ */
+/**
+ * @typedef {{
+ *   csvPath: string | null,
+ *   source: string,
+ *   templatePath: string,
+ *   assetsDir: string | null,
+ *   subject: string,
+ *   campaignId: string,
+ *   parsed: ParsedRecipients,
+ *   alreadySent: Set<string>,
+ *   templateHtml: string,
+ * }} ResolvedInput
+ */
+/**
+ * @typedef {{
+ *   parsed: { recipients: Recipient[] },
+ *   templateHtml: string,
+ *   subject: string,
+ *   assetsDir: string | null,
+ *   campaignId: string,
+ *   alreadySent: Set<string>,
+ * }} StartCampaignInput
+ */
+/** @typedef {{ email: string, name: string, company: string, fields: Record<string, string> }} ScheduledRecipient */
+/**
+ * @typedef {{
+ *   id: string,
+ *   at: string,
+ *   createdAt?: string,
+ *   campaign: string,
+ *   subject: string,
+ *   template: string,
+ *   templateHash?: string,
+ *   delay: number,
+ *   recipients: ScheduledRecipient[],
+ *   status: string,
+ *   interrupted?: boolean,
+ *   error: string | null,
+ *   result: { sent: number, failed: number, skipped: number, uncertain?: number } | null,
+ * }} ScheduleEntry
+ */
+
+/** @param {unknown} err @returns {string} */
+const errMsg = (err) => (err instanceof Error ? err.message : String(err));
+/** @param {unknown} err @returns {string | undefined} */
+const errCode = (err) => (err && typeof err === 'object' && 'code' in err && typeof err.code === 'string' ? err.code : undefined);
+/** @param {unknown} err @returns {number | undefined} */
+const errStatus = (err) => (err && typeof err === 'object' && 'status' in err && typeof err.status === 'number' ? err.status : undefined);
 
 // Read the product config before anything looks at process.env.
 const configFile = loadConfig();
@@ -117,6 +197,7 @@ export const tlsEnabled = TLS_ON;
 // deliberate acknowledgement (a trusted proxy terminating TLS in front).
 const ALLOW_INSECURE = /^(1|true|yes)$/i.test(String(process.env.MAILROOM_ALLOW_INSECURE || '').trim());
 
+/** @param {string} host */
 function isLoopbackHost(host) {
   const value = String(host || '').trim().toLowerCase();
   return value === '127.0.0.1' || value === '::1' || value === '[::1]' || value === 'localhost';
@@ -130,10 +211,11 @@ function tlsOptions() {
   try {
     return { cert: readFileSync(TLS_CERT_PATH), key: readFileSync(TLS_KEY_PATH) };
   } catch (err) {
-    throw new Error(`Cannot read the TLS certificate or key: ${err.message}`);
+    throw new Error(`Cannot read the TLS certificate or key: ${errMsg(err)}`);
   }
 }
 
+/** @param {string} host */
 function assertBindingIsSafe(host) {
   if (hashError) throw hashError;
   if (isLoopbackHost(host)) return;
@@ -183,11 +265,13 @@ const PASSWORD_HASH = String(process.env.MAILROOM_PASSWORD_HASH || '').trim();
 const AUTH_ON = PASSWORD_HASH.length > 0 || PASSWORD.length > 0;
 const MAX_PASSWORD_LENGTH = 1024;
 
+/** @type {unknown} */
 let hashError = null;
 if (PASSWORD_HASH) {
   try { parsePasswordHash(PASSWORD_HASH); } catch (err) { hashError = err; }
 }
 
+/** @type {Promise<string> | null} */
 let memoryHash = null;
 const storedHash = () => PASSWORD_HASH || (memoryHash ??= hashPassword(PASSWORD));
 
@@ -195,10 +279,14 @@ const storedHash = () => PASSWORD_HASH || (memoryHash ??= hashPassword(PASSWORD)
 // say how the browser really connected. They are honoured only when asked for:
 // otherwise any client could claim to be on HTTPS or spoof its address.
 const TRUST_PROXY = /^(1|true|yes)$/i.test(String(process.env.MAILROOM_TRUST_PROXY || '').trim());
-const lastForwarded = (req, name) => String(req.headers[name] || '').split(',').pop().trim();
-const firstForwarded = (req, name) => String(req.headers[name] || '').split(',')[0].trim();
+/** @param {IncomingMessage} req @param {string} name */
+const lastForwarded = (req, name) => (String(req.headers[name] || '').split(',').pop() ?? '').trim();
+/** @param {IncomingMessage} req @param {string} name */
+const firstForwarded = (req, name) => (String(req.headers[name] || '').split(',')[0] ?? '').trim();
 
+/** @param {IncomingMessage} req */
 const isSecureRequest = (req) => TLS_ON || (TRUST_PROXY && firstForwarded(req, 'x-forwarded-proto').toLowerCase() === 'https');
+/** @param {IncomingMessage} req */
 const clientIp = (req) => (TRUST_PROXY && lastForwarded(req, 'x-forwarded-for')) || req.socket.remoteAddress || 'local';
 
 const COOKIE = 'mr_session';
@@ -208,25 +296,40 @@ const SESSION_SECONDS = Number.isFinite(configuredTtl) && configuredTtl > 0 ? Ma
 const SESSION_TTL = SESSION_SECONDS * 1000;
 const MAX_SESSIONS = 100;
 // Sessions live in memory only: restarting the server signs everyone out.
+/** @type {Map<string, number>} */
 const sessions = new Map();
 
 function createSession() {
   const now = Date.now();
   for (const [token, expiry] of sessions) if (expiry < now) sessions.delete(token);
   // Maps iterate in insertion order, so the oldest sessions go first.
-  while (sessions.size >= MAX_SESSIONS) sessions.delete(sessions.keys().next().value);
+  while (sessions.size >= MAX_SESSIONS) {
+    const oldest = sessions.keys().next().value;
+    if (oldest !== undefined) sessions.delete(oldest);
+  }
   const token = randomBytes(32).toString('hex');
   sessions.set(token, now + SESSION_TTL);
   return token;
 }
 
+/**
+ * @param {IncomingMessage} req
+ * @param {string} token
+ * @param {number} maxAgeSeconds
+ * @returns {string}
+ */
 function sessionCookie(req, token, maxAgeSeconds) {
   const secure = isSecureRequest(req) ? '; Secure' : '';
   return `${COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAgeSeconds}${secure}`;
 }
 
+/**
+ * @param {IncomingMessage} req
+ * @returns {Record<string, string>}
+ */
 function cookies(req) {
   const header = String(req.headers.cookie || '');
+  /** @type {Record<string, string>} */
   const out = {};
   for (const part of header.split(';')) {
     const eq = part.indexOf('=');
@@ -239,10 +342,12 @@ function cookies(req) {
   return out;
 }
 
+/** @param {IncomingMessage} req */
 function sessionOf(req) {
   return String(cookies(req)[COOKIE] || '');
 }
 
+/** @param {IncomingMessage} req */
 function isAuthed(req) {
   if (!AUTH_ON) return true;
   const token = sessionOf(req);
@@ -255,10 +360,12 @@ function isAuthed(req) {
   return true;
 }
 
+/** @type {Map<string, number[]>} */
 const loginAttempts = new Map();
 const ATTEMPT_WINDOW = 60_000;
 const MAX_ATTEMPTS = 8;
 
+/** @param {string} ip */
 function recentAttempts(ip) {
   const now = Date.now();
   const recent = (loginAttempts.get(ip) || []).filter((t) => now - t < ATTEMPT_WINDOW);
@@ -267,10 +374,12 @@ function recentAttempts(ip) {
   return recent;
 }
 
+/** @param {string} ip */
 function tooManyAttempts(ip) {
   return recentAttempts(ip).length >= MAX_ATTEMPTS;
 }
 
+/** @param {string} ip @param {boolean} ok */
 function noteAttempt(ip, ok) {
   if (ok) return loginAttempts.delete(ip);
   const recent = recentAttempts(ip);
@@ -295,6 +404,7 @@ const CSP = [
   "object-src 'none'",
 ].join('; ');
 
+/** @param {IncomingMessage} req @param {ServerResponse} res */
 function setSecurityHeaders(req, res) {
   res.setHeader('Content-Security-Policy', CSP);
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -310,6 +420,7 @@ function setSecurityHeaders(req, res) {
 // these checks stop a forged request from reaching the handlers at all.
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
+/** @param {IncomingMessage} req @returns {string | null} */
 function crossSiteReason(req) {
   const origin = String(req.headers.origin || '').toLowerCase();
   if (origin) {
@@ -321,13 +432,18 @@ function crossSiteReason(req) {
   // Modern browsers label every request; same-site (a sibling subdomain) is
   // still not us.
   const site = String(req.headers['sec-fetch-site'] || '').toLowerCase();
-  if (!SAFE_METHODS.has(req.method) && site && site !== 'same-origin' && site !== 'none') {
+  if (req.method && !SAFE_METHODS.has(req.method) && site && site !== 'same-origin' && site !== 'none') {
     return 'Cross-site request refused';
   }
   return null;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
+/**
+ * @param {ServerResponse} res
+ * @param {number} code
+ * @param {unknown} body
+ */
 const json = (res, code, body) => {
   const payload = JSON.stringify(body);
   res.statusCode = code;
@@ -337,20 +453,36 @@ const json = (res, code, body) => {
   res.end(payload);
 };
 
+/**
+ * @param {ServerResponse} res
+ * @param {number} code
+ * @param {string} message
+ */
 const fail = (res, code, message) => json(res, code, { error: message });
+/** @param {string} message @returns {HttpError} */
 const badRequest = (message) => Object.assign(new Error(message), { status: 400 });
+/** @param {string} message @returns {HttpError} */
 const forbidden = (message) => Object.assign(new Error(message), { status: 403 });
+/** @param {string} message @returns {HttpError} */
 const conflict = (message) => Object.assign(new Error(message), { status: 409 });
 
+/**
+ * @param {IncomingMessage} req
+ * @param {number} [limit]
+ * @returns {Promise<Record<string, unknown>>}
+ */
 async function readJson(req, limit = 2 * 1024 * 1024) {
   let size = 0;
+  /** @type {Buffer[]} */
   const chunks = [];
   for await (const chunk of req) {
-    size += chunk.length;
+    const buf = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+    size += buf.length;
     if (size > limit) throw Object.assign(new Error('Request body too large'), { status: 413 });
-    chunks.push(chunk);
+    chunks.push(buf);
   }
   if (!chunks.length) return {};
+  /** @type {unknown} */
   let body;
   try {
     body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
@@ -362,10 +494,10 @@ async function readJson(req, limit = 2 * 1024 * 1024) {
   if (body === null || typeof body !== 'object' || Array.isArray(body)) {
     throw new Error('Invalid JSON body: expected an object');
   }
-  return body;
+  return /** @type {Record<string, unknown>} */ (body);
 }
 
-/** Real path of a root, whether or not the directory already exists. */
+/** Real path of a root, whether or not the directory already exists. @param {string} path */
 function realRoot(path) {
   try {
     return realpathSync(path);
@@ -374,6 +506,7 @@ function realRoot(path) {
   }
 }
 
+/** @param {string} candidate @param {string[]} roots */
 function isInside(candidate, roots) {
   return roots.some((root) => candidate === root || candidate.startsWith(root + sep));
 }
@@ -381,6 +514,11 @@ function isInside(candidate, roots) {
 const ENCODED_TRAVERSAL_RE = /%(?:2e|2f|5c|00)/i;
 const DOT_SEGMENT_RE = /(^|[\\/])\.\.([\\/]|$)/;
 
+/**
+ * @param {unknown} input
+ * @param {string} label
+ * @returns {string}
+ */
 function assertSafeRelativeInput(input, label) {
   if (typeof input !== 'string') throw badRequest(`Invalid ${label}`);
   const value = input.trim();
@@ -391,7 +529,12 @@ function assertSafeRelativeInput(input, label) {
   return value;
 }
 
-/** Only files inside data/ or templates/ may be referenced by the page. */
+/**
+ * Only files inside data/ or templates/ may be referenced by the page.
+ * @param {unknown} input
+ * @param {{ roots?: string[], ext?: string[] | null }} [options]
+ * @returns {string}
+ */
 function safePath(input, { roots = [DATA_DIR, TEMPLATE_DIR], ext = null } = {}) {
   const value = assertSafeRelativeInput(input, 'file path');
   const absolute = resolve(ROOT, value);
@@ -415,6 +558,7 @@ function safePath(input, { roots = [DATA_DIR, TEMPLATE_DIR], ext = null } = {}) 
   return real;
 }
 
+/** @param {string} absolute */
 const rel = (absolute) => (absolute.startsWith(ROOT + sep)
   ? absolute.slice(ROOT.length + 1).split(sep).join('/')
   : absolute);
@@ -425,18 +569,25 @@ const BUNDLED_TEMPLATES = new Set([
   'bcci-membership.html',
 ]);
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']);
+/** @type {Record<string, 'png' | 'jpeg' | 'gif' | 'webp'>} */
 const EXT_TO_FORMAT = { '.png': 'png', '.jpg': 'jpeg', '.jpeg': 'jpeg', '.gif': 'gif', '.webp': 'webp' };
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
+/** @param {string} templatePath */
 const isBundledTemplate = (templatePath) => BUNDLED_TEMPLATES.has(basename(templatePath));
 
+/** @param {string} templatePath */
 function assertEditableTemplate(templatePath) {
   if (isBundledTemplate(templatePath)) {
     throw forbidden('Bundled templates are read-only — duplicate it to edit a copy');
   }
 }
 
-/** Top-level template HTML files inside templates/ only (excludes -assets/ and subfolders). */
+/**
+ * Top-level template HTML files inside templates/ only (excludes -assets/ and subfolders).
+ * @param {unknown} input
+ * @returns {string}
+ */
 function safeTemplatePath(input) {
   const real = safePath(input, { roots: [TEMPLATE_DIR], ext: ['.html', '.htm'] });
   const file = basename(real);
@@ -446,6 +597,11 @@ function safeTemplatePath(input) {
   return real;
 }
 
+/**
+ * @param {string} templatePath
+ * @param {{ create?: boolean }} [options]
+ * @returns {string | null}
+ */
 function resolveSafeAssetsDir(templatePath, { create = false } = {}) {
   const guess = templatePath.replace(/\.html?$/i, '') + '-assets';
   try {
@@ -455,7 +611,7 @@ function resolveSafeAssetsDir(templatePath, { create = false } = {}) {
       throw badRequest('Not allowed: invalid assets folder');
     }
   } catch (err) {
-    if (err.code !== 'ENOENT') throw err;
+    if (errCode(err) !== 'ENOENT') throw err;
     if (!create) return null;
     mkdirSync(guess, { recursive: true });
   }
@@ -466,7 +622,11 @@ function resolveSafeAssetsDir(templatePath, { create = false } = {}) {
   return real;
 }
 
-/** The `-assets` folder that sits beside a template, if there is one. */
+/**
+ * The `-assets` folder that sits beside a template, if there is one.
+ * @param {string} templatePath
+ * @returns {string | null}
+ */
 function assetsDirFor(templatePath) {
   try {
     return resolveSafeAssetsDir(templatePath, { create: false });
@@ -475,6 +635,10 @@ function assetsDirFor(templatePath) {
   }
 }
 
+/**
+ * @param {string} target
+ * @param {string | Uint8Array} data
+ */
 function writeAtomicFile(target, data) {
   const dir = dirname(target);
   mkdirSync(dir, { recursive: true });
@@ -488,6 +652,10 @@ function writeAtomicFile(target, data) {
   }
 }
 
+/**
+ * @param {unknown} rawName
+ * @returns {string}
+ */
 function normalizeTemplateName(rawName) {
   if (typeof rawName !== 'string') throw badRequest('Template name is required');
   let value = rawName.trim();
@@ -508,6 +676,10 @@ function normalizeTemplateName(rawName) {
   return `${slug}.html`;
 }
 
+/**
+ * @param {unknown} rawName
+ * @returns {{ filename: string, cid: string, ext: string }}
+ */
 function safeAssetFilename(rawName) {
   if (typeof rawName !== 'string') throw badRequest('Asset filename is required');
   const value = rawName.trim();
@@ -533,6 +705,10 @@ function safeAssetFilename(rawName) {
   return { filename: `${stem}${ext}`, cid: stem, ext };
 }
 
+/**
+ * @param {string | null} assetsDir
+ * @returns {{ filename: string, cid: string, size: number }[]}
+ */
 function listAssetsFor(assetsDir) {
   if (!assetsDir) return [];
   return readdirSync(assetsDir)
@@ -549,6 +725,10 @@ function listAssetsFor(assetsDir) {
     });
 }
 
+/**
+ * @param {Buffer} buf
+ * @returns {'png' | 'jpeg' | 'gif' | 'webp' | null}
+ */
 function detectImageFormat(buf) {
   if (buf.length >= 8
     && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47
@@ -570,6 +750,11 @@ function detectImageFormat(buf) {
   return null;
 }
 
+/**
+ * @param {unknown} raw
+ * @param {string} expectedExt
+ * @returns {Buffer}
+ */
 function decodeImageBase64(raw, expectedExt) {
   if (typeof raw !== 'string') throw badRequest('Image data is required');
   let payload = raw.trim();
@@ -599,6 +784,10 @@ function decodeImageBase64(raw, expectedExt) {
   return buf;
 }
 
+/**
+ * @param {unknown} rawName
+ * @returns {string}
+ */
 function templateTargetForNew(rawName) {
   const filename = normalizeTemplateName(rawName);
   assertEditableTemplate(filename);
@@ -616,7 +805,7 @@ function templateTargetForNew(rawName) {
     if (stat.isSymbolicLink()) throw badRequest(`Not allowed: ${filename}`);
     throw conflict(`A template named ${filename} already exists`);
   } catch (err) {
-    if (err.code !== 'ENOENT') throw err;
+    if (errCode(err) !== 'ENOENT') throw err;
   }
   return target;
 }
@@ -630,6 +819,7 @@ function listCsvs() {
     .sort()
     .map((name) => {
       const path = join(DATA_DIR, name);
+      /** @type {{ path: string, name: string, recipients: number, invalid: number, duplicates: number, error: string | null }} */
       const item = { path: rel(path), name, recipients: 0, invalid: 0, duplicates: 0, error: null };
       try {
         const parsed = parseRecipients(readFileSync(path, 'utf8'));
@@ -637,7 +827,7 @@ function listCsvs() {
         item.invalid = parsed.invalid;
         item.duplicates = parsed.duplicates;
       } catch (err) {
-        item.error = err.message;
+        item.error = errMsg(err);
       }
       return item;
     });
@@ -667,6 +857,7 @@ function listTemplates() {
  * single mailbox inside provider rate limits; an explicit 0 is honoured but a
  * missing or nonsense value must never become an unthrottled blast.
  */
+/** @param {unknown} value @param {number} [fallback] */
 function delayFrom(value, fallback = 4000) {
   if (value === undefined || value === null || value === '') return fallback;
   const n = Number(value);
@@ -674,7 +865,12 @@ function delayFrom(value, fallback = 4000) {
   return Math.max(0, Math.min(10 * 60 * 1000, Math.floor(n)));
 }
 
-/** true is implicit TLS, false is STARTTLS; unspecified follows the saved mode, else the port. */
+/**
+ * true is implicit TLS, false is STARTTLS; unspecified follows the saved mode, else the port.
+ * @param {unknown} value
+ * @param {number} port
+ * @returns {boolean}
+ */
 function secureFrom(value, port) {
   if (value === undefined) return resolveSmtpConfig({ ...process.env, SMTP_PORT: String(port) }).secure;
   if (typeof value === 'boolean') return value;
@@ -682,10 +878,19 @@ function secureFrom(value, port) {
   throw new Error('Invalid TLS mode: secure must be true (implicit TLS) or false (STARTTLS)');
 }
 
-/** A text setting from the form: not sent keeps what is saved, empty clears it. */
+/**
+ * A text setting from the form: not sent keeps what is saved, empty clears it.
+ * @param {unknown} value
+ * @param {string} saved
+ * @returns {string}
+ */
 const textSetting = (value, saved) => (value === undefined ? saved : String(value ?? '').trim());
 
-/** SMTP settings from a settings form, falling back to what is saved. */
+/**
+ * SMTP settings from a settings form, falling back to what is saved.
+ * @param {Record<string, unknown>} body
+ * @returns {SmtpConfig & { maxPerHour: string }}
+ */
 function smtpConfigFrom(body) {
   const current = resolveSmtpConfig();
   const host = String(body.host ?? current.host).trim();
@@ -706,6 +911,7 @@ function smtpConfigFrom(body) {
     pass,
     from,
     replyTo: textSetting(body.replyTo, current.replyTo),
+    unsubscribeMailto: current.unsubscribeMailto,
     unsubscribeUrl: textSetting(body.unsubscribeUrl, current.unsubscribeUrl),
     maxPerHour: textSetting(body.maxPerHour, process.env.MAX_PER_HOUR ?? ''),
     isLocal,
@@ -713,7 +919,11 @@ function smtpConfigFrom(body) {
   };
 }
 
-/** Why the optional delivery settings cannot be saved, or null. */
+/**
+ * Why the optional delivery settings cannot be saved, or null.
+ * @param {SmtpConfig & { maxPerHour: string }} cfg
+ * @returns {string | null}
+ */
 function deliverySettingsIssue(cfg) {
   if (cfg.replyTo && !emailRe.test(bareAddress(cfg.replyTo))) {
     return 'Reply-To must be an email address such as help@example.com or Help <help@example.com>';
@@ -723,7 +933,7 @@ function deliverySettingsIssue(cfg) {
   try {
     rateLimitsFromEnv({ MAX_PER_HOUR: cfg.maxPerHour });
   } catch (err) {
-    return err.message;
+    return errMsg(err);
   }
   return null;
 }
@@ -744,17 +954,25 @@ function smtpState() {
   };
 }
 
-/** Why a send cannot go out compliantly (bad ceiling, From or unsubscribe URL), or null. */
+/**
+ * Why a send cannot go out compliantly (bad ceiling, From or unsubscribe URL), or null.
+ * @param {SmtpConfig} cfg
+ * @returns {string | null}
+ */
 function complianceIssue(cfg) {
   try {
     rateLimitsFromEnv();
   } catch (err) {
-    return err.message;
+    return errMsg(err);
   }
   return configIssue(cfg);
 }
 
-/** Shared input resolution for preview / test / send. */
+/**
+ * Shared input resolution for preview / test / send.
+ * @param {Record<string, unknown>} body
+ * @returns {ResolvedInput}
+ */
 function resolveInput(body) {
   const templatePath = safePath(body.html, { roots: [TEMPLATE_DIR], ext: ['.html', '.htm'] });
   const assetsDir = assetsDirFor(templatePath);
@@ -767,7 +985,7 @@ function resolveInput(body) {
   // Recipients come either from a saved CSV or from the paste box.
   const raw = typeof body.raw === 'string' ? body.raw.trim() : '';
   const csvPath = raw ? null : safePath(body.csv, { roots: [DATA_DIR], ext: ['.csv'] });
-  const parsed = raw ? parseRecipientsText(raw, options) : recipientsFromFile(csvPath, options);
+  const parsed = csvPath ? recipientsFromFile(csvPath, options) : parseRecipientsText(raw, options);
   if (!parsed.recipients.length) {
     throw new Error(raw ? 'No valid email addresses in the pasted list' : 'No valid email addresses found in this CSV');
   }
@@ -779,7 +997,7 @@ function resolveInput(body) {
 
   return {
     csvPath,
-    source: raw ? 'pasted' : csvPath,
+    source: raw ? 'pasted' : String(csvPath),
     templatePath,
     assetsDir,
     subject,
@@ -790,7 +1008,11 @@ function resolveInput(body) {
   };
 }
 
-/** data/<slug>.csv, with a numeric suffix if that name is taken. */
+/**
+ * data/<slug>.csv, with a numeric suffix if that name is taken.
+ * @param {unknown} name
+ * @returns {string}
+ */
 function nextCsvPath(name) {
   const slug = String(name || '')
     .toLowerCase()
@@ -806,10 +1028,15 @@ function nextCsvPath(name) {
   return candidate;
 }
 
-/** Rendered message for one recipient, images inlined so a browser can show it. */
+/**
+ * Rendered message for one recipient, images inlined so a browser can show it.
+ * @param {ResolvedInput} input
+ * @param {unknown} [index]
+ */
 function previewFor(input, index = 0) {
   const i = Math.max(0, Math.min(input.parsed.recipients.length - 1, Number(index) || 0));
   const rec = input.parsed.recipients[i];
+  /** @param {Recipient} r */
   const held = (r) => !input.alreadySent.has(r._email.toLowerCase()) && isSuppressed(SUPPRESSION_PATH, r._email);
   const suppressed = input.parsed.recipients.filter(held).length;
   const skipped = input.parsed.recipients.filter((r) => input.alreadySent.has(r._email.toLowerCase())).length;
@@ -839,10 +1066,17 @@ function previewFor(input, index = 0) {
   };
 }
 
-/** Each {{field}} the message uses, and whether the recipient list can fill it. */
+/**
+ * Each {{field}} the message uses, and whether the recipient list can fill it.
+ * @param {string} text
+ * @param {{ name: string, role: string }[]} columns
+ * @returns {{ name: string, status: string }[]}
+ */
 function placeholdersFor(text, columns) {
   const known = new Set(columns.map((c) => c.name));
+  /** @type {Set<string>} */
   const seen = new Set();
+  /** @type {{ name: string, status: string }[]} */
   const found = [];
   for (const name of templateVariables(text)) {
     const key = name.toLowerCase();
@@ -854,7 +1088,11 @@ function placeholdersFor(text, columns) {
   return found;
 }
 
-/** The recipient table the page shows for a saved CSV, a dry run or a pasted list. */
+/**
+ * The recipient table the page shows for a saved CSV, a dry run or a pasted list.
+ * @param {ParsedRecipients} parsed
+ * @param {{ path?: string | null, alreadySent?: Set<string> }} [options]
+ */
 function rosterView(parsed, { path = null, alreadySent = new Set() } = {}) {
   const shown = parsed.recipients.slice(0, 1000);
   return {
@@ -876,7 +1114,9 @@ function rosterView(parsed, { path = null, alreadySent = new Set() } = {}) {
 }
 
 // ── Jobs (campaign progress streams) ─────────────────────────────────
+/** @type {Map<string, CampaignJob>} */
 const jobs = new Map();
+/** @type {string | null} */
 let activeJobId = null;
 
 function runningJob() {
@@ -887,19 +1127,20 @@ function runningJob() {
 // Set by the signal handler; no new campaign may start once it is true.
 let shuttingDown = false;
 
+/** @returns {CampaignJob} */
 function createJob() {
   if (shuttingDown) {
-    const err = new Error('Mailroom is shutting down');
-    err.status = 503;
-    throw err;
+    throw Object.assign(new Error('Mailroom is shutting down'), { status: 503 });
   }
   // One campaign at a time: two runs would double-send whatever they share.
   if (runningJob()) {
-    const err = new Error('A campaign is already running — wait for it to finish');
-    err.status = 409;
-    throw err;
+    throw Object.assign(new Error('A campaign is already running — wait for it to finish'), { status: 409 });
   }
 
+  /** @type {(value: unknown) => void} */
+  let resolveFinished = () => {};
+  const finished = new Promise((resolveDone) => { resolveFinished = resolveDone; });
+  /** @type {CampaignJob} */
   const job = {
     id: randomUUID(),
     events: [],
@@ -908,8 +1149,9 @@ function createJob() {
     done: false,
     summary: null,
     startedAt: new Date().toISOString(),
+    finished,
+    resolveFinished,
   };
-  job.finished = new Promise((resolve) => { job.resolveFinished = resolve; });
   jobs.set(job.id, job);
   activeJobId = job.id;
 
@@ -924,6 +1166,10 @@ function createJob() {
   return job;
 }
 
+/**
+ * @param {CampaignJob} job
+ * @param {JobEvent} event
+ */
 function emit(job, event) {
   // Replay buffers thousands of lines in a big campaign; bound it.
   if (job.events.length < 20000) job.events.push(event);
@@ -935,7 +1181,7 @@ function emit(job, event) {
     job.clients.clear();
     job.done = true;
     job.summary = event.summary;
-    job.resolveFinished?.(event.summary);
+    job.resolveFinished(event.summary);
     if (activeJobId === job.id) activeJobId = null;
   }
 }
@@ -943,6 +1189,9 @@ function emit(job, event) {
 /**
  * Runs a campaign in the background and streams progress through a job.
  * Used by POST /api/send and by the scheduler.
+ * @param {StartCampaignInput} input
+ * @param {{ delay?: number }} [options]
+ * @returns {CampaignJob}
  */
 function startCampaign(input, { delay = 0 } = {}) {
   const cfg = resolveSmtpConfig();
@@ -981,8 +1230,9 @@ function startCampaign(input, { delay = 0 } = {}) {
         onEvent: (event) => emit(job, event),
       });
     } catch (err) {
-      emit(job, { type: 'error', error: err.message });
-      emit(job, { type: 'done', summary: { sent: 0, failed: 0, skipped: 0, failures: [], stopped: true, error: err.message } });
+      const message = errMsg(err);
+      emit(job, { type: 'error', error: message });
+      emit(job, { type: 'done', summary: { sent: 0, failed: 0, skipped: 0, failures: [], stopped: true, error: message } });
     } finally {
       mailer.close();
     }
@@ -995,17 +1245,19 @@ function startCampaign(input, { delay = 0 } = {}) {
 // The queue lives in a JSON file next to the send log, so a restart keeps it.
 // Each entry stores its recipients at the moment it was scheduled: editing a
 // CSV later cannot change what a queued send will do.
+/** @returns {ScheduleEntry[]} */
 function readSchedule() {
   if (!existsSync(SCHEDULE_PATH)) return [];
   try {
     const parsed = JSON.parse(readFileSync(SCHEDULE_PATH, 'utf8'));
     return Array.isArray(parsed) ? parsed : [];
   } catch (err) {
-    console.error('[schedule] unreadable file:', err.message);
+    console.error('[schedule] unreadable file:', errMsg(err));
     return [];
   }
 }
 
+/** @param {ScheduleEntry[]} entries */
 function writeSchedule(entries) {
   const staging = `${SCHEDULE_PATH}.tmp`;
   try {
@@ -1036,8 +1288,10 @@ function scheduleView() {
     }));
 }
 
+/** @param {string} text */
 const sha256 = (text) => createHash('sha256').update(text).digest('hex');
 
+/** @param {ScheduleEntry} entry */
 function templateFor(entry) {
   const path = safePath(entry.template, { roots: [TEMPLATE_DIR], ext: ['.html', '.htm'] });
   const html = readFileSync(path, 'utf8');
@@ -1050,13 +1304,14 @@ function templateFor(entry) {
   return { path, html, assetsDir: assetsDirFor(path) };
 }
 
-/** Runs one due entry; the caller has already marked it "sending". */
+/** Runs one due entry; the caller has already marked it "sending". @param {ScheduleEntry} entry */
 async function fireScheduled(entry) {
   // Set again below if this run is cut short too.
   entry.interrupted = false;
   try {
     const template = templateFor(entry);
     const campaignId = String(entry.campaign || '');
+    /** @type {Recipient[]} */
     const recipients = (entry.recipients || []).map((r) => ({
       ...r.fields,
       _email: r.email,
@@ -1066,7 +1321,6 @@ async function fireScheduled(entry) {
     if (!recipients.length) throw new Error('The scheduled list has no recipients');
 
     const job = startCampaign({
-      recipients,
       parsed: { recipients },
       templateHtml: template.html,
       assetsDir: template.assetsDir,
@@ -1076,14 +1330,14 @@ async function fireScheduled(entry) {
     }, { delay: delayFrom(entry.delay) });
     job.scheduleId = entry.id;
 
-    const summary = await job.finished;
+    const summary = /** @type {JobSummary | null} */ (await job.finished);
     entry.result = {
       sent: summary?.sent || 0,
       failed: summary?.failed || 0,
       skipped: summary?.skipped || 0,
       ...(summary?.uncertain?.length ? { uncertain: summary.uncertain.length } : {}),
     };
-    if (job.cancelled && summary?.remaining > 0) {
+    if (job.cancelled && (summary?.remaining || 0) > 0) {
       // Stopped part-way. A shutdown puts the entry back in line so the next
       // start resumes it (the log skips whoever was already mailed); a person
       // pressing Stop means it is over.
@@ -1098,7 +1352,7 @@ async function fireScheduled(entry) {
     if (summary?.error) entry.error = summary.error;
   } catch (err) {
     entry.status = 'failed';
-    entry.error = err.message;
+    entry.error = errMsg(err);
   } finally {
     // A send can run for hours, during which schedules are added and
     // cancelled. Write this entry's outcome into the file as it is now rather
@@ -1116,6 +1370,7 @@ async function fireScheduled(entry) {
   }
 }
 
+/** @type {ReturnType<typeof setInterval> | null} */
 let schedulerTimer = null;
 let ticking = false;
 
@@ -1159,7 +1414,7 @@ async function tick() {
     writeSchedule(list);
     await fireScheduled(due);
   } catch (err) {
-    console.error('[schedule] tick failed:', err.message);
+    console.error('[schedule] tick failed:', errMsg(err));
   } finally {
     ticking = false;
   }
@@ -1193,6 +1448,7 @@ export function startScheduler() {
 }
 
 // ── Static page ──────────────────────────────────────────────────────
+/** @type {Record<string, [string, string]>} */
 const STATIC = {
   '/': ['index.html', 'text/html; charset=utf-8'],
   '/index.html': ['index.html', 'text/html; charset=utf-8'],
@@ -1204,6 +1460,7 @@ const STATIC = {
   '/favicon.svg': ['favicon.svg', 'image/svg+xml'],
 };
 
+/** @param {ServerResponse} res @param {string} pathname */
 function serveStatic(res, pathname) {
   const entry = STATIC[pathname];
   if (!entry) return false;
@@ -1220,6 +1477,7 @@ function serveStatic(res, pathname) {
 }
 
 // ── Routes ───────────────────────────────────────────────────────────
+/** @param {IncomingMessage} req @param {ServerResponse} res */
 async function route(req, res) {
   setSecurityHeaders(req, res);
 
@@ -1402,7 +1660,7 @@ async function route(req, res) {
     const asCsv = body.format === 'csv';
     // A dry run reports what would be saved, so the page can validate as the
     // user types or picks a file, without leaving a file behind.
-    if (body.dryRun === true && !text) return json(res, 200, rosterView({ recipients: [], invalid: 0, duplicates: 0, truncated: 0, columns: [] }));
+    if (body.dryRun === true && !text) return json(res, 200, rosterView({ recipients: [], total: 0, invalid: 0, duplicates: 0, truncated: 0, columns: [] }));
     if (!text) return fail(res, 400, 'Nothing to save');
     const parsed = asCsv ? parseRecipients(text) : parseRecipientsText(text);
     if (body.dryRun === true) return json(res, 200, rosterView(parsed));
@@ -1420,7 +1678,7 @@ async function route(req, res) {
     }
     return json(res, 201, {
       path: rel(target),
-      name: target.split(sep).pop(),
+      name: target.split(sep).pop() || basename(target),
       recipients: parsed.recipients.length,
       duplicates: parsed.duplicates,
       invalid: parsed.invalid,
@@ -1476,7 +1734,7 @@ async function route(req, res) {
           return fail(res, 400, 'Not allowed: invalid destination assets folder');
         }
       } catch (err) {
-        if (err.code !== 'ENOENT') throw err;
+        if (errCode(err) !== 'ENOENT') throw err;
         assetsCreated = true;
       }
     }
@@ -1485,8 +1743,10 @@ async function route(req, res) {
     if (srcAssets) {
       try {
         const destAssets = resolveSafeAssetsDir(target, { create: true });
-        for (const asset of listAssetsFor(srcAssets)) {
-          writeAtomicFile(join(destAssets, asset.filename), readFileSync(join(srcAssets, asset.filename)));
+        if (destAssets) {
+          for (const asset of listAssetsFor(srcAssets)) {
+            writeAtomicFile(join(destAssets, asset.filename), readFileSync(join(srcAssets, asset.filename)));
+          }
         }
       } catch (err) {
         rmSync(target, { force: true });
@@ -1519,11 +1779,12 @@ async function route(req, res) {
     const { filename, cid, ext } = safeAssetFilename(body.filename);
     const bytes = decodeImageBase64(body.dataBase64, ext);
     const assetsDir = resolveSafeAssetsDir(templatePath, { create: true });
+    if (!assetsDir) return fail(res, 400, 'Invalid assets folder');
     const target = join(assetsDir, filename);
     try {
       if (lstatSync(target).isSymbolicLink()) return fail(res, 400, 'Not allowed');
     } catch (err) {
-      if (err.code !== 'ENOENT') throw err;
+      if (errCode(err) !== 'ENOENT') throw err;
     }
     writeAtomicFile(target, bytes);
     return json(res, 201, { filename, cid, size: bytes.length, assetsDir: rel(assetsDir) });
@@ -1588,9 +1849,9 @@ async function route(req, res) {
     mailer.close();
     return json(res, 200, {
       ok: result.success,
-      error: result.error || null,
-      messageId: result.messageId || null,
-      inline: result.inline || 0,
+      error: result.success ? null : result.error,
+      messageId: result.success ? result.messageId : null,
+      inline: result.success ? result.inline : 0,
       from: cfg.from,
     });
   }
@@ -1609,7 +1870,7 @@ async function route(req, res) {
     try {
       job = startCampaign(input, { delay });
     } catch (err) {
-      return fail(res, err.status || 409, err.message);
+      return fail(res, errStatus(err) || 409, errMsg(err));
     }
     return json(res, 202, { jobId: job.id, total: input.parsed.recipients.length, skipped: countAlreadySent(input.parsed.recipients, input.alreadySent) });
   }
@@ -1660,6 +1921,7 @@ async function route(req, res) {
     const active = list.filter((e) => e.status === 'pending' || e.status === 'sending').length;
     if (active >= 100) return fail(res, 400, 'Too many scheduled campaigns — finish or cancel some first');
 
+    /** @type {ScheduleEntry} */
     const entry = {
       id: randomUUID(),
       at: new Date(at).toISOString(),
@@ -1719,11 +1981,11 @@ async function route(req, res) {
   if (req.method === 'GET' && pathname === '/api/jobs/active') {
     const job = runningJob();
     if (!job) return json(res, 200, { jobId: null });
-    const start = job.events.find((event) => event.type === 'start') || {};
+    const start = job.events.find((event) => event.type === 'start');
     return json(res, 200, {
       jobId: job.id,
-      total: start.total ?? null,
-      campaign: start.campaign ?? null,
+      total: start && 'total' in start ? start.total : null,
+      campaign: start && 'campaign' in start ? start.campaign : null,
       startedAt: job.startedAt,
       cancelled: job.cancelled,
     });
@@ -1772,19 +2034,24 @@ function suggestedCampaign() {
   return `campaign-${stamp}`;
 }
 
+/** @param {IncomingMessage} req @param {ServerResponse} res */
 function handleRequest(req, res) {
   route(req, res).catch((err) => {
     if (res.headersSent) {
       res.end();
       return;
     }
-    const code = err.status || (/not allowed|not found|required|invalid|no valid|no data rows|unclosed quote|expected|too long/i.test(err.message) ? 400 : 500);
-    if (code >= 500) console.error('[gui] request failed:', err.message);
-    fail(res, code, err.message);
+    const message = errMsg(err);
+    const code = errStatus(err) || (/not allowed|not found|required|invalid|no valid|no data rows|unclosed quote|expected|too long/i.test(message) ? 400 : 500);
+    if (code >= 500) console.error('[gui] request failed:', message);
+    fail(res, code, message);
   });
 }
 
-/** HTTPS when a certificate/key pair is configured, plain HTTP otherwise. */
+/**
+ * HTTPS when a certificate/key pair is configured, plain HTTP otherwise.
+ * @returns {WebServer}
+ */
 function createServer() {
   const tls = tlsOptions();
   const created = tls
@@ -1800,10 +2067,16 @@ function createServer() {
   return created;
 }
 
+/** @type {WebServer | null} */
 let server = null;
+/** @type {Promise<ListenAddress> | null} */
 let started = null;
 
-/** Starts the HTTPS/HTTP server once; safe to await more than once. */
+/**
+ * Starts the HTTPS/HTTP server once; safe to await more than once.
+ * @param {{ port?: number, host?: string }} [options]
+ * @returns {Promise<ListenAddress>}
+ */
 export function startServer({ port = PORT, host = HOST } = {}) {
   if (started) return Promise.resolve(started);
   try {
@@ -1819,22 +2092,24 @@ export function startServer({ port = PORT, host = HOST } = {}) {
   } catch (err) {
     return Promise.reject(err);
   }
+  const activeServer = server;
   started = new Promise((resolveListen) => {
-    server.listen(port, host, () => {
-      server.off('error', onListenError);
+    activeServer.listen(port, host, () => {
+      activeServer.off('error', onListenError);
       startScheduler();
-      resolveListen(server.address());
+      resolveListen(activeServer.address());
     });
   });
   return started;
 }
 
+/** @param {unknown} err */
 function onListenError(err) {
-  if (err.code === 'EADDRINUSE') {
+  if (errCode(err) === 'EADDRINUSE') {
     console.error(`\n  Port ${PORT} is already in use.`);
     console.error(`  Stop the other process, or run: mailroom --port 4300\n`);
   } else {
-    console.error(`\n  Server error: ${err.message}\n`);
+    console.error(`\n  Server error: ${errMsg(err)}\n`);
   }
   process.exit(1);
 }
@@ -1863,14 +2138,18 @@ if (isMain) {
   startServer()
     .then(banner)
     .catch((err) => {
-      console.error(`\n  ${err.message}\n`);
+      console.error(`\n  ${errMsg(err)}\n`);
       process.exit(1);
     });
 }
 
 const SHUTDOWN_WAIT_MS = 8000;
 
-/** Stops the running campaign cleanly, reports it, and returns the exit code. */
+/**
+ * Stops the running campaign cleanly, reports it, and returns the exit code.
+ * @param {string} signal
+ * @returns {Promise<number>}
+ */
 async function shutDown(signal) {
   if (schedulerTimer) clearInterval(schedulerTimer);
 
@@ -1885,8 +2164,8 @@ async function shutDown(signal) {
   }
   if (!job) return 0;
 
-  const start = job.events.find((event) => event.type === 'start') || {};
-  const campaign = start.campaign || '';
+  const start = job.events.find((event) => event.type === 'start');
+  const campaign = start && 'campaign' in start && start.campaign ? start.campaign : '';
   const resume = job.scheduleId
     ? 'The scheduled entry is back in the queue and resumes when Mailroom starts again (or use Run now).'
     : 'Start the same campaign again to resume; addresses already sent are skipped.';
@@ -1896,8 +2175,10 @@ async function shutDown(signal) {
     console.error('  The message in flight may or may not have been delivered; check the send log before running it again.\n');
     return SIGNAL_EXIT[signal];
   }
-  if (job.summary?.remaining > 0) {
-    console.error(`\n  ${describeInterruption(signal, job.summary, { campaign, resume }).replace(/\n/g, '\n  ')}\n`);
+  const doneSummary = job.summary;
+  if (doneSummary && 'total' in doneSummary && typeof doneSummary.total === 'number'
+    && typeof doneSummary.remaining === 'number' && doneSummary.remaining > 0) {
+    console.error(`\n  ${describeInterruption(signal, /** @type {CampaignRunSummary} */ (doneSummary), { campaign, resume }).replace(/\n/g, '\n  ')}\n`);
     return SIGNAL_EXIT[signal];
   }
   return 0;
@@ -1919,5 +2200,5 @@ for (const signal of Object.keys(SIGNAL_EXIT)) {
 }
 
 process.on('unhandledRejection', (err) => {
-  console.error('[gui] unhandled rejection:', err?.message || err);
+  console.error('[gui] unhandled rejection:', err instanceof Error ? err.message : err);
 });

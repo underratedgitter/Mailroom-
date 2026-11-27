@@ -65,11 +65,12 @@ for (let i = 0; i < args.length; i++) {
 const { startServer, tlsEnabled } = await import('../src/gui.mjs');
 const { resolveConfigPath } = await import('../src/lib/config.mjs');
 
-let address;
+/** @type {import('node:net').AddressInfo | string | null} */
+let address = null;
 try {
   address = await startServer();
 } catch (err) {
-  console.error(`\n  ${err.message}\n`);
+  console.error(`\n  ${err instanceof Error ? err.message : String(err)}\n`);
   process.exit(1);
 }
 
@@ -87,6 +88,7 @@ console.log(`\n  Ctrl+C to stop.\n`);
 
 if (opts.open) openBrowser(url);
 
+/** @param {string} target */
 function openBrowser(target) {
   const [command, argv] = process.platform === 'darwin'
     ? ['open', [target]]

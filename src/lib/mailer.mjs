@@ -8,10 +8,45 @@
 //   EMAIL_REPLY_TO       Reply-To address; also the default unsubscribe mailbox
 //   UNSUBSCRIBE_MAILTO   unsubscribe mailbox if it should differ from the above
 //                        (default: Reply-To, else the From address)
-//   UNSUBSCRIBE_URL      https:// endpoint you host that accepts a one-click
-//                        POST; {email} is replaced with the recipient
+//   MAILROOM_PUBLIC_URL  https:// origin of this Mailroom server for signed
+//                        per-recipient /unsubscribe?token=... links
+//   UNSUBSCRIBE_URL      external https:// endpoint you host that accepts a
+//                        one-click POST; {email} is replaced with the recipient
 
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+
+const SIMPLE_EMAIL_RE = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
+
+/** Signs an HMAC-SHA256 unsubscribe token binding a normalized email address. */
+export function signUnsubscribeToken(email, secret) {
+  const normalized = String(email ?? '').trim().toLowerCase();
+  const key = String(secret ?? '').trim();
+  if (!SIMPLE_EMAIL_RE.test(normalized) || !key) return '';
+  const payload = Buffer.from(JSON.stringify({ e: normalized }), 'utf8').toString('base64url');
+  const sig = createHmac('sha256', key).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+/** Verifies an unsubscribe token and returns `{ email }`, or `null` if invalid/tampered. */
+export function verifyUnsubscribeToken(token, secret) {
+  const key = String(secret ?? '').trim();
+  const parts = String(token ?? '').split('.');
+  if (parts.length !== 2 || !parts[0] || !parts[1] || !key) return null;
+  const [payload, sig] = parts;
+  const expected = createHmac('sha256', key).update(payload).digest('base64url');
+  const actualBuf = Buffer.from(sig);
+  const expectedBuf = Buffer.from(expected);
+  if (actualBuf.length !== expectedBuf.length || !timingSafeEqual(actualBuf, expectedBuf)) {
+    return null;
+  }
+  try {
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    const email = String(data?.e || '').trim().toLowerCase();
+    return SIMPLE_EMAIL_RE.test(email) ? { email } : null;
+  } catch {
+    return null;
+  }
+}
 
 /** `Desk <desk@example.com>` -> `desk@example.com`. */
 export function bareAddress(value) {
@@ -58,6 +93,8 @@ export function resolveSmtpConfig(env = process.env) {
     replyTo,
     unsubscribeMailto: (env.UNSUBSCRIBE_MAILTO || '').trim(),
     unsubscribeUrl: (env.UNSUBSCRIBE_URL || '').trim(),
+    publicUrl: (env.MAILROOM_PUBLIC_URL || '').trim().replace(/\/+$/, ''),
+    unsubscribeSecret: String(env.MAILROOM_UNSUBSCRIBE_SECRET || '').trim(),
     isLocal,
     configured: Boolean((user && pass) || isLocal),
   };
@@ -71,12 +108,26 @@ export function unsubscribeUrlIssue(url) {
   return null;
 }
 
+/** Why MAILROOM_PUBLIC_URL cannot be used, or null (empty means none). */
+export function publicUrlIssue(url) {
+  if (!url) return null;
+  if (!/^https:\/\/[^\s<>?#]+$/i.test(url)) {
+    return 'MAILROOM_PUBLIC_URL must be an https:// URL with no spaces, query, or hash (RFC 8058 one-click needs HTTPS).';
+  }
+  try {
+    new URL(url);
+  } catch {
+    return 'MAILROOM_PUBLIC_URL is not a valid https:// URL.';
+  }
+  return null;
+}
+
 /** Why this configuration cannot send compliant mail, or null when it can. */
 export function configIssue(cfg) {
   if (!addressDomain(cfg.from)) {
     return 'EMAIL_FROM must be a full address such as news@example.com: Message-ID and unsubscribe headers are built from its domain.';
   }
-  return unsubscribeUrlIssue(cfg.unsubscribeUrl);
+  return unsubscribeUrlIssue(cfg.unsubscribeUrl) || publicUrlIssue(cfg.publicUrl);
 }
 
 /** `mailto:` link to the unsubscribe mailbox (UNSUBSCRIBE_MAILTO, else Reply-To, else From), or ''. */
@@ -89,9 +140,19 @@ function unsubscribeMailtoLink(cfg) {
 
 const unsubscribeUrlFor = (cfg, to) => cfg.unsubscribeUrl.replaceAll('{email}', encodeURIComponent(to));
 
+function signedUnsubscribeUrlFor(cfg, to) {
+  if (!cfg.publicUrl || !cfg.unsubscribeSecret) return '';
+  const token = signUnsubscribeToken(to, cfg.unsubscribeSecret);
+  return token ? `${cfg.publicUrl}/unsubscribe?token=${encodeURIComponent(token)}` : '';
+}
+
+function httpUnsubscribeTarget(cfg, to) {
+  return cfg.unsubscribeUrl ? unsubscribeUrlFor(cfg, to) : signedUnsubscribeUrlFor(cfg, to);
+}
+
 /** What `{{unsubscribe_url}}` stands for: the hosted URL for this recipient, else the mailto link; '' when neither exists. */
 export function unsubscribeLink(cfg, to) {
-  return cfg.unsubscribeUrl ? unsubscribeUrlFor(cfg, to) : unsubscribeMailtoLink(cfg);
+  return httpUnsubscribeTarget(cfg, to) || unsubscribeMailtoLink(cfg);
 }
 
 /**
@@ -101,8 +162,9 @@ export function unsubscribeLink(cfg, to) {
 export function bulkFields(cfg, to) {
   const targets = [];
   const headers = {};
-  if (cfg.unsubscribeUrl) {
-    targets.push(`<${unsubscribeUrlFor(cfg, to)}>`);
+  const httpsTarget = httpUnsubscribeTarget(cfg, to);
+  if (httpsTarget) {
+    targets.push(`<${httpsTarget}>`);
     headers['List-Unsubscribe-Post'] = 'List-Unsubscribe=One-Click';
   }
   const mailto = unsubscribeMailtoLink(cfg);

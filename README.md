@@ -344,7 +344,9 @@ call.) Delete a line from the file to un-suppress an address.
 | --- | --- | --- |
 | `EMAIL_REPLY_TO` | unset | Reply-To header; also the default unsubscribe mailbox |
 | `UNSUBSCRIBE_MAILTO` | Reply-To, else From | Mailbox that receives "unsubscribe" mail |
-| `UNSUBSCRIBE_URL` | unset | `https://` one-click endpoint you host; `{email}` is replaced |
+| `UNSUBSCRIBE_URL` | unset | External `https://` one-click endpoint you host; `{email}` is replaced (overrides `MAILROOM_PUBLIC_URL`) |
+| `MAILROOM_PUBLIC_URL` | unset | Public `https://` origin of this Mailroom server for signed one-click `/unsubscribe` links (works without logging in) |
+| `MAILROOM_UNSUBSCRIBE_SECRET` | generated in `logs/.unsubscribe-secret` | Explicit HMAC secret for signing `/unsubscribe` tokens across CLI and server restarts |
 | `SUPPRESSION_FILE` | `data/suppressed.csv` | Suppression list location (CLI: `--suppression-file`); the default is in the install folder for the CLI and the browser alike |
 | `MAX_PER_HOUR` | `500` | Rolling messages-per-hour ceiling for all domains; `0` turns it off |
 | `MAX_PER_DOMAIN_PER_HOUR` | `0` (off) | Same, per recipient domain (e.g. `gmail.com`); a full domain pauses the run |

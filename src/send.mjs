@@ -51,6 +51,7 @@ import {
   describeInterruption,
   defaultSuppressionPath,
   defaultLogPath,
+  loadOrCreateUnsubscribeSecret,
   addSuppressed,
   isSuppressed,
   rateLimitsFromEnv,
@@ -154,6 +155,8 @@ try {
 }
 const subjectTemplate = values.subject;
 const assetsDir = values['assets-dir'];
+
+if (process.env.MAILROOM_PUBLIC_URL) loadOrCreateUnsubscribeSecret();
 
 const cfg = resolveSmtpConfig();
 console.log('\nSMTP');

@@ -29,6 +29,7 @@
  *   GET  /api/jobs/active      the campaign still running, if any
  *   GET  /api/jobs/:id/events  server-sent event stream of progress
  *   POST /api/jobs/:id/cancel  stop after the message in flight
+ *   GET|POST /unsubscribe      public signed unsubscribe page / RFC 8058 one-click handler
  *
  * File paths are restricted to data/ and templates/.
  */
@@ -52,11 +53,14 @@ import {
   linkWarnings,
   render,
   renderSubject,
+  escapeHtml,
   inlineForPreview,
   attachmentsFor,
   readLog,
   defaultLogPath,
   defaultSuppressionPath,
+  loadOrCreateUnsubscribeSecret,
+  verifyUnsubscribeToken,
   loadSuppressed,
   addSuppressed,
   isSuppressed,
@@ -165,6 +169,16 @@ const ALLOWED_HOSTS = new Set([
 // origin that is not one of our own names is refused. `Origin: null`
 // (sandboxed iframe, file://) is refused too — it is not in the set.
 const ALLOWED_ORIGINS = new Set([...ALLOWED_HOSTS].flatMap((h) => [`http://${h}`, `https://${h}`]));
+const PUBLIC_URL = (process.env.MAILROOM_PUBLIC_URL || '').trim().replace(/\/+$/, '');
+const { PUBLIC_URL_HOST, PUBLIC_URL_ORIGIN } = (() => {
+  try {
+    if (!PUBLIC_URL) return { PUBLIC_URL_HOST: '', PUBLIC_URL_ORIGIN: '' };
+    const u = new URL(PUBLIC_URL);
+    return { PUBLIC_URL_HOST: u.host.toLowerCase(), PUBLIC_URL_ORIGIN: u.origin.toLowerCase() };
+  } catch {
+    return { PUBLIC_URL_HOST: '', PUBLIC_URL_ORIGIN: '' };
+  }
+})();
 
 // ── Optional password gate ───────────────────────────────────────────
 // Loopback-only installs need none. A Docker or LAN install must set a
@@ -304,13 +318,14 @@ function setSecurityHeaders(req, res) {
 // these checks stop a forged request from reaching the handlers at all.
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
-function crossSiteReason(req) {
+function crossSiteReason(req, rawPath = '') {
   const origin = String(req.headers.origin || '').toLowerCase();
   if (origin) {
     let originHost = null;
     try { originHost = new URL(origin).host; } catch { /* "null" and junk are foreign */ }
     const ownHost = String((TRUST_PROXY && firstForwarded(req, 'x-forwarded-host')) || req.headers.host || '').toLowerCase();
-    if (!ALLOWED_ORIGINS.has(origin) && !(originHost && originHost === ownHost)) return 'Cross-origin request refused';
+    const publicUnsubOrigin = rawPath === '/unsubscribe' && PUBLIC_URL_ORIGIN && origin === PUBLIC_URL_ORIGIN;
+    if (!ALLOWED_ORIGINS.has(origin) && !publicUnsubOrigin && !(originHost && originHost === ownHost)) return 'Cross-origin request refused';
   }
   // Modern browsers label every request; same-site (a sibling subdomain) is
   // still not us.
@@ -319,6 +334,52 @@ function crossSiteReason(req) {
     return 'Cross-site request refused';
   }
   return null;
+}
+
+async function readSmallBody(req, limit = 8192) {
+  let size = 0;
+  const chunks = [];
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) throw Object.assign(new Error('Request body too large'), { status: 413 });
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+function renderUnsubscribePage(res, code, { title, heading, message, token = '' }) {
+  const form = token
+    ? `<form method="POST" action="/unsubscribe"><input type="hidden" name="token" value="${escapeHtml(token)}"><button type="submit">Unsubscribe</button></form>`
+    : '';
+  const body = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(title)}</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, -apple-system, sans-serif; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; background: Canvas; color: CanvasText; }
+  main { max-width: 440px; width: 100%; padding: 28px; border: 1px solid color-mix(in srgb, CanvasText 15%, transparent); border-radius: 12px; }
+  h1 { margin: 0 0 12px; font-size: 20px; }
+  p { margin: 0 0 18px; line-height: 1.5; }
+  button { font: inherit; font-weight: 600; padding: 10px 18px; border-radius: 8px; border: 0; background: #1d4ed8; color: #fff; cursor: pointer; }
+  code { font-family: ui-monospace, monospace; word-break: break-all; }
+</style>
+</head>
+<body>
+<main>
+  <h1>${escapeHtml(heading)}</h1>
+  <p>${message}</p>
+  ${form}
+</main>
+</body>
+</html>`;
+  res.statusCode = code;
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Content-Length', Buffer.byteLength(body));
+  res.end(body);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -1008,11 +1069,13 @@ async function route(req, res) {
   // public DNS entry pointing at 127.0.0.1 could drive this server from a
   // browser and use the stored SMTP credentials.
   const host = String(req.headers.host || '').toLowerCase();
-  if (LOOPBACK && PORT !== 0 && host && !ALLOWED_HOSTS.has(host)) {
+  const rawPath = String(req.url || '/').split(/[?#]/)[0];
+  const allowedHost = ALLOWED_HOSTS.has(host) || (rawPath === '/unsubscribe' && PUBLIC_URL_HOST && host === PUBLIC_URL_HOST);
+  if (LOOPBACK && PORT !== 0 && host && !allowedHost) {
     return fail(res, 403, 'Unexpected Host header');
   }
 
-  const crossSite = crossSiteReason(req);
+  const crossSite = crossSiteReason(req, rawPath);
   if (crossSite) return fail(res, 403, crossSite);
 
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -1028,6 +1091,43 @@ async function route(req, res) {
   // check keeps working when MAILROOM_PASSWORD is set. Carries no settings.
   if (req.method === 'GET' && pathname === '/api/health') {
     return json(res, 200, { ok: true, version: APP_VERSION });
+  }
+
+  // Signed public unsubscribe endpoint (RFC 8058 one-click POST & scanner-safe GET form).
+  if (pathname === '/unsubscribe' && (req.method === 'GET' || req.method === 'POST')) {
+    let token = url.searchParams.get('token') || '';
+    if (req.method === 'POST') {
+      const rawBody = await readSmallBody(req);
+      if (!token && rawBody) {
+        if (rawBody.trimStart().startsWith('{')) {
+          try { token = String(JSON.parse(rawBody)?.token || ''); } catch { /* treated as missing/invalid token */ }
+        } else {
+          token = new URLSearchParams(rawBody).get('token') || '';
+        }
+      }
+    }
+    const verified = verifyUnsubscribeToken(token, loadOrCreateUnsubscribeSecret());
+    if (!verified) {
+      return renderUnsubscribePage(res, 400, {
+        title: 'Invalid link — Mailroom',
+        heading: 'Invalid unsubscribe link',
+        message: 'This unsubscribe link is invalid or has been modified.',
+      });
+    }
+    if (req.method === 'GET') {
+      return renderUnsubscribePage(res, 200, {
+        title: 'Unsubscribe — Mailroom',
+        heading: 'Unsubscribe from future emails?',
+        message: `Confirm removal for <code>${escapeHtml(verified.email)}</code>.`,
+        token,
+      });
+    }
+    addSuppressed(SUPPRESSION_PATH, [verified.email], 'unsubscribe');
+    return renderUnsubscribePage(res, 200, {
+      title: 'Unsubscribed — Mailroom',
+      heading: 'You have been unsubscribed',
+      message: `<code>${escapeHtml(verified.email)}</code> will no longer receive campaigns from this Mailroom.`,
+    });
   }
 
   // ── Password gate ──────────────────────────────────────────────────
@@ -1474,6 +1574,7 @@ export function startServer({ port = PORT, host = HOST } = {}) {
       ],
     });
     assertBindingIsSafe(host);
+    loadOrCreateUnsubscribeSecret();
     server = createServer();
   } catch (err) {
     return Promise.reject(err);

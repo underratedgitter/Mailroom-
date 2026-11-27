@@ -724,13 +724,20 @@ function setComposeTab(tab, { focus = false } = {}) {
   if (next === 'studio') loadStudioTemplate();
 }
 
+function selectedTemplate() {
+  return state.templates.find((x) => x.path === ui.template.value);
+}
+
 function renderTemplateControls() {
-  const hasSelection = Boolean(ui.template.value);
+  const t = selectedTemplate();
+  const hasSelection = Boolean(t);
+  const editable = Boolean(t && !t.bundled);
   ui.duplicateTemplateBtn.disabled = !hasSelection;
-  ui.deleteTemplateBtn.disabled = !hasSelection;
+  ui.deleteTemplateBtn.disabled = !editable;
   ui.studioHtml.disabled = !hasSelection;
-  ui.studioSaveBtn.disabled = !hasSelection;
-  ui.assetBtn.disabled = !hasSelection;
+  ui.studioHtml.readOnly = Boolean(t?.bundled);
+  ui.studioSaveBtn.disabled = !editable;
+  ui.assetBtn.disabled = !editable;
 }
 
 function setStudioStatus(text, kind = '') {
@@ -740,6 +747,7 @@ function setStudioStatus(text, kind = '') {
 }
 
 function renderAssets() {
+  const readOnly = Boolean(selectedTemplate()?.bundled);
   setHidden(ui.assetEmpty, state.studioAssets.length > 0);
   reconcile(ui.assetList, state.studioAssets, (a) => a.filename,
     () => h('li', { class: 'asset-item' },
@@ -753,6 +761,7 @@ function renderAssets() {
       const kb = asset.size < 1024 ? asset.size + ' B' : Math.max(1, Math.round(asset.size / 1024)) + ' KB';
       setText(li.firstElementChild.firstElementChild, asset.filename);
       setText(li.firstElementChild.lastElementChild, 'cid:' + asset.cid + ' · ' + kb);
+      for (const btn of li.lastElementChild.children) btn.disabled = readOnly;
     });
 }
 
@@ -780,7 +789,7 @@ async function loadStudioTemplate({ force = false } = {}) {
     state.studioAssets = data.assets || [];
     ui.studioHtml.value = data.html || '';
     setText(ui.studioFile, data.path);
-    setStudioStatus('');
+    setStudioStatus(data.bundled ? 'Bundled template (read-only) — click Duplicate to edit a copy.' : '');
     renderAssets();
     renderTemplateControls();
   } catch (err) {

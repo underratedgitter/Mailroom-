@@ -339,6 +339,7 @@ const json = (res, code, body) => {
 
 const fail = (res, code, message) => json(res, code, { error: message });
 const badRequest = (message) => Object.assign(new Error(message), { status: 400 });
+const forbidden = (message) => Object.assign(new Error(message), { status: 403 });
 const conflict = (message) => Object.assign(new Error(message), { status: 409 });
 
 async function readJson(req, limit = 2 * 1024 * 1024) {
@@ -377,10 +378,22 @@ function isInside(candidate, roots) {
   return roots.some((root) => candidate === root || candidate.startsWith(root + sep));
 }
 
+const ENCODED_TRAVERSAL_RE = /%(?:2e|2f|5c|00)/i;
+const DOT_SEGMENT_RE = /(^|[\\/])\.\.([\\/]|$)/;
+
+function assertSafeRelativeInput(input, label) {
+  if (typeof input !== 'string') throw badRequest(`Invalid ${label}`);
+  const value = input.trim();
+  if (!value) throw badRequest(`Missing ${label}`);
+  if (value.includes('\0') || value.includes('\\') || ENCODED_TRAVERSAL_RE.test(value) || DOT_SEGMENT_RE.test(value)) {
+    throw badRequest(`Not allowed: ${value}`);
+  }
+  return value;
+}
+
 /** Only files inside data/ or templates/ may be referenced by the page. */
 function safePath(input, { roots = [DATA_DIR, TEMPLATE_DIR], ext = null } = {}) {
-  const value = String(input || '').trim();
-  if (!value) throw badRequest('Missing file path');
+  const value = assertSafeRelativeInput(input, 'file path');
   const absolute = resolve(ROOT, value);
   if (!isInside(absolute, roots)) throw badRequest(`Not allowed: ${value}`);
   if (ext && !ext.includes(extname(absolute).toLowerCase())) {
@@ -406,8 +419,32 @@ const rel = (absolute) => (absolute.startsWith(ROOT + sep)
   ? absolute.slice(ROOT.length + 1).split(sep).join('/')
   : absolute);
 
+const BUNDLED_TEMPLATES = new Set([
+  'bcci-connect.html',
+  'bcci-connect-v2.html',
+  'bcci-membership.html',
+]);
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']);
+const EXT_TO_FORMAT = { '.png': 'png', '.jpg': 'jpeg', '.jpeg': 'jpeg', '.gif': 'gif', '.webp': 'webp' };
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+const isBundledTemplate = (templatePath) => BUNDLED_TEMPLATES.has(basename(templatePath));
+
+function assertEditableTemplate(templatePath) {
+  if (isBundledTemplate(templatePath)) {
+    throw forbidden('Bundled templates are read-only — duplicate it to edit a copy');
+  }
+}
+
+/** Top-level template HTML files inside templates/ only (excludes -assets/ and subfolders). */
+function safeTemplatePath(input) {
+  const real = safePath(input, { roots: [TEMPLATE_DIR], ext: ['.html', '.htm'] });
+  const file = basename(real);
+  if (file.startsWith('.') || dirname(real) !== realRoot(TEMPLATE_DIR)) {
+    throw badRequest(`Not allowed: ${input}`);
+  }
+  return real;
+}
 
 function resolveSafeAssetsDir(templatePath, { create = false } = {}) {
   const guess = templatePath.replace(/\.html?$/i, '') + '-assets';
@@ -452,9 +489,11 @@ function writeAtomicFile(target, data) {
 }
 
 function normalizeTemplateName(rawName) {
-  let value = String(rawName || '').trim();
+  if (typeof rawName !== 'string') throw badRequest('Template name is required');
+  let value = rawName.trim();
   if (!value) throw badRequest('Template name is required');
-  if (value.includes('/') || value.includes('\\') || value.includes('\0') || value.startsWith('.')) {
+  if (value.includes('/') || value.includes('\\') || value.includes('\0') || value.includes(':')
+    || value.includes('..') || ENCODED_TRAVERSAL_RE.test(value) || value.startsWith('.')) {
     throw badRequest(`Invalid template name: ${value}`);
   }
   value = value.replace(/\.html?$/i, '').trim();
@@ -470,9 +509,11 @@ function normalizeTemplateName(rawName) {
 }
 
 function safeAssetFilename(rawName) {
-  const value = String(rawName || '').trim();
+  if (typeof rawName !== 'string') throw badRequest('Asset filename is required');
+  const value = rawName.trim();
   if (!value) throw badRequest('Asset filename is required');
-  if (value.includes('/') || value.includes('\\') || value.includes('\0') || value.startsWith('.')) {
+  if (value.includes('/') || value.includes('\\') || value.includes('\0') || value.includes(':')
+    || value.includes('..') || ENCODED_TRAVERSAL_RE.test(value) || value.startsWith('.')) {
     throw badRequest(`Invalid asset filename: ${value}`);
   }
   const ext = extname(value).toLowerCase();
@@ -489,7 +530,7 @@ function safeAssetFilename(rawName) {
   if (!stem || stem === '.' || stem === '..' || stem.startsWith('.')) {
     throw badRequest(`Invalid asset filename: ${value}`);
   }
-  return { filename: `${stem}${ext}`, cid: stem };
+  return { filename: `${stem}${ext}`, cid: stem, ext };
 }
 
 function listAssetsFor(assetsDir) {
@@ -508,12 +549,41 @@ function listAssetsFor(assetsDir) {
     });
 }
 
-function decodeImageBase64(raw) {
-  let payload = String(raw || '').trim();
+function detectImageFormat(buf) {
+  if (buf.length >= 8
+    && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47
+    && buf[4] === 0x0d && buf[5] === 0x0a && buf[6] === 0x1a && buf[7] === 0x0a) {
+    return 'png';
+  }
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+    return 'jpeg';
+  }
+  if (buf.length >= 6) {
+    const head6 = buf.subarray(0, 6).toString('ascii');
+    if (head6 === 'GIF87a' || head6 === 'GIF89a') return 'gif';
+  }
+  if (buf.length >= 12
+    && buf.subarray(0, 4).toString('ascii') === 'RIFF'
+    && buf.subarray(8, 12).toString('ascii') === 'WEBP') {
+    return 'webp';
+  }
+  return null;
+}
+
+function decodeImageBase64(raw, expectedExt) {
+  if (typeof raw !== 'string') throw badRequest('Image data is required');
+  let payload = raw.trim();
   if (!payload) throw badRequest('Image data is required');
+  const expectedFormat = EXT_TO_FORMAT[expectedExt];
+  if (!expectedFormat) throw badRequest('Invalid image format');
+
   if (payload.startsWith('data:')) {
     const match = payload.match(/^data:image\/(png|jpeg|jpg|gif|webp);base64,(.+)$/is);
     if (!match) throw badRequest('Invalid image data URL: expected PNG, JPG, GIF, or WEBP');
+    const urlFormat = match[1].toLowerCase() === 'jpg' ? 'jpeg' : match[1].toLowerCase();
+    if (urlFormat !== expectedFormat) {
+      throw badRequest('Invalid image data URL: MIME type does not match file extension');
+    }
     payload = match[2];
   }
   const compact = payload.replace(/\s+/g, '');
@@ -523,11 +593,15 @@ function decodeImageBase64(raw) {
   const buf = Buffer.from(compact, 'base64');
   if (!buf.length) throw badRequest('Image payload is empty');
   if (buf.length > MAX_IMAGE_BYTES) throw Object.assign(new Error('Image exceeds 5 MB limit'), { status: 413 });
+  if (detectImageFormat(buf) !== expectedFormat) {
+    throw badRequest('Invalid image content: file signature does not match format');
+  }
   return buf;
 }
 
 function templateTargetForNew(rawName) {
   const filename = normalizeTemplateName(rawName);
+  assertEditableTemplate(filename);
   mkdirSync(TEMPLATE_DIR, { recursive: true });
   if (lstatSync(TEMPLATE_DIR).isSymbolicLink()) {
     throw badRequest('Not allowed: templates directory is a symlink');
@@ -581,6 +655,7 @@ function listTemplates() {
       return {
         path: rel(path),
         name,
+        bundled: isBundledTemplate(path),
         assetsDir: assetsDir ? rel(assetsDir) : null,
         assets: listAssetsFor(assetsDir).length,
       };
@@ -1353,12 +1428,12 @@ async function route(req, res) {
   }
 
   if (req.method === 'GET' && pathname === '/api/templates/read') {
-    const templatePath = safePath(url.searchParams.get('path'), { roots: [TEMPLATE_DIR], ext: ['.html', '.htm'] });
-    if (basename(templatePath).startsWith('.')) return fail(res, 400, 'Not allowed');
+    const templatePath = safeTemplatePath(url.searchParams.get('path'));
     const assetsDir = assetsDirFor(templatePath);
     return json(res, 200, {
       path: rel(templatePath),
       name: basename(templatePath),
+      bundled: isBundledTemplate(templatePath),
       html: readFileSync(templatePath, 'utf8'),
       assetsDir: assetsDir ? rel(assetsDir) : null,
       assets: listAssetsFor(assetsDir),
@@ -1370,11 +1445,14 @@ async function route(req, res) {
     const html = typeof body.html === 'string' ? body.html : '';
     if (!html.trim()) return fail(res, 400, 'Template HTML cannot be empty');
 
-    if (body.path !== undefined && String(body.path || '').trim()) {
-      const target = safePath(body.path, { roots: [TEMPLATE_DIR], ext: ['.html', '.htm'] });
-      if (basename(target).startsWith('.')) return fail(res, 400, 'Not allowed');
-      writeAtomicFile(target, html);
-      return json(res, 200, { path: rel(target), name: basename(target) });
+    if (body.path !== undefined) {
+      if (typeof body.path !== 'string') return fail(res, 400, 'Invalid template path');
+      if (body.path.trim()) {
+        const target = safeTemplatePath(body.path);
+        assertEditableTemplate(target);
+        writeAtomicFile(target, html);
+        return json(res, 200, { path: rel(target), name: basename(target) });
+      }
     }
 
     const target = templateTargetForNew(body.name);
@@ -1384,8 +1462,7 @@ async function route(req, res) {
 
   if (req.method === 'POST' && pathname === '/api/templates/duplicate') {
     const body = await readJson(req);
-    const srcPath = safePath(body.path, { roots: [TEMPLATE_DIR], ext: ['.html', '.htm'] });
-    if (basename(srcPath).startsWith('.')) return fail(res, 400, 'Not allowed');
+    const srcPath = safeTemplatePath(body.path);
     const target = templateTargetForNew(body.name);
     const srcAssets = assetsDirFor(srcPath);
     const destAssetsGuess = target.replace(/\.html?$/i, '') + '-assets';
@@ -1426,8 +1503,8 @@ async function route(req, res) {
 
   if (req.method === 'POST' && pathname === '/api/templates/delete') {
     const body = await readJson(req);
-    const target = safePath(body.path, { roots: [TEMPLATE_DIR], ext: ['.html', '.htm'] });
-    if (basename(target).startsWith('.')) return fail(res, 400, 'Not allowed');
+    const target = safeTemplatePath(body.path);
+    assertEditableTemplate(target);
     const assetsDir = assetsDirFor(target);
     rmSync(target, { force: true });
     if (assetsDir) rmSync(assetsDir, { recursive: true, force: true });
@@ -1437,10 +1514,10 @@ async function route(req, res) {
   if (req.method === 'POST' && pathname === '/api/templates/assets') {
     // 5 MB binary decoded -> ~6.7 MB base64 + JSON envelope.
     const body = await readJson(req, 8 * 1024 * 1024);
-    const templatePath = safePath(body.template, { roots: [TEMPLATE_DIR], ext: ['.html', '.htm'] });
-    if (basename(templatePath).startsWith('.')) return fail(res, 400, 'Not allowed');
-    const { filename, cid } = safeAssetFilename(body.filename);
-    const bytes = decodeImageBase64(body.dataBase64);
+    const templatePath = safeTemplatePath(body.template);
+    assertEditableTemplate(templatePath);
+    const { filename, cid, ext } = safeAssetFilename(body.filename);
+    const bytes = decodeImageBase64(body.dataBase64, ext);
     const assetsDir = resolveSafeAssetsDir(templatePath, { create: true });
     const target = join(assetsDir, filename);
     try {
@@ -1454,8 +1531,8 @@ async function route(req, res) {
 
   if (req.method === 'POST' && pathname === '/api/templates/assets/delete') {
     const body = await readJson(req);
-    const templatePath = safePath(body.template, { roots: [TEMPLATE_DIR], ext: ['.html', '.htm'] });
-    if (basename(templatePath).startsWith('.')) return fail(res, 400, 'Not allowed');
+    const templatePath = safeTemplatePath(body.template);
+    assertEditableTemplate(templatePath);
     const { filename } = safeAssetFilename(body.filename);
     const assetsDir = resolveSafeAssetsDir(templatePath, { create: false });
     if (!assetsDir) return fail(res, 404, 'Asset folder not found');

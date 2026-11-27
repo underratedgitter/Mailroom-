@@ -5,8 +5,8 @@
 // drift apart. Anything fatal is thrown as an Error; the callers decide
 // whether that means a non-zero exit or an HTTP 400.
 
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync, readdirSync, statSync, realpathSync, renameSync, rmSync, linkSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, chmodSync, existsSync, readdirSync, statSync, realpathSync, renameSync, rmSync, linkSync } from 'node:fs';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import nodemailer from 'nodemailer';
@@ -809,6 +809,41 @@ export const defaultLogPath = (env = process.env) => resolve(env.SEND_LOG || joi
 /** @param {Record<string, string | undefined>} [env] */
 export const defaultSuppressionPath = (env = process.env) => resolve(env.SUPPRESSION_FILE || join(PACKAGE_ROOT, 'data', 'suppressed.csv'));
 
+/** @param {Record<string, string | undefined>} [env] */
+export const defaultUnsubscribeSecretPath = (env = process.env) =>
+  resolve(env.UNSUBSCRIBE_SECRET_FILE || join(dirname(defaultLogPath(env)), '.unsubscribe-secret'));
+
+/**
+ * Loads or creates the persisted 0600 HMAC secret used to sign /unsubscribe links.
+ * @param {Record<string, string | undefined>} [env]
+ * @returns {string}
+ */
+export function loadOrCreateUnsubscribeSecret(env = process.env) {
+  const explicit = String(env.MAILROOM_UNSUBSCRIBE_SECRET || '').trim();
+  if (explicit) return explicit;
+  const secretPath = defaultUnsubscribeSecretPath(env);
+  if (existsSync(secretPath)) {
+    const saved = readFileSync(secretPath, 'utf8').trim();
+    if (saved) {
+      env.MAILROOM_UNSUBSCRIBE_SECRET = saved;
+      return saved;
+    }
+  }
+  const generated = randomBytes(32).toString('hex');
+  mkdirSync(dirname(secretPath), { recursive: true });
+  const staging = `${secretPath}.${process.pid}.tmp`;
+  try {
+    writeFileSync(staging, `${generated}\n`, { mode: 0o600 });
+    renameSync(staging, secretPath);
+    chmodSync(secretPath, 0o600);
+  } catch (err) {
+    rmSync(staging, { force: true });
+    throw err;
+  }
+  env.MAILROOM_UNSUBSCRIBE_SECRET = generated;
+  return generated;
+}
+
 /** @type {Map<string, { stamp: string, set: Set<string>, entries: SuppressionEntry[] }>} */
 const suppressionCache = new Map();
 
@@ -1387,3 +1422,4 @@ export async function runCampaign(options) {
 }
 
 export { resolveSmtpConfig };
+export { signUnsubscribeToken, verifyUnsubscribeToken } from './mailer.mjs';

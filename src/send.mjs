@@ -51,6 +51,7 @@ import {
   describeInterruption,
   defaultSuppressionPath,
   defaultLogPath,
+  loadOrCreateUnsubscribeSecret,
   addSuppressed,
   isSuppressed,
   rateLimitsFromEnv,
@@ -165,6 +166,8 @@ try {
   die(`Cannot read template ${htmlArg}: ${errMsg(err)}`);
 }
 const assetsDir = values['assets-dir'];
+
+if (process.env.MAILROOM_PUBLIC_URL) loadOrCreateUnsubscribeSecret();
 
 const cfg = resolveSmtpConfig();
 console.log('\nSMTP');

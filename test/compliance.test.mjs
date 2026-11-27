@@ -15,8 +15,11 @@ import {
   isSuppressed,
   createRateLimiter,
   rateLimitsFromEnv,
+  signUnsubscribeToken,
+  verifyUnsubscribeToken,
+  loadOrCreateUnsubscribeSecret,
 } from '../src/lib/core.mjs';
-import { resolveSmtpConfig, configIssue } from '../src/lib/mailer.mjs';
+import { resolveSmtpConfig, configIssue, unsubscribeLink } from '../src/lib/mailer.mjs';
 import { startSmtpSink } from './helpers/smtp-sink.mjs';
 
 const workDir = () => mkdtempSync(join(tmpdir(), 'mailroom-compliance-'));
@@ -100,6 +103,60 @@ test('an https unsubscribe URL adds RFC 8058 one-click, with the recipient fille
   assert.equal(header(message, 'List-Unsubscribe-Post'), 'List-Unsubscribe=One-Click');
 });
 
+test('MAILROOM_PUBLIC_URL produces signed per-recipient RFC 8058 unsubscribe links', async () => {
+  const secret = 'test-secret-0123456789';
+  const cfg = resolveSmtpConfig({
+    SMTP_HOST: 'h', SMTP_USER: 'u', SMTP_PASS: 'p', EMAIL_FROM: 'Desk <desk@news.example.org>',
+    MAILROOM_PUBLIC_URL: 'https://mail.example.org///', MAILROOM_UNSUBSCRIBE_SECRET: secret,
+  });
+  assert.equal(cfg.publicUrl, 'https://mail.example.org');
+  assert.equal(configIssue(cfg), null);
+
+  const link = unsubscribeLink(cfg, 'Priya@Example.com');
+  const parsed = new URL(link);
+  assert.equal(parsed.origin, 'https://mail.example.org');
+  assert.equal(parsed.pathname, '/unsubscribe');
+  const token = parsed.searchParams.get('token');
+  assert.deepEqual(verifyUnsubscribeToken(token, secret), { email: 'priya@example.com' });
+  assert.equal(verifyUnsubscribeToken(token + 'x', secret), null);
+  assert.equal(verifyUnsubscribeToken(token, 'wrong-secret'), null);
+
+  const forgedPayload = Buffer.from(JSON.stringify({ e: 'not-an-email' })).toString('base64url');
+  assert.equal(verifyUnsubscribeToken(`${forgedPayload}.tampered`, secret), null);
+
+  const { message } = await sendOne(
+    { publicUrl: cfg.publicUrl, unsubscribeSecret: secret },
+    '<p>Read or <a href="{{unsubscribe_url}}">unsubscribe</a></p>',
+  );
+  const hdr = header(message, 'List-Unsubscribe');
+  assert.ok(hdr.startsWith('<https://mail.example.org/unsubscribe?token='));
+  assert.ok(hdr.includes('<mailto:desk@news.example.org?subject=unsubscribe>'));
+  assert.equal(header(message, 'List-Unsubscribe-Post'), 'List-Unsubscribe=One-Click');
+
+  // An explicit UNSUBSCRIBE_URL continues to win when both are configured.
+  assert.equal(
+    unsubscribeLink({ ...cfg, unsubscribeUrl: 'https://custom.example/u?e={email}' }, 'a@b.com'),
+    'https://custom.example/u?e=a%40b.com',
+  );
+});
+
+test('loadOrCreateUnsubscribeSecret persists a 0600 hex secret across reads and respects explicit env', () => {
+  const dir = workDir();
+  try {
+    const env = { SEND_LOG: join(dir, 'logs', 'sent.jsonl') };
+    const first = loadOrCreateUnsubscribeSecret(env);
+    assert.match(first, /^[0-9a-f]{64}$/);
+    const second = loadOrCreateUnsubscribeSecret({ SEND_LOG: join(dir, 'logs', 'sent.jsonl') });
+    assert.equal(second, first);
+
+    const token = signUnsubscribeToken('User@Example.com', first);
+    assert.deepEqual(verifyUnsubscribeToken(token, second), { email: 'user@example.com' });
+    assert.equal(loadOrCreateUnsubscribeSecret({ ...env, MAILROOM_UNSUBSCRIBE_SECRET: 'override' }), 'override');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('environment settings reach the config, and a bad unsubscribe URL is reported', () => {
   const cfg = resolveSmtpConfig({
     SMTP_HOST: 'h', SMTP_USER: 'u', SMTP_PASS: 'p', EMAIL_FROM: 'Desk <desk@news.example.org>',
@@ -108,6 +165,11 @@ test('environment settings reach the config, and a bad unsubscribe URL is report
   assert.equal(cfg.replyTo, 'r@news.example.org');
   assert.equal(cfg.unsubscribeMailto, 'stop@news.example.org');
   assert.match(configIssue(cfg), /UNSUBSCRIBE_URL must be an https:\/\/ URL/);
+
+  assert.match(
+    configIssue({ from: 'Desk <desk@news.example.org>', unsubscribeUrl: '', publicUrl: 'http://mail.example.org' }),
+    /MAILROOM_PUBLIC_URL must be an https:\/\/ URL/,
+  );
 
   assert.equal(configIssue({ from: 'Desk <desk@news.example.org>', unsubscribeUrl: '' }), null);
   assert.match(configIssue({ from: 'desk', unsubscribeUrl: '' }), /EMAIL_FROM must be a full address/);

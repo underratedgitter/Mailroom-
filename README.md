@@ -215,11 +215,12 @@ with no unsubscribe link.
 
 **Unsubscribe link** — put `{{unsubscribe_url}}` in a template's footer
 (`href="{{unsubscribe_url}}"`). It is the same target as the List-Unsubscribe
-header: `UNSUBSCRIBE_URL` with `{email}` replaced by the URL-encoded recipient
-when that is set, otherwise `mailto:` the unsubscribe mailbox
-(`UNSUBSCRIBE_MAILTO`, else Reply-To, else From) with the subject `unsubscribe`.
-All bundled templates use it. Mailroom does not receive unsubscribes: add the
-people who write back to the suppression list.
+header: `UNSUBSCRIBE_URL` with `{email}` replaced when that is set, otherwise
+a signed `MAILROOM_PUBLIC_URL` `/unsubscribe?token=…` link when set (confirmations
+add the address to `suppressed.csv` without requiring a login), otherwise
+`mailto:` the unsubscribe mailbox (`UNSUBSCRIBE_MAILTO`, else Reply-To, else From)
+with the subject `unsubscribe`. All bundled templates use it; people who opt
+out via `mailto:` or an external endpoint still need adding to the suppression list.
 
 **Send** — a confirmation gate, then per-recipient progress over a live stream.
 Re-running a campaign skips everyone it already mailed. Close the tab and the
@@ -349,8 +350,12 @@ call.) You can also remove suppressed addresses in the **Suppression list** view
 | --- | --- | --- |
 | `EMAIL_REPLY_TO` | unset | Reply-To header; also the default unsubscribe mailbox |
 | `UNSUBSCRIBE_MAILTO` | Reply-To, else From | Mailbox that receives "unsubscribe" mail |
-| `UNSUBSCRIBE_URL` | unset | `https://` one-click endpoint you host; `{email}` is replaced |
+| `UNSUBSCRIBE_URL` | unset | External `https://` one-click endpoint you host; `{email}` is replaced (overrides `MAILROOM_PUBLIC_URL`) |
+| `MAILROOM_PUBLIC_URL` | unset | Public `https://` origin of this Mailroom server for signed one-click `/unsubscribe` links (works without logging in) |
+| `MAILROOM_UNSUBSCRIBE_SECRET` | generated in `logs/.unsubscribe-secret` | Explicit HMAC secret for signing `/unsubscribe` tokens across CLI and server restarts |
+| `UNSUBSCRIBE_SECRET_FILE` | `<log dir>/.unsubscribe-secret` | Override path where the generated HMAC signing secret is stored (`0600`) |
 | `SUPPRESSION_FILE` | `data/suppressed.csv` | Suppression list location (CLI: `--suppression-file`); the default is in the install folder for the CLI and the browser alike |
+| `SCHEDULE_FILE` | `logs/schedule.json` | Scheduled campaign queue file location |
 | `MAX_PER_HOUR` | `500` | Rolling messages-per-hour ceiling for all domains; `0` turns it off |
 | `MAX_PER_DOMAIN_PER_HOUR` | `0` (off) | Same, per recipient domain (e.g. `gmail.com`); a full domain pauses the run |
 

@@ -178,16 +178,25 @@
               <select id="reportCsv"></select>
             </div>
           </div>
+          <div class="search">
+            <label class="sr-only" for="campaignSearch">Filter campaigns</label>
+            <input id="campaignSearch" type="search" placeholder="Filter campaigns" spellcheck="false" autocomplete="off">
+          </div>
           <div class="table-wrap" id="campaignsWrap">
             <table class="table">
               <thead><tr><th scope="col">Campaign</th><th scope="col" class="num">Sent</th><th scope="col" class="num">Failed</th><th scope="col" class="num">Skipped</th><th scope="col">Export CSV</th></tr></thead>
               <tbody id="campaignsBody"></tbody>
             </table>
           </div>
+          <div class="pager-bar" id="campaignsPager" hidden>
+            <button class="btn btn--sm" id="campaignPrevBtn" type="button">Previous</button>
+            <span class="muted" id="campaignPageInfo"></span>
+            <button class="btn btn--sm" id="campaignNextBtn" type="button">Next</button>
+          </div>
           <div class="empty" id="campaignsEmpty">
             <svg class="icon empty__icon" aria-hidden="true" focusable="false"><use href="#i-send"></use></svg>
-            <p class="empty__title">No campaigns yet</p>
-            <p class="empty__text">Sent campaigns show up here with their results.</p>
+            <p class="empty__title" id="campaignsEmptyTitle">No campaigns yet</p>
+            <p class="empty__text" id="campaignsEmptyText">Sent campaigns show up here with their results.</p>
           </div>
         </section>
       </div>
@@ -297,8 +306,14 @@
               <button class="btn btn--icon" id="previewBtn" type="button" aria-label="Refresh preview"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-refresh"></use></svg></button>
             </div>
           </div>
-          <div class="preview__frame">
+          <div class="preview__toolbar" role="toolbar" aria-label="Preview options">
+            <button class="btn btn--sm" id="previewMobileBtn" type="button" aria-pressed="false">Mobile</button>
+            <button class="btn btn--sm" id="previewDarkBtn" type="button" aria-pressed="false">Dark</button>
+            <button class="btn btn--sm" id="previewTextBtn" type="button" aria-pressed="false">Plain text</button>
+          </div>
+          <div class="preview__frame" id="previewFrame">
             <iframe id="preview" sandbox="" title="Message preview"></iframe>
+            <pre class="preview__text" id="previewText" hidden></pre>
             <div class="preview__empty" id="proofEmpty">
               <svg class="icon empty__icon" aria-hidden="true" focusable="false"><use href="#i-compose"></use></svg>
               <p class="empty__title" id="proofEmptyTitle">Nothing to preview yet</p>
@@ -307,6 +322,7 @@
           </div>
           <div class="preview__foot">
             <span id="proofImages">0 inline images</span>
+            <span id="proofWeight"></span>
             <span id="proofTotal"></span>
           </div>
         </section>
@@ -415,6 +431,12 @@
             <a class="btn btn--sm" href="#/compose" id="rosterPreviewLink">Open preview</a>
           </div>
           <div class="roster__stats" id="rosterStats" aria-live="polite"></div>
+          <div class="roster__tools">
+            <div class="search">
+              <label class="sr-only" for="rosterSearch">Filter recipients</label>
+              <input id="rosterSearch" type="search" placeholder="Filter recipients by email, name, company or field" spellcheck="false" autocomplete="off">
+            </div>
+          </div>
           <div class="roster__body">
             <ul class="roster__list" id="rosterList"></ul>
             <div class="roster__state" id="rosterEmpty">
@@ -422,6 +444,11 @@
               <p class="empty__title" id="rosterEmptyTitle">No recipients yet</p>
               <p class="empty__text" id="rosterEmptyText">Choose a saved list, paste addresses or upload a CSV.</p>
             </div>
+          </div>
+          <div class="pager-bar" id="rosterPager" hidden>
+            <button class="btn btn--sm" id="rosterPrevBtn" type="button">Previous</button>
+            <span class="pager__pos" id="rosterPageInfo" aria-live="polite"></span>
+            <button class="btn btn--sm" id="rosterNextBtn" type="button">Next</button>
           </div>
         </section>
       </div>
@@ -470,7 +497,7 @@
 
           <section class="card form" aria-labelledby="hTest">
             <h2 class="card__title" id="hTest">Send a test</h2>
-            <p class="lead lead--sm">Sends the first recipient's version of the message to one address you choose.</p>
+            <p class="lead lead--sm">Sends the previewed recipient's version of the message to one address you choose.</p>
             <div class="inline-form">
               <div class="field">
                 <label for="testTo">Test address</label>
@@ -586,15 +613,29 @@
             <h2 class="card__title" id="hSuppressed">Suppressed addresses</h2>
             <span class="muted" id="suppressCount"></span>
           </div>
-          <div class="search">
+          <div class="search search--row">
             <label class="sr-only" for="suppressSearch">Filter suppressed addresses</label>
             <input id="suppressSearch" type="search" placeholder="Filter addresses" spellcheck="false" autocomplete="off">
+            <label class="sr-only" for="suppressReasonFilter">Filter by reason</label>
+            <select id="suppressReasonFilter">
+              <option value="">All reasons</option>
+              <option value="unsubscribe">Unsubscribe</option>
+              <option value="hard-bounce">Hard bounce</option>
+              <option value="bounce">Bounce</option>
+              <option value="complaint">Complaint</option>
+              <option value="manual">Manual</option>
+            </select>
           </div>
           <ul class="plain-list" id="suppressList"></ul>
           <div class="empty" id="suppressEmpty">
             <svg class="icon empty__icon" aria-hidden="true" focusable="false"><use href="#i-ban"></use></svg>
             <p class="empty__title" id="suppressEmptyTitle">No suppressed addresses</p>
-            <p class="empty__text" id="suppressEmptyText">Addresses you add, and hard bounces found while sending, appear here. Unsubscribe requests are not added automatically: add them here when they arrive.</p>
+            <p class="empty__text" id="suppressEmptyText">Addresses you add, and hard bounces found while sending, appear here. Unsubscribe requests are not added automatically unless MAILROOM_PUBLIC_URL or /api/webhooks/bounces is configured: add them here when they arrive.</p>
+          </div>
+          <div class="pager-bar" id="suppressPager" hidden>
+            <button class="btn btn--sm" id="suppressPrevBtn" type="button">Previous</button>
+            <span class="pager__pos" id="suppressPageInfo" aria-live="polite"></span>
+            <button class="btn btn--sm" id="suppressNextBtn" type="button">Next</button>
           </div>
           <p class="hint card__note" id="suppressNote"></p>
         </section>
@@ -606,44 +647,25 @@
       <header class="view__head">
         <div>
           <h1 id="hSettings" tabindex="-1">Settings</h1>
-          <p class="lead" id="settingsLead">Mailroom sends through your own SMTP account, so mail comes from your address and lands in your sent folder.</p>
+          <p class="lead" id="settingsLead">Connect the mailbox Mailroom will send from.</p>
         </div>
       </header>
 
       <div class="split">
         <form class="card form" id="settingsForm" novalidate autocomplete="off">
-          <h2 class="card__title">Mailbox (SMTP)</h2>
-
-          <div class="field-row">
-            <div class="field">
-              <label for="setHost">SMTP host</label>
-              <input id="setHost" type="text" spellcheck="false" placeholder="smtp.gmail.com" autocomplete="off">
-            </div>
-            <div class="field field--port">
-              <label for="setPort">Port</label>
-              <input id="setPort" type="number" inputmode="numeric" placeholder="465">
-            </div>
-          </div>
-
-          <div class="field">
-            <label for="setSecure">Connection security</label>
-            <select id="setSecure">
-              <option value="true">Implicit TLS (usually port 465)</option>
-              <option value="false">STARTTLS (usually port 587 or 25)</option>
-            </select>
-            <p class="hint">Must match the port. Gmail and most providers: 465 with implicit TLS, or 587 with STARTTLS.</p>
-          </div>
+          <h2 class="card__title">Connect mailbox</h2>
 
           <div class="field">
             <label for="setUser">Mailbox address</label>
-            <input id="setUser" type="email" spellcheck="false" placeholder="you@yourdomain.com" autocomplete="off">
-            <p class="hint" id="setUserHint">The account Mailroom signs in as. A relay on this machine needs none.</p>
+            <input id="setUser" type="text" inputmode="email" spellcheck="false" placeholder="you@yourdomain.com" autocomplete="off" aria-describedby="setUserHint">
+            <p class="hint" id="setUserHint">Use your mailbox address or SMTP username. Leave blank for a local relay.</p>
           </div>
 
           <div class="field">
-            <label for="setPass">App password</label>
-            <input id="setPass" type="password" spellcheck="false" autocomplete="new-password" placeholder="16 characters">
-            <p class="hint" id="setPassHint">Gmail needs an App Password, not your login password.</p>
+            <label for="setPass">SMTP password</label>
+            <input id="setPass" type="password" spellcheck="false" autocomplete="new-password" aria-describedby="setPassHint">
+            <p class="hint" id="setPassHint"></p>
+            <p class="hint" id="setGmailHelp" hidden>Gmail uses an app password. <a href="https://support.google.com/accounts/answer/185833" target="_blank" rel="noopener noreferrer">Create a Google app password</a>.</p>
           </div>
 
           <div class="field">
@@ -652,28 +674,76 @@
             <p class="hint">What recipients see. Defaults to the mailbox address.</p>
           </div>
 
-          <div class="field">
-            <label for="setReplyTo">Reply-To (optional)</label>
-            <input id="setReplyTo" type="text" spellcheck="false" placeholder="Help Desk <help@yourdomain.com>" autocomplete="off">
-            <p class="hint">Where replies go, and where unsubscribe requests are mailed. Defaults to the From address.</p>
-          </div>
+          <details class="setup-details" id="setServerOptions">
+            <summary>SMTP server and security</summary>
+            <div class="form setup-details__fields">
+              <div class="field-row">
+                <div class="field">
+                  <label for="setHost">SMTP host</label>
+                  <input id="setHost" type="text" spellcheck="false" placeholder="smtp.gmail.com" autocomplete="off">
+                </div>
+                <div class="field field--port">
+                  <label for="setPort">Port</label>
+                  <input id="setPort" type="number" inputmode="numeric" min="1" max="65535" step="1" placeholder="465">
+                </div>
+              </div>
 
-          <div class="field">
-            <label for="setUnsubUrl">Unsubscribe link (optional)</label>
-            <input id="setUnsubUrl" type="text" spellcheck="false" placeholder="https://yourdomain.com/unsubscribe?e={email}" autocomplete="off">
-            <p class="hint">An https:// page you host; {email} becomes the recipient. Without one, the unsubscribe link mails the Reply-To or From address.</p>
-          </div>
+              <div class="field">
+                <label for="setSecure">Connection security</label>
+                <select id="setSecure">
+                  <option value="true">Implicit TLS (usually port 465)</option>
+                  <option value="false">STARTTLS (usually port 587 or 25)</option>
+                </select>
+                <p class="hint">Must match the port. Gmail and most providers: 465 with implicit TLS, or 587 with STARTTLS.</p>
+              </div>
+            </div>
+          </details>
 
-          <div class="field field--short">
-            <label for="setMaxPerHour">Messages per hour (optional)</label>
-            <input id="setMaxPerHour" type="text" inputmode="numeric" spellcheck="false" placeholder="500" autocomplete="off">
-            <p class="hint">Ceiling across all runs; 0 turns it off. Blank keeps the default of 500.</p>
-          </div>
+          <details class="setup-details">
+            <summary>Delivery options</summary>
+            <div class="form setup-details__fields">
+              <div class="field">
+                <label for="setReplyTo">Reply-To (optional)</label>
+                <input id="setReplyTo" type="text" spellcheck="false" placeholder="Help Desk <help@yourdomain.com>" autocomplete="off">
+                <p class="hint">Where replies go, and where unsubscribe requests are mailed. Defaults to the From address.</p>
+              </div>
+
+              <div class="field">
+                <label for="setUnsubUrl">Unsubscribe link (optional)</label>
+                <input id="setUnsubUrl" type="text" spellcheck="false" placeholder="https://yourdomain.com/unsubscribe?e={email}" autocomplete="off">
+                <p class="hint">An https:// page you host; {email} becomes the recipient. Without one, the unsubscribe link mails the Reply-To or From address.</p>
+              </div>
+
+              <div class="field">
+                <label for="setPublicUrl">Public unsubscribe base URL (optional)</label>
+                <input id="setPublicUrl" type="url" spellcheck="false" placeholder="https://mailroom.yourdomain.com" autocomplete="off">
+                <p class="hint">Public host where Mailroom serves signed one-click /unsubscribe links when MAILROOM_UNSUBSCRIBE_SECRET is set.</p>
+              </div>
+
+              <div class="field field--short">
+                <label for="setMaxPerHour">Messages per hour (optional)</label>
+                <input id="setMaxPerHour" type="text" inputmode="numeric" spellcheck="false" placeholder="500" autocomplete="off">
+                <p class="hint">Ceiling across all runs; 0 turns it off. Blank keeps the default of 500.</p>
+              </div>
+
+              <div class="field field--short">
+                <label for="setMaxPerDomainPerHour">Messages per domain per hour (optional)</label>
+                <input id="setMaxPerDomainPerHour" type="text" inputmode="numeric" spellcheck="false" placeholder="0" autocomplete="off">
+                <p class="hint">Per-domain hourly cap; 0 or blank leaves per-domain pacing unlimited.</p>
+              </div>
+
+              <div class="field field--short">
+                <label for="setMaxPerDay">Messages per day (optional)</label>
+                <input id="setMaxPerDay" type="text" inputmode="numeric" spellcheck="false" placeholder="0" autocomplete="off">
+                <p class="hint">Rolling 24-hour ceiling across runs; 0 or blank turns it off.</p>
+              </div>
+            </div>
+          </details>
 
           <p class="status" id="settingsStatus" role="status"></p>
           <div class="actions">
             <button class="btn" id="settingsTestBtn" type="button"><svg class="icon" aria-hidden="true" focusable="false"><use href="#i-plug"></use></svg>Test connection</button>
-            <button class="btn btn--primary" id="settingsSaveBtn" type="submit">Save settings</button>
+            <button class="btn btn--primary" id="settingsSaveBtn" type="submit">Test and save</button>
           </div>
           <p class="hint" id="settingsPath"></p>
         </form>
@@ -687,11 +757,27 @@
             </div>
           </section>
 
+          <section class="card form" aria-labelledby="hDns">
+            <h2 class="card__title" id="hDns">Sender DNS</h2>
+            <p class="lead lead--sm">Checks MX, SPF, DMARC and DKIM DNS records for your From domain before sending.</p>
+            <div class="field field--short">
+              <label for="dnsSelector">DKIM selector (optional)</label>
+              <input id="dnsSelector" type="text" spellcheck="false" placeholder="e.g. default or mail" autocomplete="off">
+            </div>
+            <p class="status" id="dnsStatus" role="status"></p>
+            <div class="actions">
+              <button class="btn" id="dnsCheckBtn" type="button">Check DNS</button>
+            </div>
+            <ul class="dns-list" id="dnsList" hidden></ul>
+          </section>
+
           <section class="card" aria-labelledby="hAbout">
             <h2 class="card__title" id="hAbout">About</h2>
             <dl class="facts facts--stack">
               <div><dt>Version</dt><dd id="aboutVersion">—</dd></div>
               <div><dt>Server</dt><dd id="aboutHealth">—</dd></div>
+              <div><dt>Readiness</dt><dd id="aboutReady">—</dd></div>
+              <div><dt>Bounce webhook</dt><dd id="aboutWebhook">—</dd></div>
               <div><dt>Platform</dt><dd id="aboutPlatform">—</dd></div>
               <div><dt>Send log</dt><dd id="aboutLog">—</dd></div>
               <div><dt>Suppression file</dt><dd id="aboutSuppression">—</dd></div>

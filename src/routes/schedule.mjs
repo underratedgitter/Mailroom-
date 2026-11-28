@@ -179,6 +179,7 @@ let schedulerTimer = null;
 let ticking = false;
 
 export const isTicking = () => ticking;
+export const isSchedulerRunning = () => Boolean(schedulerTimer);
 
 /** @param {ServerState} state */
 async function tick(state) {
@@ -256,7 +257,10 @@ export function startScheduler(state) {
 }
 
 export function stopScheduler() {
-  if (schedulerTimer) clearInterval(schedulerTimer);
+  if (schedulerTimer) {
+    clearInterval(schedulerTimer);
+    schedulerTimer = null;
+  }
 }
 
 /** @param {unknown} raw @returns {{ at: number } | { error: string }} */

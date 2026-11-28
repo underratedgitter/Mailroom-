@@ -1,0 +1,45 @@
+services:
+  mailroom:
+    build: .
+    ports:
+      - "127.0.0.1:${GUI_PORT:-4173}:4173"
+    environment:
+      GUI_HOST: "0.0.0.0"
+      GUI_PORT: "4173"
+      MAILROOM_CONFIG: "/home/node/.mailroom/config.env"
+      SEND_LOG: "/app/logs/sent.jsonl"
+      SCHEDULE_FILE: "/app/logs/schedule.json"
+      SUPPRESSION_FILE: "/app/data/suppressed.csv"
+      # Set these in your shell or a host .env file before `docker compose up -d`:
+      MAILROOM_PASSWORD: "${MAILROOM_PASSWORD:-${GUI_PASSWORD:-}}"
+      MAILROOM_PASSWORD_HASH: "${MAILROOM_PASSWORD_HASH:-}"
+      MAILROOM_ALLOW_INSECURE: "1"
+      MAILROOM_TRUST_PROXY: "${MAILROOM_TRUST_PROXY:-0}"
+      # Unset values are omitted so settings saved in the app survive restarts.
+      MAILROOM_PUBLIC_URL:
+      MAILROOM_UNSUBSCRIBE_SECRET:
+      MAILROOM_UNSUBSCRIBE_PREVIOUS_SECRET:
+      MAILROOM_WEBHOOK_SECRET:
+      MAX_PER_HOUR:
+      MAX_PER_DOMAIN_PER_HOUR:
+      MAX_PER_DAY:
+      DKIM_SELECTOR:
+    volumes:
+      - mailroom_config:/home/node/.mailroom
+      - ./data:/app/data
+      - ./templates:/app/templates
+      - ./logs:/app/logs
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4173/api/ready').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  mailroom_config:

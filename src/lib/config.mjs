@@ -6,6 +6,7 @@
 // process can write:
 //
 //   MAILROOM_CONFIG=/path/to/file   explicit
+//   $MAILROOM_STATE_DIR/config.env  service state directory
 //   ./.env                          a checkout that already has one
 //   ~/.mailroom/config.env          a global install
 //
@@ -26,6 +27,7 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { errMsg, errCode } from './errors.mjs';
 
 const KEYS = ['SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM', 'EMAIL_FROM', 'SMTP_SECURE'];
@@ -34,7 +36,7 @@ const KEYS = ['SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM', '
 /** @typedef {{ label: string, path: string }} WritableDir */
 /** @typedef {{ templatesDir?: string, writableDirs?: WritableDir[] }} ConfigProblemsOptions */
 /** @typedef {Record<string, string | undefined>} ConfigValues */
-/** @typedef {{ host: string, port: number | string, secure?: boolean, user: string, pass: string, from: string, replyTo: string, unsubscribeUrl: string, maxPerHour: string }} SmtpFileInput */
+/** @typedef {{ host: string, port: number | string, secure?: boolean, user: string, pass: string, from: string, replyTo: string, unsubscribeUrl: string, publicUrl?: string, maxPerHour: string, maxPerDomainPerHour?: string, maxPerDay?: string }} SmtpFileInput */
 
 /**
  * @param {string | null} problem
@@ -60,10 +62,9 @@ export function parseEnv(text) {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
 
     let value = body.slice(eq + 1).trim();
-    if (
-      (value.startsWith('"') && value.endsWith('"') && value.length >= 2) ||
-      (value.startsWith("'") && value.endsWith("'") && value.length >= 2)
-    ) {
+    if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
+      value = value.slice(1, -1).replace(/\\(["\\])/g, '$1');
+    } else if (value.startsWith("'") && value.endsWith("'") && value.length >= 2) {
       value = value.slice(1, -1);
     }
     values[key] = value;
@@ -80,12 +81,18 @@ function formatValue(value) {
   return /[\s#'"\\]/.test(text) ? `"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"` : text;
 }
 
+const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+/** @param {ConfigValues} [env] */
+export const workspaceRoot = (env = process.env) => resolve(env.MAILROOM_STATE_DIR || PACKAGE_ROOT);
+
 /**
  * @param {string} [cwd]
  * @returns {string}
  */
 export function resolveConfigPath(cwd = process.cwd()) {
   if (process.env.MAILROOM_CONFIG) return resolve(process.env.MAILROOM_CONFIG);
+  if (process.env.MAILROOM_STATE_DIR) return join(workspaceRoot(), 'config.env');
   const local = join(cwd, '.env');
   if (existsSync(local)) return local;
   return join(homedir(), '.mailroom', 'config.env');
@@ -154,7 +161,20 @@ export function saveConfig(values, path = resolveConfigPath()) {
  * @param {SmtpFileInput} input
  * @returns {ConfigValues}
  */
-export function smtpFileValues({ host, port, secure, user, pass, from, replyTo, unsubscribeUrl, maxPerHour }) {
+export function smtpFileValues({
+  host,
+  port,
+  secure,
+  user,
+  pass,
+  from,
+  replyTo,
+  unsubscribeUrl,
+  publicUrl,
+  maxPerHour,
+  maxPerDomainPerHour,
+  maxPerDay,
+}) {
   /** @type {ConfigValues} */
   const values = {
     SMTP_HOST: host,
@@ -164,7 +184,10 @@ export function smtpFileValues({ host, port, secure, user, pass, from, replyTo, 
     EMAIL_FROM: from,
     EMAIL_REPLY_TO: replyTo,
     UNSUBSCRIBE_URL: unsubscribeUrl,
+    MAILROOM_PUBLIC_URL: publicUrl,
     MAX_PER_HOUR: maxPerHour,
+    MAX_PER_DOMAIN_PER_HOUR: maxPerDomainPerHour,
+    MAX_PER_DAY: maxPerDay,
   };
   // A blank password means "keep the one already saved".
   if (pass) values.SMTP_PASS = pass;
@@ -250,7 +273,7 @@ function templatesProblem(dir) {
 function writableProblem({ label, path }) {
   try {
     mkdirSync(path, { recursive: true });
-    accessSync(path, constants.W_OK);
+    accessSync(path, constants.W_OK | constants.X_OK);
     return null;
   } catch (err) {
     return `Cannot use the ${label} ${path}: ${errMsg(err)}`;

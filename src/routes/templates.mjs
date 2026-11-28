@@ -79,9 +79,10 @@ export function safePath(input, scope, { roots = [scope.dataDir, scope.templateD
 }
 
 /** @param {string} absolute @param {{ root: string }} scope */
-export const rel = (absolute, scope) => (absolute.startsWith(scope.root + sep)
-  ? absolute.slice(scope.root.length + 1).split(sep).join('/')
-  : absolute);
+export function rel(absolute, scope) {
+  const root = absolute.startsWith(scope.root + sep) ? scope.root : realRoot(scope.root);
+  return absolute.startsWith(root + sep) ? absolute.slice(root.length + 1).split(sep).join('/') : absolute;
+}
 
 /** @param {string} templatePath */
 const isBundledTemplate = (templatePath) => BUNDLED_TEMPLATES.has(basename(templatePath));
@@ -327,9 +328,9 @@ function templateTargetForNew(rawName, scope) {
 /** @param {PathScope} scope */
 export function listTemplates(scope) {
   if (!existsSync(scope.templateDir)) return [];
-  return readdirSync(scope.templateDir)
-    .filter((name) => !name.startsWith('.') && /\.html?$/i.test(name))
-    .filter((name) => !lstatSync(join(scope.templateDir, name)).isSymbolicLink())
+  return readdirSync(scope.templateDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && !entry.name.startsWith('.') && /\.html?$/i.test(entry.name))
+    .map((entry) => entry.name)
     .sort()
     .map((name) => {
       const path = join(scope.templateDir, name);

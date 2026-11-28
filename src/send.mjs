@@ -178,7 +178,7 @@ console.log(`  from      ${cfg.from}`);
 console.log(`  password  ${cfg.pass ? `${cfg.pass.slice(0, 2)}${'•'.repeat(8)}` : '(not set)'}`);
 console.log(`  recipients ${recipients.length}${alreadySentCount ? ` (${alreadySentCount} already sent, will skip)` : ''}`);
 console.log(`  delay     ${delayMs}ms between sends`);
-console.log(`  ceiling   ${limits.perHour ? `${limits.perHour} messages/hour` : 'no hourly limit'}${limits.perDomainPerHour ? `, ${limits.perDomainPerHour} per domain` : ''}`);
+console.log(`  ceiling   ${limits.perHour ? `${limits.perHour} messages/hour` : 'no hourly limit'}${limits.perDomainPerHour ? `, ${limits.perDomainPerHour} per domain` : ''}${limits.perDay ? `, ${limits.perDay}/day` : ''}`);
 const held = recipients.filter((rec) => isSuppressed(suppressionPath, rec._email)).length;
 if (held) console.log(`  suppressed ${held} (will skip)`);
 if (campaignId) console.log(`  campaign  ${campaignId}`);
@@ -293,7 +293,8 @@ try {
         else console.log(`${n} FAILED ${event.email} — ${event.error}`);
       } else if (event.type === 'throttle') {
         const minutes = Math.ceil(event.waitMs / 60000);
-        console.log(`        waiting ~${minutes} min: ${event.scope === 'hour' ? 'hourly send ceiling' : `${event.scope} ceiling`} reached (Ctrl+C to stop; re-run to resume)`);
+        const scopeLabel = event.scope === 'hour' ? 'hourly send ceiling' : event.scope === 'day' ? 'daily send ceiling' : `${event.scope} ceiling`;
+        console.log(`        waiting ~${minutes} min: ${scopeLabel} reached (Ctrl+C to stop; re-run to resume)`);
       } else if (event.type === 'fatal') {
         console.error(`\nFATAL: ${event.error}\nStopping so the mailbox is not locked.`);
       }

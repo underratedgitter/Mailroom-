@@ -224,7 +224,8 @@ export const routes = [
       const issue = complianceIssue(cfg);
       if (issue) return fail(400, issue);
 
-      const rec = { ...input.parsed.recipients[0], _email: to };
+      const idx = Math.max(0, Math.min(input.parsed.recipients.length - 1, Number(body.index) || 0));
+      const rec = { ...input.parsed.recipients[idx], _email: to };
       const mailer = createMailer(cfg);
       const verify = await mailer.verify();
       if (!verify.ok) {

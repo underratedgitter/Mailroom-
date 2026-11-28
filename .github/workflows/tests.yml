@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'feat/**', 'codex/**']
   pull_request:
   workflow_dispatch:
 
@@ -50,3 +50,24 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+      - name: Smoke-test packed npm install
+        if: matrix.node-version == '24'
+        run: |
+          package_dir="$(mktemp -d)"
+          npm pack --pack-destination "$package_dir"
+          npm install --omit=dev --ignore-scripts --no-audit --no-fund --prefix "$package_dir/install" "$package_dir"/*.tgz
+          MAILROOM_STATE_DIR="$package_dir/state" "$package_dir/install/node_modules/.bin/mailroom" --doctor
+
+      - name: Smoke-test Compose startup
+        if: matrix.node-version == '24'
+        env:
+          MAILROOM_PASSWORD: ci-smoke-test-password
+        run: |
+          sudo chown -R 1000:1000 data logs templates
+          docker compose --env-file /dev/null up --build --wait --wait-timeout 90
+          curl --fail --silent http://127.0.0.1:4173/api/ready
+
+      - name: Stop Compose smoke test
+        if: always() && matrix.node-version == '24'
+        run: docker compose --env-file /dev/null down --volumes

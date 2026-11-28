@@ -18,9 +18,33 @@ import { fileURLToPath } from 'node:url';
 const COST = { N: 32768, r: 8, p: 1 };
 const KEY_BYTES = 32;
 const SALT_BYTES = 16;
+const MAX_SCRYPT_CONCURRENCY = 2;
 
 /** @typedef {{ N: number, r: number, p: number }} ScryptCost */
 /** @typedef {{ N: number, r: number, p: number, salt: Buffer, key: Buffer }} ParsedPasswordHash */
+
+// Bound concurrent ~32 MB scrypt hashes so parallel login bursts cannot exhaust memory.
+let activeScrypt = 0;
+/** @type {Array<() => void>} */
+const scryptWaiters = [];
+
+/**
+ * @template T
+ * @param {() => Promise<T>} task
+ * @returns {Promise<T>}
+ */
+async function withScryptSlot(task) {
+  if (activeScrypt >= MAX_SCRYPT_CONCURRENCY) {
+    await /** @type {Promise<void>} */ (new Promise((resolveSlot) => scryptWaiters.push(resolveSlot)));
+  }
+  activeScrypt++;
+  try {
+    return await task();
+  } finally {
+    activeScrypt--;
+    scryptWaiters.shift()?.();
+  }
+}
 
 // scrypt needs about 128 * N * r bytes; leave headroom above that.
 /**
@@ -37,9 +61,9 @@ const maxmemFor = (N, r) => 160 * N * r;
  * @param {number} length
  * @returns {Promise<Buffer>}
  */
-const derive = (password, salt, { N, r, p }, length) => new Promise((resolveKey, reject) => {
+const derive = (password, salt, { N, r, p }, length) => withScryptSlot(() => new Promise((resolveKey, reject) => {
   scrypt(password, salt, length, { N, r, p, maxmem: maxmemFor(N, r) }, (err, key) => (err ? reject(err) : resolveKey(key)));
-});
+}));
 
 /**
  * Throws unless `stored` is a well-formed scrypt hash; returns its parts.
@@ -138,19 +162,31 @@ export function createSessionStore({ ttlMs, maxSessions }) {
 }
 
 /**
- * Per-IP sliding-window login attempt tracker.
- * @param {{ windowMs: number, maxAttempts: number }} opts
+ * Per-IP sliding-window login attempt tracker bounded in tracked IPs.
+ * @param {{ windowMs: number, maxAttempts: number, maxTrackedIps?: number }} opts
  */
-export function createLoginLimiter({ windowMs, maxAttempts }) {
+export function createLoginLimiter({ windowMs, maxAttempts, maxTrackedIps = 4096 }) {
   /** @type {Map<string, number[]>} */
   const attempts = new Map();
   /** @param {string} ip */
   function recent(ip) {
     const now = Date.now();
     const hits = (attempts.get(ip) || []).filter((t) => now - t < windowMs);
+    attempts.delete(ip);
     if (hits.length) attempts.set(ip, hits);
-    else attempts.delete(ip);
     return hits;
+  }
+  function trimExcess() {
+    if (attempts.size < maxTrackedIps) return;
+    const now = Date.now();
+    for (const [trackedIp, list] of attempts) {
+      if (!list.some((t) => now - t < windowMs)) attempts.delete(trackedIp);
+    }
+    while (attempts.size >= maxTrackedIps) {
+      const oldest = attempts.keys().next().value;
+      if (oldest === undefined) break;
+      attempts.delete(oldest);
+    }
   }
   return {
     isBlocked: (/** @type {string} */ ip) => recent(ip).length >= maxAttempts,
@@ -158,8 +194,10 @@ export function createLoginLimiter({ windowMs, maxAttempts }) {
       if (ok) { attempts.delete(ip); return; }
       const hits = recent(ip);
       hits.push(Date.now());
+      if (!attempts.has(ip)) trimExcess();
       attempts.set(ip, hits);
     },
+    trackedCount: () => attempts.size,
   };
 }
 

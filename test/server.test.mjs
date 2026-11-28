@@ -5,6 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import http from 'node:http';
+import { spawnSync } from 'node:child_process';
 import { CSV, startServer, post, get, wait } from './helpers/server.mjs';
 import { startSmtpSink } from './helpers/smtp-sink.mjs';
 
@@ -24,6 +25,86 @@ test('a fresh install reports itself unconfigured', async (t) => {
 
   assert.equal((await get(server.base, '/')).status, 200);
   assert.equal((await get(server.base, '/favicon.svg')).status, 200);
+});
+
+test('an external state directory keeps setup, recipients, templates and suppression across restarts', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'mailroom-state-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const stateDir = join(dir, 'state');
+  const alias = join(dir, 'alias');
+  symlinkSync(dir, alias, 'dir');
+  const env = {
+    HOME: dir, MAILROOM_STATE_DIR: join(alias, 'state'), MAILROOM_CONFIG: '', SEND_LOG: '', SCHEDULE_FILE: '', SUPPRESSION_FILE: '',
+  };
+  const server = await startServer({ env, cwd: dir });
+  t.after(server.stop);
+  assert.equal((await get(server.base, '/api/state')).data.setup.configPath, 'config.env');
+
+  const saved = await post(server.base, '/api/settings', {
+    host: '127.0.0.1', from: 'Team <team@example.test>', test: false,
+  });
+  assert.equal(saved.status, 200);
+  const recipients = await post(server.base, '/api/recipients', {
+    text: 'team@example.test', name: 'Team',
+  });
+  assert.equal(recipients.status, 201);
+  const template = await post(server.base, '/api/templates/save', {
+    name: 'Team notice', html: '<p>Team notice</p>',
+  });
+  assert.equal(template.status, 201);
+  assert.equal(template.data.path, 'templates/team-notice.html');
+  assert.equal((await post(server.base, '/api/suppress', { emails: ['team@example.test'] })).status, 200);
+  await server.stop();
+
+  const restarted = await startServer({ env, cwd: dir });
+  t.after(restarted.stop);
+  const { data } = await get(restarted.base, '/api/state');
+  assert.equal(data.setup.configPath, 'config.env');
+  assert.equal(data.smtp.from, 'Team <team@example.test>');
+  assert.equal(data.log.path, 'logs/sent.jsonl');
+  assert.equal(data.suppression.path, 'data/suppressed.csv');
+  assert.equal(data.suppression.count, 1);
+  assert.ok(data.csvs.some(({ path }) => path === recipients.data.path));
+  assert.ok(data.templates.some(({ path }) => path === template.data.path));
+  assert.ok(data.templates.some(({ path }) => path === TEMPLATE));
+  assert.ok(existsSync(join(stateDir, 'logs', '.unsubscribe-secret')));
+});
+
+test('readiness reports a blocked suppression directory', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'mailroom-ready-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const suppressionDir = join(dir, 'suppression');
+  const server = await startServer({ env: { SUPPRESSION_FILE: join(suppressionDir, 'list.csv') } });
+  t.after(server.stop);
+  assert.equal((await get(server.base, '/api/ready')).data.checks.storage, true);
+
+  rmSync(suppressionDir, { recursive: true });
+  writeFileSync(suppressionDir, 'blocked');
+  const response = await get(server.base, '/api/ready');
+  assert.equal(response.status, 503);
+  assert.equal(response.data.checks.storage, false);
+  assert.equal(response.data.checks.logs, true);
+});
+
+test('the installed launcher can diagnose setup without starting the server', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'mailroom-doctor-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const run = (overrides) => spawnSync(process.execPath, [join(ROOT, 'bin', 'mailroom.mjs'), '--doctor'], {
+    cwd: dir,
+    env: { MAILROOM_STATE_DIR: join(dir, 'state'), ...overrides },
+    encoding: 'utf8',
+    timeout: 3000,
+  });
+  const valid = run({ SMTP_USER: 'check@example.test', SMTP_PASS: 'fixture-doctor-password' });
+  assert.equal(valid.status, 0, valid.stderr);
+  assert.match(valid.stdout, /Setup checks passed/);
+  assert.match(valid.stdout, /SMTP settings are present/);
+  assert.doesNotMatch(valid.stdout + valid.stderr, /fixture-doctor-password/);
+  assert.equal(existsSync(join(dir, 'state', 'logs', '.unsubscribe-secret')), false);
+
+  const invalid = run({ GUI_HOST: '0.0.0.0' });
+  assert.equal(invalid.status, 1);
+  assert.match(invalid.stderr, /Refusing to serve Mailroom over plain HTTP/);
 });
 
 test('the API refuses path traversal and malformed input', async (t) => {
@@ -82,6 +163,7 @@ test('settings save accepts a local relay without credentials and still requires
   assert.equal(local.data.smtp.passwordSet, false);
 
   const state = await get(base, '/api/state');
+  assert.equal(state.status, 200, JSON.stringify(state.data));
   assert.equal(state.data.setup.configured, true);
 
   // A relay on loopback still needs a From address, since there is no mailbox to fall back to.
@@ -96,6 +178,28 @@ test('settings save accepts a local relay without credentials and still requires
   const noUser = await post(base, '/api/settings', { host: 'smtp.example.test', port: 587, user: '', pass: 'x' });
   assert.equal(noUser.status, 400);
   assert.match(noUser.data.error, /Mailbox address is required/);
+});
+
+test('SMTP test and save give the same field errors without reusing another account password', async (t) => {
+  const server = await startServer({
+    env: { SMTP_HOST: '127.0.0.2', SMTP_PORT: '1', SMTP_USER: 'desk@example.test', SMTP_PASS: 'fixture-password' },
+  });
+  t.after(server.stop);
+  for (const path of ['/api/settings/test', '/api/settings']) {
+    for (const [fields, message] of [
+      [{ host: '' }, /SMTP host is required/],
+      [{ port: 65536 }, /SMTP port must be a whole number between 1 and 65535/],
+      [{ host: '127.0.0.3', pass: '' }, /password is required/],
+      [{ user: 'other@example.test', pass: '' }, /password is required/],
+    ]) {
+      const res = await post(server.base, path, { ...fields, test: false });
+      assert.equal(res.status, 400, JSON.stringify(res.data));
+      assert.match(res.data.error, message);
+    }
+  }
+  const saved = await post(server.base, '/api/settings', { pass: '', test: false });
+  assert.equal(saved.status, 200);
+  assert.equal(saved.data.smtp.passwordSet, true);
 });
 
 test('setup saves SMTP settings, then preview, roster and send work', async (t) => {

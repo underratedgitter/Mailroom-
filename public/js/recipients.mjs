@@ -95,9 +95,17 @@ export async function loadRoster() {
   }
   const seq = ++state.rosterSeq;
   try {
-    const data = await api('/api/roster', { csv: ui.csv.value, campaign: ui.campaign.value.trim(), limit: currentLimit() });
+    const data = await api('/api/roster', {
+      csv: ui.csv.value,
+      campaign: ui.campaign.value.trim(),
+      limit: currentLimit(),
+      q: state.rosterPage.q,
+      offset: state.rosterPage.offset,
+      pageSize: state.rosterPage.pageSize,
+    });
     if (seq !== state.rosterSeq) return;
     state.rosters.saved = data;
+    state.rosterPage.offset = data.offset ?? state.rosterPage.offset;
     state.rosterErrors.saved = '';
     state.columns = data.columns || [];
     renderTokens();
@@ -127,9 +135,16 @@ export async function validatePaste() {
     return;
   }
   try {
-    const data = await api('/api/recipients', { text, dryRun: true });
+    const data = await api('/api/recipients', {
+      text,
+      dryRun: true,
+      q: state.rosterPage.q,
+      offset: state.rosterPage.offset,
+      pageSize: state.rosterPage.pageSize,
+    });
     if (seq !== state.pasteSeq) return;
     state.rosters.paste = data;
+    state.rosterPage.offset = data.offset ?? state.rosterPage.offset;
     state.rosterErrors.paste = '';
     const parts = [plural(data.total, 'address', 'addresses')];
     if (data.duplicates) parts.push(plural(data.duplicates, 'duplicate'));
@@ -185,6 +200,7 @@ export function renderRoster() {
   if (data) {
     stats.push({ kind: 'total', text: plural(data.total, 'address', 'addresses'), state: data.total ? 'ok' : 'warn' });
     if (data.sentCount) stats.push({ kind: 'sent', text: data.sentCount + ' already sent', state: 'warn' });
+    if (data.suppressedCount) stats.push({ kind: 'suppressed', text: data.suppressedCount + ' suppressed', state: 'bad' });
     if (data.truncated) stats.push({ kind: 'limit', text: data.truncated + ' held by limit', state: 'warn' });
     if (data.duplicates) stats.push({ kind: 'dupes', text: plural(data.duplicates, 'duplicate'), state: 'warn' });
     if (data.invalid) stats.push({ kind: 'invalid', text: data.invalid + ' unusable', state: 'bad' });
@@ -194,36 +210,52 @@ export function renderRoster() {
     (node, s) => { setText(node, s.text); setAttr(node, 'data-state', s.state); });
 
   const rows = data ? data.recipients : [];
-  const position = new Map(rows.map((rec, i) => [rec.email.toLowerCase(), i]));
+  const offset = data?.offset ?? 0;
+  const pageSize = data?.pageSize ?? state.rosterPage.pageSize;
+  const filtered = data?.filtered ?? rows.length;
   reconcile(ui.rosterList, rows, (rec) => rec.email.toLowerCase(),
     () => h('li', {}, h('button', { type: 'button', class: 'rrow' },
       h('span', { class: 'rrow__no' }),
       h('span', { class: 'rrow__main' }, h('span', { class: 'rrow__mail' }), h('span', { class: 'rrow__meta' })),
       h('span', { class: 'tag' }, 'sent'))),
-    (li, rec) => {
+    (li, rec, pos) => {
       const row = li.firstElementChild;
-      const i = position.get(rec.email.toLowerCase());
-      row.dataset.index = String(i);
+      const idx = rec.index ?? (offset + pos);
+      const n = idx + 1;
+      const custom = rec.fields ? Object.entries(rec.fields).map(([k, v]) => k + ': ' + v) : [];
+      row.dataset.index = String(idx);
       row.disabled = !selectable;
       setAttr(row, 'title', rec.email);
-      setText(row.children[0], pad2(i + 1));
+      setText(row.children[0], n < 100 ? pad2(n) : String(n));
       setText(row.children[1].children[0], rec.email);
-      setText(row.children[1].children[1], [rec.name, rec.company].filter(Boolean).join(' · '));
-      setClass(row, 'is-sent', Boolean(rec.sent));
+      setText(row.children[1].children[1], [rec.name, rec.company, ...custom].filter(Boolean).join(' · '));
+      setClass(row, 'is-suppressed', Boolean(rec.suppressed));
+      setClass(row, 'is-sent', !rec.suppressed && Boolean(rec.sent));
+      setText(row.children[2], rec.suppressed ? 'suppressed' : 'sent');
     });
+
+  setHidden(ui.rosterPager, !data || filtered <= pageSize);
+  if (data && filtered > pageSize) {
+    ui.rosterPrevBtn.disabled = offset <= 0;
+    ui.rosterNextBtn.disabled = offset + rows.length >= filtered;
+    setText(ui.rosterPageInfo, (offset + 1) + '–' + (offset + rows.length) + ' of ' + filtered);
+  }
 
   const empty = !rows.length;
   setHidden(ui.rosterEmpty, !empty);
   if (empty) {
+    const query = state.rosterPage.q;
     const titles = {
-      saved: ui.csv.value ? 'No recipients found' : 'No list selected',
-      paste: 'Nothing pasted yet',
-      upload: 'No file chosen',
+      saved: ui.csv.value ? (query && data?.total ? 'No matching recipients' : 'No recipients found') : 'No list selected',
+      paste: query && data?.total ? 'No matching recipients' : 'Nothing pasted yet',
+      upload: query && data?.total ? 'No matching recipients' : 'No file chosen',
     };
     const texts = {
-      saved: ui.csv.value ? 'This list has no valid email addresses.' : 'Choose a saved list, paste addresses or upload a CSV.',
-      paste: 'Paste one address per line and they appear here as you type.',
-      upload: 'Choose a CSV file to check it before saving.',
+      saved: ui.csv.value
+        ? (query && data?.total ? 'Nothing in this list matches “' + query + '”.' : 'This list has no valid email addresses.')
+        : 'Choose a saved list, paste addresses or upload a CSV.',
+      paste: query && data?.total ? 'Nothing in the pasted list matches “' + query + '”.' : 'Paste one address per line and they appear here as you type.',
+      upload: query && data?.total ? 'Nothing in the uploaded file matches “' + query + '”.' : 'Choose a CSV file to check it before saving.',
     };
     setText(ui.rosterEmptyTitle, error ? 'Could not read this list' : titles[key]);
     setText(ui.rosterEmptyText, error || texts[key]);
@@ -304,6 +336,35 @@ async function savePastedList() {
 
 const MAX_UPLOAD = 1.5 * 1024 * 1024;
 
+async function validateUpload() {
+  if (!state.upload) return;
+  try {
+    const data = await api('/api/recipients', {
+      text: state.upload.text,
+      format: 'csv',
+      dryRun: true,
+      q: state.rosterPage.q,
+      offset: state.rosterPage.offset,
+      pageSize: state.rosterPage.pageSize,
+    });
+    state.rosters.upload = data;
+    state.rosterPage.offset = data.offset ?? state.rosterPage.offset;
+    const parts = [plural(data.total, 'valid address', 'valid addresses')];
+    if (data.duplicates) parts.push(plural(data.duplicates, 'duplicate'));
+    if (data.invalid) parts.push(data.invalid + ' unusable');
+    setText(ui.uploadStatus, parts.join(' · '));
+    setClass(ui.uploadStatus, 'is-ok', data.total > 0);
+    setClass(ui.uploadStatus, 'is-bad', data.total === 0);
+    ui.uploadSaveBtn.disabled = data.total === 0;
+    renderRoster();
+  } catch (err) {
+    setText(ui.uploadStatus, err.message);
+    setClass(ui.uploadStatus, 'is-bad', true);
+    setClass(ui.uploadStatus, 'is-ok', false);
+    renderRoster();
+  }
+}
+
 async function handleFile(file) {
   if (!file) return;
   state.upload = null;
@@ -323,24 +384,12 @@ async function handleFile(file) {
   try { text = await file.text(); } catch { fail('Could not read that file.'); return; }
 
   state.upload = { name: file.name, text };
+  state.rosterPage.offset = 0;
   setClass(ui.uploadStatus, 'is-bad', false);
   setClass(ui.uploadStatus, 'is-ok', false);
   setText(ui.uploadStatus, 'Checking ' + file.name + '…');
   renderRoster();
-  try {
-    const data = await api('/api/recipients', { text, format: 'csv', dryRun: true });
-    state.rosters.upload = data;
-    const parts = [plural(data.total, 'valid address', 'valid addresses')];
-    if (data.duplicates) parts.push(plural(data.duplicates, 'duplicate'));
-    if (data.invalid) parts.push(data.invalid + ' unusable');
-    setText(ui.uploadStatus, parts.join(' · '));
-    setClass(ui.uploadStatus, 'is-ok', data.total > 0);
-    setClass(ui.uploadStatus, 'is-bad', data.total === 0);
-    ui.uploadSaveBtn.disabled = data.total === 0;
-    renderRoster();
-  } catch (err) {
-    fail(err.message);
-  }
+  await validateUpload();
 }
 
 async function saveUpload() {
@@ -367,10 +416,20 @@ async function saveUpload() {
   await refreshPreview({ resetIndex: true });
 }
 
+function reloadActiveRoster() {
+  const key = activeRosterKey();
+  if (key === 'paste') return validatePaste();
+  if (key === 'upload') return validateUpload();
+  return loadRoster();
+}
+
 export function initRecipients() {
   ui.sourceTabs.addEventListener('click', (event) => {
     const tab = event.target.closest('[role="tab"]');
-    if (tab) setTab(tab.dataset.tab);
+    if (tab) {
+      state.rosterPage.offset = 0;
+      setTab(tab.dataset.tab);
+    }
   });
   ui.sourceTabs.addEventListener('keydown', (event) => {
     const tabs = [...ui.sourceTabs.querySelectorAll('[role="tab"]')];
@@ -379,19 +438,35 @@ export function initRecipients() {
     const next = { ArrowRight: (at + 1) % tabs.length, ArrowLeft: (at + tabs.length - 1) % tabs.length, Home: 0, End: tabs.length - 1 }[event.key];
     if (next === undefined) return;
     event.preventDefault();
+    state.rosterPage.offset = 0;
     setTab(tabs[next].dataset.tab, { focus: true });
   });
   ui.csv.addEventListener('change', () => {
     store.set('csv', ui.csv.value);
     describeCsv();
     state.index = 0;
+    state.rosterPage.offset = 0;
     refreshPreview({ resetIndex: true });
     loadRoster();
   });
   ui.pasteBox.addEventListener('input', debounce(() => {
+    state.rosterPage.offset = 0;
     validatePaste();
     refreshPreview({ resetIndex: true });
   }, 500));
+  ui.rosterSearch.addEventListener('input', debounce(() => {
+    state.rosterPage.q = ui.rosterSearch.value.trim();
+    state.rosterPage.offset = 0;
+    reloadActiveRoster();
+  }, 200));
+  ui.rosterPrevBtn.addEventListener('click', () => {
+    state.rosterPage.offset = Math.max(0, state.rosterPage.offset - state.rosterPage.pageSize);
+    reloadActiveRoster();
+  });
+  ui.rosterNextBtn.addEventListener('click', () => {
+    state.rosterPage.offset += state.rosterPage.pageSize;
+    reloadActiveRoster();
+  });
   ui.saveCsvBtn.addEventListener('click', savePastedList);
   ui.deleteCsvBtn.addEventListener('click', deleteCsv);
   ui.limit.addEventListener('input', debounce(() => {

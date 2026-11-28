@@ -17,7 +17,6 @@ import {
 } from './api.mjs';
 import { refreshPreview } from './compose.mjs';
 
-const SUPPRESS_SHOWN = 300;
 const SUPPRESS_TAG = { 'hard-bounce': 'failed', bounce: 'failed', complaint: 'failed', unsubscribe: 'skip' };
 
 function formatAdded(value) {
@@ -27,8 +26,14 @@ function formatAdded(value) {
 
 export async function loadSuppression() {
   try {
-    const data = await api('/api/suppression');
+    const { q, reason, limit, offset } = state.suppressionPage;
+    const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    if (q) params.set('q', q);
+    if (reason) params.set('reason', reason);
+    const data = await api('/api/suppression?' + params.toString());
     state.suppressed = data;
+    state.suppressionPage.filtered = data.filtered ?? (data.entries || []).length;
+    state.suppressionPage.offset = data.offset ?? offset;
     renderSuppression();
   } catch (err) {
     setText(ui.suppressNote, 'Could not load the list: ' + err.message);
@@ -38,12 +43,9 @@ export async function loadSuppression() {
 export function renderSuppression() {
   const data = state.suppressed;
   if (!data) return;
-  const entries = data.entries || (data.emails || []).map((email) => ({ email, reason: '', added: '' }));
-  const query = ui.suppressSearch.value.trim().toLowerCase();
-  const matches = query
-    ? entries.filter((e) => e.email.includes(query) || (e.reason && e.reason.toLowerCase().includes(query)))
-    : entries;
-  const shown = matches.slice(0, SUPPRESS_SHOWN);
+  const shown = data.entries || (data.emails || []).map((email) => ({ email, reason: '', added: '' }));
+  const { q, reason, limit, offset, filtered } = state.suppressionPage;
+  const matched = data.filtered ?? filtered ?? shown.length;
 
   setText(ui.suppressCount, plural(data.count, 'address', 'addresses'));
   reconcile(ui.suppressList, shown, (item) => item.email,
@@ -68,10 +70,20 @@ export function renderSuppression() {
       setAttr(addedEl, 'title', item.added || '');
       setAttr(btn, 'aria-label', 'Remove ' + item.email);
     });
+
+  setHidden(ui.suppressPager, matched <= limit || shown.length === 0);
+  if (shown.length && matched > limit) {
+    ui.suppressPrevBtn.disabled = offset <= 0;
+    ui.suppressNextBtn.disabled = offset + shown.length >= matched;
+    setText(ui.suppressPageInfo, (offset + 1) + '–' + (offset + shown.length) + ' of ' + matched);
+  }
+
   setHidden(ui.suppressEmpty, shown.length > 0);
   setText(ui.suppressEmptyTitle, data.count ? 'No matches' : 'No suppressed addresses');
-  setText(ui.suppressEmptyText, data.count ? 'Nothing on the list matches “' + ui.suppressSearch.value.trim() + '”.' : 'Addresses you add, and hard bounces found while sending, appear here. Unsubscribe requests are not added automatically: add them here when they arrive.');
-  setText(ui.suppressNote, (matches.length > shown.length ? 'Showing the first ' + shown.length + ' of ' + matches.length + '. Filter to narrow it down. ' : '')
+  setText(ui.suppressEmptyText, data.count
+    ? 'Nothing on the list matches ' + ([q ? '“' + q + '”' : '', reason || ''].filter(Boolean).join(' · ') || 'that filter') + '.'
+    : 'Addresses you add, and hard bounces found while sending, appear here. Unsubscribe requests are not added automatically: add them here when they arrive.');
+  setText(ui.suppressNote, (matched < data.count ? plural(matched, 'match') + ' of ' + data.count + '. ' : '')
     + 'Stored in ' + data.path + '.');
 }
 
@@ -130,7 +142,24 @@ async function submitSuppress(event) {
 
 export function initSuppression() {
   ui.suppressForm.addEventListener('submit', submitSuppress);
-  ui.suppressSearch.addEventListener('input', debounce(renderSuppression, 150));
+  ui.suppressSearch.addEventListener('input', debounce(() => {
+    state.suppressionPage.q = ui.suppressSearch.value.trim();
+    state.suppressionPage.offset = 0;
+    loadSuppression();
+  }, 200));
+  ui.suppressReasonFilter.addEventListener('change', () => {
+    state.suppressionPage.reason = ui.suppressReasonFilter.value;
+    state.suppressionPage.offset = 0;
+    loadSuppression();
+  });
+  ui.suppressPrevBtn.addEventListener('click', () => {
+    state.suppressionPage.offset = Math.max(0, state.suppressionPage.offset - state.suppressionPage.limit);
+    loadSuppression();
+  });
+  ui.suppressNextBtn.addEventListener('click', () => {
+    state.suppressionPage.offset += state.suppressionPage.limit;
+    loadSuppression();
+  });
   ui.suppressList.addEventListener('click', (event) => {
     const button = event.target.closest('[data-action="remove"]');
     if (!button) return;

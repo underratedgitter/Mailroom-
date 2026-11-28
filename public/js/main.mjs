@@ -25,7 +25,7 @@ import { initOverview, loadCampaigns, loadHealth, mailboxOf, renderCampaigns, re
 import { describeCsv, initRecipients, loadRoster, markRosterCurrent, setTab, validatePaste } from './recipients.mjs';
 import { initSchedule, loadQueue, prepareScheduleForm, renderScheduleSummary } from './schedule.mjs';
 import { initSend, listen, lockControls, resumeActiveJob } from './send.mjs';
-import { initSettings, loadSettingsForm } from './settings.mjs';
+import { initSettings, loadSettingsForm, WEBHOOK_PATH } from './settings.mjs';
 import { initSuppression, loadSuppression } from './suppression.mjs';
 import { initTemplateStudio, loadStudioTemplate, renderTemplateControls } from './template-studio.mjs';
 
@@ -123,13 +123,16 @@ function applyState(data) {
     ? 'A password is required to open Mailroom.'
     : 'Mailroom is only reachable from this computer.');
   setText(ui.aboutVersion, data.app?.version || '—');
+  setText(ui.aboutWebhook, data.smtp?.webhookConfigured
+    ? 'POST ' + WEBHOOK_PATH + ' · secret configured'
+    : 'POST ' + WEBHOOK_PATH + ' · set MAILROOM_WEBHOOK_SECRET to enable');
   setText(ui.aboutPlatform, data.platform || '—');
   setText(ui.aboutLog, data.log.path);
   setText(ui.aboutSuppression, data.suppression.path);
   setText(ui.settingsPath, data.setup.configPath ? 'Saved to ' + data.setup.configPath : '');
   setText(ui.settingsLead, data.setup.configured
-    ? 'Change where Mailroom sends from. The password is never shown again once saved.'
-    : 'Mailroom sends through your own SMTP account, so mail comes from your address and lands in your sent folder. Nothing is shared with anyone else.');
+    ? 'Manage the mailbox Mailroom sends from.'
+    : 'Connect the mailbox Mailroom will send from.');
 
   options(ui.template, data.templates.map((t) => ({ value: t.path, label: t.name })), store.get('template'));
   options(ui.csv, data.csvs.map((c) => ({

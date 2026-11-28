@@ -22,9 +22,10 @@ between you and your recipients.
 ## Quick start
 
 ```bash
-git clone <this repo> mailroom && cd mailroom
-npm install
-npm start          # or: npx mailroom
+git clone https://github.com/underratedgitter/Mailroom-.git mailroom
+cd mailroom
+npm ci
+npx mailroom
 ```
 
 It prints `http://127.0.0.1:4173` and opens it. On first run Mailroom asks for
@@ -34,7 +35,9 @@ Global install:
 
 ```bash
 npm install -g .
-mailroom                  # --port 5000, --host 0.0.0.0, --no-open, --help
+export MAILROOM_STATE_DIR="$HOME/.local/share/mailroom"
+mailroom --doctor
+mailroom                  # --port 5000, --no-open, --help
 ```
 
 Docker:
@@ -94,6 +97,15 @@ start without one, even with `MAILROOM_ALLOW_INSECURE=1`.
 path and make it writable by uid 1000 once, e.g.
 `docker run --rm -v mailroom-config:/c alpine chown -R 1000:1000 /c`.
 
+Docker Compose publishes HTTP on `127.0.0.1` and checks `GET /api/ready`:
+
+```bash
+MAILROOM_PASSWORD='choose-a-strong-password' docker compose up -d --build
+```
+
+You can also supply `MAILROOM_PASSWORD_HASH`. For remote access, put a trusted
+TLS reverse proxy in front of the loopback port and set `MAILROOM_TRUST_PROXY=1`.
+
 ## HTTPS and network exposure
 
 Loopback HTTP (`http://127.0.0.1:4173`) is the default and needs no setup.
@@ -115,6 +127,7 @@ npm start
 | `MAILROOM_SESSION_TTL_SECONDS` | `43200` (12 h) | How long a login lasts; the cookie and the server-side session both expire then |
 | `MAILROOM_TRUST_PROXY` | unset | Set to `1` behind a reverse proxy you control: honours `X-Forwarded-Proto` (Secure cookie, HSTS), `X-Forwarded-Host` and `X-Forwarded-For` (login throttling) |
 | `MAILROOM_TLS_CERT` | unset | Path to a PEM certificate (chain included if needed) |
+| `MAILROOM_STATE_DIR` | package directory for data, templates and logs | Absolute path to a durable service directory, shared by the CLI and browser |
 | `MAILROOM_TLS_KEY` | unset | Path to the matching PEM private key |
 | `MAILROOM_ALLOW_INSECURE` | unset | Set to `1` to permit a non-loopback plain-HTTP bind |
 | `GUI_HOST` | `127.0.0.1` | Network interface to bind (CLI: `--host`) |
@@ -175,15 +188,17 @@ status, counts, campaign reports & sent/failed/unsent CSV export), **Compose**, 
 **Schedule**, **Suppression** and **Settings**. It follows your light or dark
 system theme and works on a phone-sized screen.
 
-**Settings** — the mailbox (host, port, app password, From line), the
-**connection security** (implicit TLS, `SMTP_SECURE=true`, usually port 465, or
-STARTTLS, `SMTP_SECURE=false`, usually 587 or 25; the page picks one when you
-type 465 or 587 and writes the choice to the settings file), and three optional
-delivery settings: Reply-To (`EMAIL_REPLY_TO`), an https unsubscribe link
-(`UNSUBSCRIBE_URL`, `{email}` replaced) and a messages-per-hour ceiling
-(`MAX_PER_HOUR`). They are validated like the environment variables (a line break,
-an `http://` unsubscribe URL or a non-numeric ceiling is refused) and a blank
-field removes the setting.
+**Settings** — enter your mailbox and SMTP password, then select **Test and
+save**. Gmail is prefilled. For other providers or local relays, expand
+**SMTP server and security** to set the host, port and connection mode. The
+form selects implicit TLS for port 465 and STARTTLS for ports 587 and 25.
+Expand **Delivery options** for the optional settings (Reply-To `EMAIL_REPLY_TO`, external unsubscribe link
+`UNSUBSCRIBE_URL` with `{email}` replaced, public unsubscribe base URL
+`MAILROOM_PUBLIC_URL`, `MAX_PER_HOUR`, `MAX_PER_DOMAIN_PER_HOUR`, and rolling
+24-hour `MAX_PER_DAY` cap), a **Sender DNS** card to inspect MX, SPF, DMARC and
+DKIM (`POST /api/settings/dns`) for your From domain, and server readiness /
+bounce webhook status in **About**. Delivery settings are validated like the
+environment variables and a blank field removes the setting.
 
 **Compose** — every `templates/*.html` file is offered as a template, and you can
 create, duplicate, delete, or edit template HTML and upload/delete inline
@@ -206,13 +221,18 @@ the list into `data/` for next time, and saved lists can be removed with
 **Delete**. **Upload** checks a CSV before saving it and
 shows how each column is used: the email column, `name` and `company` (with their
 common aliases), and every other column as a `{{merge field}}` for the subject and
-template. The Compose page flags any `{{field}}` the list cannot fill.
+template. The roster supports live search and server-side pagination for large
+lists, surfaces custom field values alongside `sent` and `suppressed` badges,
+and the Compose page flags any `{{field}}` the list cannot fill.
 
 **Preview** — the actual rendered HTML for the selected recipient, images
-included, with arrows to page through the list. The **Links and unsubscribe**
-check on the Send page warns (without blocking) about links that go nowhere
-(`href="#…"` or empty), relative links such as `/unsubscribe`, and a message
-with no unsubscribe link.
+included, with arrows to page through the list, **Mobile**, **Dark** and
+**Plain text** (`text/plain`) inspection toggles, rendered HTML size with a
+102 KB Gmail clipping warning, and per-row selection (also used by **Send a
+test**). The **Links and unsubscribe** check on the Send page warns (without
+blocking) about links that go nowhere (`href="#…"` or empty), unsafe schemes
+(`javascript:` / `vbscript:` / `data:`), relative links such as `/unsubscribe`,
+and a message with no unsubscribe link.
 
 **Unsubscribe link** — put `{{unsubscribe_url}}` in a template's footer
 (`href="{{unsubscribe_url}}"`). It is the same target as the List-Unsubscribe
@@ -323,12 +343,23 @@ sends alike:
   to the suppression list with reason `hard-bounce`, and the failed entry in
   the log carries the SMTP `responseCode`. Other refusals (policy, spam, full or
   busy mailbox) are logged but not suppressed.
-- **Rate ceiling.** A rolling one-hour window across all runs, rebuilt from the
-  send log, so a restart or a second run cannot reset it. When it is full the
-  run waits (and says so) until the oldest send ages out; Ctrl+C or *Stop*
-  ends the wait and the campaign resumes later. Two Mailroom processes cannot
-  send from the same log at the same moment (see *How it behaves*), so the
-  window is never counted twice.
+- **Rate ceilings.** Rolling one-hour (`MAX_PER_HOUR`), per-domain one-hour
+  (`MAX_PER_DOMAIN_PER_HOUR`), and rolling 24-hour (`MAX_PER_DAY`) windows
+  across all runs, rebuilt from the send log, so a restart or a second run
+  cannot reset them. When full, the run waits (and says so) until the oldest
+  send ages out; Ctrl+C or *Stop* ends the wait and the campaign resumes later.
+  Two Mailroom processes cannot send from the same log at the same moment (see
+  *How it behaves*), so windows are never counted twice.
+- **Bounce and complaint webhooks.** `POST /api/webhooks/bounces` accepts
+  Mailroom events and direct Postmark, Resend and Amazon SES event payloads.
+  Use a logged-in admin session or configure `MAILROOM_WEBHOOK_SECRET` and
+  send `Authorization: Bearer <secret>` or
+  `X-Mailroom-Signature: sha256=<hmac-hex>`. A provider integration can use a
+  forwarding service to unwrap any outer envelope and add Mailroom's
+  credentials. Hard bounces and complaints are added to suppression.
+- **Sender DNS pre-flight.** Settings checks MX, SPF (including the RFC 7208
+  10-lookup limit and `+all` rejection), DMARC policy, and DKIM selector TXT
+  records via `POST /api/settings/dns`.
 
 Add addresses to the suppression list:
 
@@ -354,25 +385,29 @@ call.) You can also remove suppressed addresses in the **Suppression list** view
 | `UNSUBSCRIBE_URL` | unset | External `https://` one-click endpoint you host; `{email}` is replaced (overrides `MAILROOM_PUBLIC_URL`) |
 | `MAILROOM_PUBLIC_URL` | unset | Public `https://` origin of this Mailroom server for signed one-click `/unsubscribe` links (works without logging in) |
 | `MAILROOM_UNSUBSCRIBE_SECRET` | generated in `logs/.unsubscribe-secret` | Explicit HMAC secret for signing `/unsubscribe` tokens across CLI and server restarts |
+| `MAILROOM_UNSUBSCRIBE_PREVIOUS_SECRET` | unset | Comma-separated previous HMAC secret(s) accepted during `/unsubscribe` secret rotation |
 | `UNSUBSCRIBE_SECRET_FILE` | `<log dir>/.unsubscribe-secret` | Override path where the generated HMAC signing secret is stored (`0600`) |
+| `MAILROOM_WEBHOOK_SECRET` | unset | Shared Bearer / HMAC-SHA256 secret authorising `POST /api/webhooks/bounces` without a session cookie |
+| `DKIM_SELECTOR` | unset | Default DKIM selector tested by DNS pre-flight checks when none is entered |
 | `SUPPRESSION_FILE` | `data/suppressed.csv` | Suppression list location (CLI: `--suppression-file`); the default is in the install folder for the CLI and the browser alike |
 | `SCHEDULE_FILE` | `logs/schedule.json` | Scheduled campaign queue file location |
 | `MAX_PER_HOUR` | `500` | Rolling messages-per-hour ceiling for all domains; `0` turns it off |
 | `MAX_PER_DOMAIN_PER_HOUR` | `0` (off) | Same, per recipient domain (e.g. `gmail.com`); a full domain pauses the run |
+| `MAX_PER_DAY` | `0` (off) | Rolling 24-hour messages ceiling across all campaigns; `0` turns it off |
 
 A malformed value (`MAX_PER_HOUR=lots`, an `http://` `UNSUBSCRIBE_URL`, an
 `EMAIL_FROM` without a domain) stops the send with a message before any mail goes out.
 
 What stays with you, because it cannot be done from inside the app:
 
-- **SPF, DKIM and DMARC** are DNS and provider settings. Gmail and Yahoo
-  require them for bulk senders; with a hosted SMTP account the provider signs
-  for you, so use a From address on a domain you have authenticated there.
-- **Reading the unsubscribe mailbox.** Mailroom does not receive mail. When
-  someone mails "unsubscribe" (or your one-click endpoint is hit), add them with
-  `--suppress` or `/api/suppress`. The same goes for spam complaints and for
-  bounces that arrive later by mail (only refusals during the send are
-  suppressed automatically).
+- **Publishing SPF, DKIM and DMARC DNS records.** Mailroom can inspect them in
+  **Settings -> Sender DNS**, while the TXT/MX records themselves live at your
+  DNS provider; Gmail and Yahoo require them for bulk senders.
+- **Reading the unsubscribe/bounce mailbox directly.** Mailroom does not poll
+  IMAP/POP3 mailboxes. Configure `MAILROOM_PUBLIC_URL` for automatic HTTP
+  one-click `/unsubscribe` suppression and forward authenticated provider
+  events to `POST /api/webhooks/bounces`. Add mailto requests manually with
+  `--suppress` or the UI.
 - **The one-click endpoint** must be public HTTPS; the Mailroom UI is not
   (and should not be) exposed that way.
 - **Keep spam complaints under 0.3 %** (Google's threshold), a postal address in
@@ -399,13 +434,15 @@ What stays with you, because it cannot be done from inside the app:
   address is logged as `uncertain`, shown as *unconfirmed* in the run summary
   (CLI exit code 1), and skipped on every resume of that campaign. Check your
   Sent folder, then mail it again with a new campaign name if it never went
-  out.
+  out. Mailroom records each SMTP attempt in `sent.jsonl.pending` before sending.
+  If it cannot record the outcome, it holds the recipient as unconfirmed on
+  resume. Keep this file alongside the send log when moving or restoring state.
 - `Ctrl+C` (SIGINT) or SIGTERM during a campaign, in the CLI and in the
   browser server alike, finishes and logs the message in flight, starts no
   more, prints how many recipients were not attempted and how to resume, and
   exits non-zero (130 for SIGINT, 143 for SIGTERM). An idle server exits 0. A
-  second signal exits immediately; the message in flight may then be
-  unrecorded, so check the log before re-running. The server waits up to 8 s
+  second signal exits immediately. A message still in flight is held as
+  unconfirmed on resume. The server waits up to 8 s
   for the message in flight, so keep your supervisor's stop timeout above that
   (Docker's default 10 s is enough).
 - A scheduled send interrupted by a shutdown goes back to `pending` and
@@ -437,25 +474,61 @@ What stays with you, because it cannot be done from inside the app:
 - A subject line is not HTML: `&` and apostrophes reach the recipient as typed,
   while the body is escaped so a name cannot break the markup.
 
+## Operating a single-team instance
+
+Run one Mailroom server per state directory under your service manager. For a
+native install, set `MAILROOM_STATE_DIR` in the service environment to a
+directory owned by its service user. Mailroom seeds bundled templates on first
+start and preserves existing templates. Compose persists equivalent state in its
+config volume and the `data/`, `templates/` and `logs/` mounts.
+
+- Run `mailroom --doctor` with the service environment before starting. It
+  checks startup configuration and storage, prepares missing directories and
+  reports whether SMTP settings are present. It does not open a port or contact
+  SMTP. Verify SMTP credentials in **Settings** after startup.
+- Monitor `/api/ready` for storage and scheduler readiness. Check a real
+  delivery to a mailbox your team controls before the first campaign.
+- Stop the GUI and any CLI sends before copying state. Back up the entire
+  `MAILROOM_STATE_DIR` or all four Compose mounts together. Include any
+  separately configured paths and secret-manager entries. Protect backups as
+  you would SMTP credentials and your recipient lists.
+- Restore into a fresh directory with the same service owner. Keep the
+  suppression list, send log and archives, `sent.jsonl.pending`, schedule and
+  unsubscribe signing key together. Review pending schedules before restarting,
+  since a due or interrupted campaign can resume automatically. Run
+  `mailroom --doctor`, check `/api/ready` and confirm existing campaigns and
+  suppression totals before enabling routine sends.
+- To move from a checkout to an external state directory, stop Mailroom and
+  copy the existing `data/`, `templates/` and `logs/` folders into it. Point
+  `MAILROOM_CONFIG` at the existing settings file, or copy it securely to
+  `config.env` in the new directory. Keep the old state until the new instance
+  has passed verification.
+
 ## Files
 
 ```
 bin/mailroom.mjs        launcher (port, host, browser)
+compose.yml             Docker Compose service definition with /api/ready healthcheck
 scripts/                dev tooling (check-syntax.mjs, used by npm run check)
-src/gui.mjs             HTTP/HTTPS server + JSON/SSE API
+src/gui.mjs             HTTP/HTTPS server, auth, /api/health, /api/ready, /unsubscribe
 src/send.mjs            command-line front end
-src/lib/core.mjs        CSV, render, text part, cid: images, SMTP, suppression, rate ceiling, send loop
+src/lib/auth.mjs        scrypt password hashing/verification, session cookies, bounded login limiter
 src/lib/config.mjs      settings file (read/write, 0600)
-src/lib/mailer.mjs      SMTP rules (TLS, From, app-password cleanup), unsubscribe/Message-ID headers
-public/                 the browser UI
+src/lib/core.mjs        CSV, render, text part, cid: images, SMTP, suppression, rate ceilings, send loop
+src/lib/dns.mjs         MX, SPF, DMARC and DKIM pre-flight checks via node:dns/promises
+src/lib/errors.mjs      typed HTTP error helpers and safe error formatting
+src/lib/mailer.mjs      SMTP rules (TLS, From, app-password cleanup), unsubscribe/Message-ID headers & token rotation
+src/routes/             modular HTTP/SSE handlers (bounces, campaigns, recipients, schedule, send, settings, suppression, templates)
+public/                 the browser UI (HTML, styles, and modular ES scripts in public/js/)
 templates/              HTML templates + their image folders
 data/                   recipient CSVs, suppressed.csv (data/recipients.example.csv tracked)
 logs/                   send log (sent.jsonl) and schedule queue (schedule.json)
 test/                   node:test suite (npm test)
 ```
 
-Settings resolve in this order: `MAILROOM_CONFIG` → a `./.env` beside the app →
-`~/.mailroom/config.env`. Real environment variables always win, so Docker can
+Settings resolve in this order: `MAILROOM_CONFIG` →
+`$MAILROOM_STATE_DIR/config.env` when a state directory is set → an existing
+`./.env` in the working directory → `~/.mailroom/config.env`. Real environment variables always win, so Docker can
 override the file.
 
 Supported SMTP environment variables:
@@ -496,13 +569,15 @@ Supported SMTP environment variables:
 ## Tests
 
 ```bash
-npm test            # 183 tests: parsing, rendering, resume, retries, scheduling, shutdown, log rotation, config validation, suppression, headers, rate ceiling, CLI, API, template studio, auth, TLS, guards
+npm test            # node:test suite: parsing, rendering, resume, retries, scheduling, shutdown, log rotation, config validation, suppression, DNS, webhooks, headers, rate ceilings, CLI, API, template studio, auth, TLS, UI guards
 npm run check       # parse every JS file in bin/, src/ and public/ without running it
+npm run typecheck   # TypeScript checkJs strict validation across the codebase
+npm run lint        # ESLint check across all source and test files
 ```
 
-GitHub Actions (`.github/workflows/tests.yml`) runs `npm ci`, `npm run check`
-and `npm test` on Node 20, 22 and 24 for every push to `main` and every pull
-request.
+GitHub Actions runs syntax checks, type checking, lint, a runtime dependency
+audit and tests on Node 20, 22 and 24. The Node 24 job also checks a clean npm
+package install and starts the Compose service to verify readiness.
 
 The API tests boot the real server against an in-process SMTP sink, so no mail
 leaves the machine.
@@ -511,13 +586,16 @@ leaves the machine.
 
 - Delivery is via SMTP submission: your provider's daily caps and reputation
   apply, and "sent" means the server accepted it, not that it reached an inbox.
-- Bounces arrive at the From mailbox; Mailroom does not process them.
+- Mailroom does not poll mailboxes directly; late bounces or complaints arriving
+  only by email require your provider or webhook forwarder to call
+  `POST /api/webhooks/bounces` (or manual suppression).
 - Scheduled sends need the process to be alive at the due time; there is no
   external cron or queue worker. Start it under `systemd`, Docker restart
   policy, or `launchd` if the timing matters.
-- Mailroom sends the unsubscribe headers and honours a suppression list, but it
-  does not receive unsubscribe requests, late bounces or complaints; you feed them
-  in (see above). For large, regulated, or marketing lists use a real ESP.
+- HTTP one-click unsubscribes work automatically when `MAILROOM_PUBLIC_URL` is
+  configured, and bounce/complaint webhooks update `data/suppressed.csv` via
+  `POST /api/webhooks/bounces`; `mailto:` opt-outs must still be added manually.
+  For large, multi-tenant, or dedicated bulk IP setups, use an ESP.
 - Templates are edited as raw HTML and inline `cid:` images (PNG, JPG, GIF, or
   WEBP up to 5 MB) in the Compose **Template studio** tab rather than a
   drag-and-drop visual designer; bundled templates are read-only (duplicate one

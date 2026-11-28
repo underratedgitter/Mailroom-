@@ -24,10 +24,11 @@ const INHERITED_ENV = [
   'SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM', 'EMAIL_FROM', 'SMTP_SECURE',
   'MAILROOM_PASSWORD', 'MAILROOM_PASSWORD_HASH', 'MAILROOM_TRUST_PROXY',
   'MAILROOM_SESSION_TTL_SECONDS', 'MAILROOM_TLS_CERT', 'MAILROOM_TLS_KEY', 'MAILROOM_ALLOW_INSECURE',
-  'GUI_ALLOWED_HOSTS', 'SCHEDULE_FILE', 'SCHEDULER_INTERVAL_MS', 'SCHEDULE_GRACE_MS',
+  'MAILROOM_STATE_DIR', 'GUI_ALLOWED_HOSTS', 'SCHEDULE_FILE', 'SCHEDULER_INTERVAL_MS', 'SCHEDULE_GRACE_MS',
   'SEND_LOG_MAX_BYTES', 'SEND_LOG_KEEP',
-  'SUPPRESSION_FILE', 'MAX_PER_HOUR', 'MAX_PER_DOMAIN_PER_HOUR', 'EMAIL_REPLY_TO', 'UNSUBSCRIBE_MAILTO', 'UNSUBSCRIBE_URL',
-  'MAILROOM_PUBLIC_URL', 'MAILROOM_UNSUBSCRIBE_SECRET', 'UNSUBSCRIBE_SECRET_FILE',
+  'SUPPRESSION_FILE', 'MAX_PER_HOUR', 'MAX_PER_DOMAIN_PER_HOUR', 'MAX_PER_DAY', 'EMAIL_REPLY_TO', 'UNSUBSCRIBE_MAILTO', 'UNSUBSCRIBE_URL',
+  'MAILROOM_PUBLIC_URL', 'MAILROOM_UNSUBSCRIBE_SECRET', 'MAILROOM_UNSUBSCRIBE_PREVIOUS_SECRET', 'UNSUBSCRIBE_SECRET_FILE',
+  'MAILROOM_WEBHOOK_SECRET', 'DKIM_SELECTOR',
 ];
 
 function serverEnv(workDir, port, env) {
@@ -44,9 +45,9 @@ function serverEnv(workDir, port, env) {
   });
 }
 
-function spawnServer(workDir, port, env) {
+function spawnServer(workDir, port, env, cwd = ROOT) {
   const child = spawn(process.execPath, [join(ROOT, 'src/gui.mjs')], {
-    cwd: ROOT,
+    cwd,
     env: serverEnv(workDir, port, env),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -59,10 +60,10 @@ function spawnServer(workDir, port, env) {
 
 const schemeFor = (env) => (env.MAILROOM_TLS_CERT && env.MAILROOM_TLS_KEY ? 'https' : 'http');
 
-export async function startServer({ env = {}, dir = null } = {}) {
+export async function startServer({ env = {}, dir = null, cwd = ROOT } = {}) {
   const workDir = dir || mkdtempSync(join(tmpdir(), 'mailroom-test-'));
   const port = await freePort();
-  const { child, output } = spawnServer(workDir, port, env);
+  const { child, output } = spawnServer(workDir, port, env, cwd);
 
   const base = `${schemeFor(env)}://127.0.0.1:${port}`;
   const deadline = Date.now() + 15000;

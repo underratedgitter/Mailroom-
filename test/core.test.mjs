@@ -21,6 +21,7 @@ import {
   formatReportCsv,
   readLog,
   appendLog,
+  addSuppressed,
   logArchives,
   runCampaign,
   emailRe,
@@ -292,7 +293,7 @@ test('a send log that cannot be written stops the run with a plain message', asy
       logPath: join(dir, 'missing-folder', 'sent.jsonl'),
       onEvent: () => {},
     }), /Cannot write the send log .*sent\.jsonl/);
-    assert.equal(count, 1, 'must not keep mailing people it cannot record');
+    assert.equal(count, 0, 'must stop before mailing anyone it cannot record');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -320,6 +321,85 @@ test('runCampaign reports how many recipients were never attempted when stopped'
 });
 
 const recipient = (email) => ({ _email: email, _name: 'Name', _company: 'Co' });
+
+test('runCampaign rechecks suppression during retry backoff and throttling', async (t) => {
+  const dir = workDir();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const email = 'opt-out@example.test';
+  const suppressionPath = join(dir, 'suppressed.csv');
+  const logPath = join(dir, 'send.jsonl');
+  const addresses = [];
+  let outcomesDuringBackoff;
+  const options = {
+    recipients: [recipient(email)],
+    templateHtml: 'x',
+    subjectTemplate: 'x',
+    delayMs: 0,
+    logPath,
+    suppressionPath,
+  };
+  const retry = await runCampaign({
+    ...options,
+    retryDelay: 20,
+    mailer: { send: async ({ to }) => {
+      addresses.push(to);
+      setTimeout(() => {
+        outcomesDuringBackoff = readLog(logPath);
+        addSuppressed(suppressionPath, [to], 'unsubscribe');
+      }, 0);
+      return { success: false, error: 'temporary rejection', responseCode: 451, uncertain: false };
+    } },
+  });
+  assert.deepEqual(addresses, [email]);
+  assert.equal(retry.suppressed, 1);
+  assert.equal(retry.failed, 0);
+  assert.deepEqual(outcomesDuringBackoff, []);
+
+  const throttled = 'throttled@example.test';
+  appendLog(logPath, { email: 'previous@example.test', status: 'sent', at: new Date(Date.now() - 3_600_000 + 1500).toISOString() });
+  const throttle = await runCampaign({
+    ...options,
+    recipients: [recipient(throttled)],
+    limits: { perHour: 1, perDomainPerHour: 0 },
+    mailer: { send: async ({ to }) => { addresses.push(to); return { success: true }; } },
+    onEvent: (event) => {
+      if (event.type === 'throttle') addSuppressed(suppressionPath, [throttled], 'unsubscribe');
+    },
+  });
+  assert.deepEqual(addresses, [email]);
+  assert.equal(throttle.suppressed, 1);
+});
+
+test('runCampaign holds an accepted recipient on resume after the outcome log write fails', async (t) => {
+  const dir = workDir();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const logPath = join(dir, 'send.jsonl');
+  const email = 'accepted@example.test';
+  const addresses = [];
+  const options = {
+    recipients: [recipient(email), recipient('next@example.test')],
+    templateHtml: 'x',
+    subjectTemplate: 'x',
+    campaignId: 'resume',
+    delayMs: 0,
+    logPath,
+    suppressionPath: join(dir, 'suppressed.csv'),
+    mailer: { send: async ({ to }) => {
+      addresses.push(to);
+      if (addresses.length === 1) mkdirSync(logPath);
+      return { success: true, messageId: 'smtp-accepted' };
+    } },
+  };
+  await assert.rejects(runCampaign(options), /Cannot write the send log/);
+  rmSync(logPath, { recursive: true });
+  writeFileSync(logPath, '{"email":');
+  assert.deepEqual(readLog(logPath).map(({ email, status }) => [email, status]), [[email, 'uncertain']]);
+  const result = await runCampaign(options);
+  assert.deepEqual(addresses, [email, 'next@example.test']);
+  assert.equal(result.skipped, 1);
+  assert.equal(result.sent, 1);
+  assert.equal(readLog(logPath).filter((entry) => entry.status === 'uncertain').length, 1);
+});
 
 test('runCampaign sends, skips logged addresses and writes the log', async () => {
   const dir = workDir();

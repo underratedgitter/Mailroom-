@@ -58,7 +58,7 @@ async function sendTest() {
   ui.testBtn.textContent = 'Sending test…';
   setTestResult('Sending…');
   try {
-    const data = await api('/api/test', body({ to }));
+    const data = await api('/api/test', body({ to, index: state.index }));
     if (data.ok) {
       state.tested = true;
       setTestResult('Test delivered to ' + to + ' (' + plural(data.inline, 'inline image') + ').', 'ok');
@@ -87,6 +87,11 @@ function clearLedger() {
 }
 
 const UNSENT_REASON = { suppressed: 'suppressed', uncertain: 'earlier attempt unconfirmed; not mailed again' };
+const THROTTLE_SCOPE = {
+  hour: 'hourly send ceiling',
+  day: 'daily send ceiling',
+  domain: 'domain send ceiling',
+};
 
 function addLine({ n, tag, tagLabel, addr, note, bad = false }) {
   setHidden(ui.ledgerEmpty, true);
@@ -257,7 +262,7 @@ export function listen(jobId, attempt = 0) {
         tag: 'run',
         tagLabel: 'wait',
         addr: data.email,
-        note: (data.scope === 'hour' ? 'hourly send ceiling' : data.scope + ' ceiling') + ' reached, resuming in about ' + Math.ceil(data.waitMs / 60000) + ' min',
+        note: (THROTTLE_SCOPE[data.scope] || (data.scope + ' ceiling')) + ' reached, resuming in about ' + Math.ceil(data.waitMs / 60000) + ' min',
       });
     } else if (data.type === 'fatal') {
       addLine({ n: '!!', tag: 'failed', tagLabel: 'halt', addr: data.email, note: data.error, bad: true });

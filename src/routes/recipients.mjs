@@ -1,11 +1,14 @@
-import { existsSync, lstatSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join, sep } from 'node:path';
 import {
   attachmentsFor,
   columnRoles,
+  csvRowsToCsv,
+  htmlToText,
   inlineForPreview,
   isSuppressed,
   linkWarnings,
+  loadSuppressed,
   parseRecipients,
   parseRecipientsText,
   readLog,
@@ -19,6 +22,7 @@ import {
 } from '../lib/core.mjs';
 import { errMsg } from '../lib/errors.mjs';
 import { unsubscribeLink } from '../lib/mailer.mjs';
+import { intParam, paginate } from './index.mjs';
 import { assetsDirFor, realRoot, rel, safePath } from './templates.mjs';
 
 /** @typedef {import('./index.mjs').RouteDef} RouteDef */
@@ -42,10 +46,10 @@ import { assetsDirFor, realRoot, rel, safePath } from './templates.mjs';
 /** @param {ServerState} state */
 export function listCsvs(state) {
   if (!existsSync(state.dataDir)) return [];
-  return readdirSync(state.dataDir)
-    .filter((name) => name.toLowerCase().endsWith('.csv'))
+  return readdirSync(state.dataDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.csv'))
+    .map((entry) => entry.name)
     .filter((name) => join(state.dataDir, name) !== state.suppressionPath)
-    .filter((name) => !lstatSync(join(state.dataDir, name)).isSymbolicLink())
     .sort()
     .map((name) => {
       const path = join(state.dataDir, name);
@@ -174,6 +178,8 @@ function previewFor(input, state, index = 0) {
     alreadySent: input.alreadySent.has(rec._email.toLowerCase()),
     source: input.source,
     html: inlineForPreview(raw, input.assetsDir),
+    text: htmlToText(raw),
+    bytes: Buffer.byteLength(raw, 'utf8'),
     willSend: input.parsed.recipients.length - skipped - suppressed,
     skipped,
     suppressed,
@@ -189,25 +195,53 @@ function previewFor(input, state, index = 0) {
 /**
  * The recipient table the page shows for a saved CSV, a dry run or a pasted list.
  * @param {ParsedRecipients} parsed
- * @param {{ path?: string | null, alreadySent?: Set<string> }} [options]
+ * @param {{ path?: string | null, alreadySent?: Set<string>, suppressed?: Set<string>, q?: unknown, offset?: unknown, pageSize?: unknown }} [options]
  */
-function rosterView(parsed, { path = null, alreadySent = new Set() } = {}) {
-  const shown = parsed.recipients.slice(0, 1000);
+function rosterView(parsed, { path = null, alreadySent = new Set(), suppressed = new Set(), q = '', offset = 0, pageSize = 200 } = {}) {
+  const roles = columnRoles(parsed.columns || []);
+  const customColumns = roles.filter((c) => c.role === 'field').map((c) => c.name);
+  const size = intParam(pageSize, 200, { min: 1, max: 1000 }) ?? 200;
+  const indexed = parsed.recipients.map((rec, index) => ({ rec, index }));
+  const page = paginate(indexed, {
+    q: typeof q === 'string' ? q : '',
+    limit: size,
+    offset: intParam(offset, 0, { min: 0 }) ?? 0,
+    match: ({ rec }, needle) => rec._email.toLowerCase().includes(needle)
+      || rec._name.toLowerCase().includes(needle)
+      || rec._company.toLowerCase().includes(needle)
+      || customColumns.some((col) => String(rec[col] || '').toLowerCase().includes(needle)),
+  });
+
   return {
     path,
     total: parsed.recipients.length,
-    shown: shown.length,
+    filtered: page.filtered,
+    shown: page.items.length,
+    offset: page.offset,
+    pageSize: size,
     invalid: parsed.invalid,
     duplicates: parsed.duplicates,
     truncated: parsed.truncated,
     sentCount: parsed.recipients.filter((r) => alreadySent.has(r._email.toLowerCase())).length,
-    columns: columnRoles(parsed.columns || []),
-    recipients: shown.map((rec) => ({
-      email: rec._email,
-      name: rec._name,
-      company: rec._company,
-      sent: alreadySent.has(rec._email.toLowerCase()),
-    })),
+    suppressedCount: parsed.recipients.filter((r) => suppressed.has(r._email.toLowerCase())).length,
+    columns: roles,
+    recipients: page.items.map(({ rec, index }) => {
+      const email = rec._email.toLowerCase();
+      /** @type {Record<string, string>} */
+      const fields = {};
+      for (const col of customColumns) {
+        if (rec[col]) fields[col] = rec[col];
+      }
+      return {
+        index,
+        email: rec._email,
+        name: rec._name,
+        company: rec._company,
+        sent: alreadySent.has(email),
+        suppressed: suppressed.has(email),
+        fields,
+      };
+    }),
   };
 }
 
@@ -235,7 +269,15 @@ export const routes = [
       });
       const campaignId = String(body.campaign ?? '').trim();
       const alreadySent = sentAddresses(readLog(state.logPath), campaignId);
-      return json(200, rosterView(parsed, { path: rel(csvPath, state), alreadySent }));
+      const suppressed = loadSuppressed(state.suppressionPath);
+      return json(200, rosterView(parsed, {
+        path: rel(csvPath, state),
+        alreadySent,
+        suppressed,
+        q: body.q,
+        offset: body.offset,
+        pageSize: body.pageSize,
+      }));
     },
   },
   {
@@ -255,14 +297,24 @@ export const routes = [
       }
       if (!text) return fail(400, 'Nothing to save');
       const parsed = asCsv ? parseRecipients(text) : parseRecipientsText(text);
-      if (body.dryRun === true) return json(200, rosterView(parsed));
+      if (body.dryRun === true) {
+        return json(200, rosterView(parsed, {
+          suppressed: loadSuppressed(state.suppressionPath),
+          q: body.q,
+          offset: body.offset,
+          pageSize: body.pageSize,
+        }));
+      }
       if (!parsed.recipients.length) return fail(400, 'No valid email addresses to save');
 
       const target = nextCsvPath(body.name || parsed.recipients[0]._email.replace(/@.*$/, '') + '-list', state);
       // Write then rename, so a crash cannot leave a half-written recipient file.
       const staging = `${target}.tmp`;
       try {
-        writeFileSync(staging, asCsv ? `${text}\n` : recipientsToCsv(parsed.recipients), 'utf8');
+        const serialized = asCsv
+          ? csvRowsToCsv(parsed.columns, parsed.recipients)
+          : recipientsToCsv(parsed.recipients);
+        writeFileSync(staging, serialized, 'utf8');
         renameSync(staging, target);
       } catch (err) {
         rmSync(staging, { force: true });

@@ -18,13 +18,13 @@
 import http from 'node:http';
 import https from 'node:https';
 import { createLoginLimiter, createSessionStore, hashPassword, parseCookies, parsePasswordHash, verifyPassword } from './lib/auth.mjs';
-import { loadConfig, assertConfig } from './lib/config.mjs';
+import { loadConfig, assertConfig, configProblems, workspaceRoot } from './lib/config.mjs';
 import { errMsg, errCode, errStatus } from './lib/errors.mjs';
 import { dispatchApi, fail, json, readJson } from './routes/index.mjs';
 import { rel as relInScope } from './routes/templates.mjs';
 import { runningJob } from './routes/send.mjs';
-import { startScheduler, stopScheduler, isTicking } from './routes/schedule.mjs';
-import { readFileSync, existsSync } from 'node:fs';
+import { startScheduler, stopScheduler, isTicking, isSchedulerRunning } from './routes/schedule.mjs';
+import { readFileSync, existsSync, cpSync, mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -38,7 +38,7 @@ import {
   SIGNAL_EXIT,
   describeInterruption,
 } from './lib/core.mjs';
-import { missingSmtpFields } from './lib/mailer.mjs';
+import { missingSmtpFields, previousUnsubscribeSecrets } from './lib/mailer.mjs';
 
 /** @typedef {import('node:http').IncomingMessage} IncomingMessage */
 /** @typedef {import('node:http').ServerResponse} ServerResponse */
@@ -59,11 +59,12 @@ const APP_VERSION = (() => {
   }
 })();
 const PUBLIC_DIR = join(ROOT, 'public');
-const DATA_DIR = join(ROOT, 'data');
-const TEMPLATE_DIR = join(ROOT, 'templates');
+const STATE_ROOT = workspaceRoot();
+const DATA_DIR = join(STATE_ROOT, 'data');
+const TEMPLATE_DIR = join(STATE_ROOT, 'templates');
 const LOG_PATH = defaultLogPath();
 const SUPPRESSION_PATH = defaultSuppressionPath();
-const SCHEDULE_PATH = resolve(process.env.SCHEDULE_FILE || join(ROOT, 'logs', 'schedule.json'));
+const SCHEDULE_PATH = resolve(process.env.SCHEDULE_FILE || join(STATE_ROOT, 'logs', 'schedule.json'));
 // A schedule that came due while the server was off is sent if it is at most
 // this late; later than that it is parked as "missed" for a human to decide.
 const GRACE_MS = Number(process.env.SCHEDULE_GRACE_MS || 30 * 60 * 1000);
@@ -141,24 +142,35 @@ const ALLOWED_HOSTS = new Set([
 // origin that is not one of our own names is refused. `Origin: null`
 // (sandboxed iframe, file://) is refused too — it is not in the set.
 const ALLOWED_ORIGINS = new Set([...ALLOWED_HOSTS].flatMap((h) => [`http://${h}`, `https://${h}`]));
-const PUBLIC_URL = (process.env.MAILROOM_PUBLIC_URL || '').trim().replace(/\/+$/, '');
-const { PUBLIC_URL_HOST, PUBLIC_URL_ORIGIN, PUBLIC_UNSUB_PATH } = (() => {
+
+function publicUrlConfig() {
+  const raw = (process.env.MAILROOM_PUBLIC_URL || '').trim().replace(/\/+$/, '');
   try {
-    if (!PUBLIC_URL) return { PUBLIC_URL_HOST: '', PUBLIC_URL_ORIGIN: '', PUBLIC_UNSUB_PATH: '' };
-    const u = new URL(PUBLIC_URL);
+    if (!raw) return { host: '', origin: '', unsubPath: '' };
+    const u = new URL(raw);
     const base = u.pathname.replace(/\/+$/, '');
     return {
-      PUBLIC_URL_HOST: u.host.toLowerCase(),
-      PUBLIC_URL_ORIGIN: u.origin.toLowerCase(),
-      PUBLIC_UNSUB_PATH: base ? `${base}/unsubscribe` : '',
+      host: u.host.toLowerCase(),
+      origin: u.origin.toLowerCase(),
+      unsubPath: base ? `${base}/unsubscribe` : '',
     };
   } catch {
-    return { PUBLIC_URL_HOST: '', PUBLIC_URL_ORIGIN: '', PUBLIC_UNSUB_PATH: '' };
+    return { host: '', origin: '', unsubPath: '' };
   }
-})();
+}
 
 /** @param {string} pathname */
-const isUnsubscribePath = (pathname) => pathname === '/unsubscribe' || (PUBLIC_UNSUB_PATH !== '' && pathname === PUBLIC_UNSUB_PATH);
+const isUnsubscribePath = (pathname) => {
+  const { unsubPath } = publicUrlConfig();
+  return pathname === '/unsubscribe' || (unsubPath !== '' && pathname === unsubPath);
+};
+
+/** @param {IncomingMessage} req @param {string} pathname */
+const hasWebhookCredentials = (req, pathname) => {
+  if (req.method !== 'POST' || pathname !== '/api/webhooks/bounces') return false;
+  if (!String(process.env.MAILROOM_WEBHOOK_SECRET || '').trim()) return false;
+  return Boolean(req.headers.authorization || req.headers['x-mailroom-signature'] || req.headers['x-hub-signature-256']);
+};
 
 // ── Optional password gate ───────────────────────────────────────────
 // Loopback-only installs need none. A Docker or LAN install must set a
@@ -211,8 +223,6 @@ function sessionCookie(req, token, maxAgeSeconds) {
 
 /** @param {IncomingMessage} req */
 const sessionOf = (req) => String(parseCookies(req.headers.cookie)[COOKIE] || '');
-/** @param {IncomingMessage} req */
-const isAuthed = (req) => !AUTH_ON || sessions.has(sessionOf(req));
 
 // Scripts and styles come from our own files only. Styles also allow inline
 // rules because the preview iframe is a srcdoc frame, which inherits this
@@ -254,7 +264,8 @@ function crossSiteReason(req, rawPath = '') {
     let originHost = null;
     try { originHost = new URL(origin).host; } catch { /* "null" and junk are foreign */ }
     const ownHost = String((TRUST_PROXY && firstForwarded(req, 'x-forwarded-host')) || req.headers.host || '').toLowerCase();
-    const publicUnsubOrigin = isUnsubscribePath(rawPath) && PUBLIC_URL_ORIGIN && origin === PUBLIC_URL_ORIGIN;
+    const { origin: publicOrigin } = publicUrlConfig();
+    const publicUnsubOrigin = isUnsubscribePath(rawPath) && publicOrigin && origin === publicOrigin;
     if (!ALLOWED_ORIGINS.has(origin) && !publicUnsubOrigin && !(originHost && originHost === ownHost)) return 'Cross-origin request refused';
   }
   // Modern browsers label every request; same-site (a sibling subdomain) is
@@ -330,7 +341,7 @@ let shuttingDown = false;
 
 /** @type {ServerState} */
 const serverState = {
-  root: ROOT,
+  root: STATE_ROOT,
   dataDir: DATA_DIR,
   templateDir: TEMPLATE_DIR,
   logPath: LOG_PATH,
@@ -391,13 +402,16 @@ async function route(req, res) {
   // browser and use the stored SMTP credentials.
   const host = String(req.headers.host || '').toLowerCase();
   const rawPath = String(req.url || '/').split(/[?#]/)[0];
-  const allowedHost = ALLOWED_HOSTS.has(host) || (isUnsubscribePath(rawPath) && PUBLIC_URL_HOST && host === PUBLIC_URL_HOST);
+  const { host: publicHost } = publicUrlConfig();
+  const publicEndpoint = isUnsubscribePath(rawPath) || rawPath === '/api/webhooks/bounces';
+  const allowedHost = ALLOWED_HOSTS.has(host) || (publicEndpoint && publicHost && host === publicHost);
   if (LOOPBACK && PORT !== 0 && host && !allowedHost) {
     return fail(res, 403, 'Unexpected Host header');
   }
 
   const crossSite = crossSiteReason(req, rawPath);
-  if (crossSite) return fail(res, 403, crossSite);
+  const webhookCredentials = hasWebhookCredentials(req, rawPath);
+  if (crossSite && !webhookCredentials) return fail(res, 403, crossSite);
 
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   const pathname = url.pathname;
@@ -414,6 +428,20 @@ async function route(req, res) {
     return json(res, 200, { ok: true, version: APP_VERSION });
   }
 
+  // Readiness check: unauthenticated (returns only booleans & version) so
+  // orchestrators stop routing traffic during shutdown or storage failures.
+  if (req.method === 'GET' && pathname === '/api/ready') {
+    const problems = configProblems(process.env, configPaths);
+    const checks = {
+      templates: !problems.some((p) => /template/i.test(p)),
+      logs: !problems.some((p) => /(?:log|schedule) folder/i.test(p)),
+      storage: !problems.some((p) => /(?:recipients|suppression) folder/i.test(p)),
+      scheduler: isSchedulerRunning() && !shuttingDown,
+    };
+    const ready = !shuttingDown && problems.length === 0 && checks.scheduler;
+    return json(res, ready ? 200 : 503, { ok: ready, ready, version: APP_VERSION, checks });
+  }
+
   // Signed public unsubscribe endpoint (RFC 8058 one-click POST & scanner-safe GET form).
   if (isUnsubscribePath(pathname) && (req.method === 'GET' || req.method === 'POST')) {
     let token = url.searchParams.get('token') || '';
@@ -427,7 +455,7 @@ async function route(req, res) {
         }
       }
     }
-    const verified = verifyUnsubscribeToken(token, loadOrCreateUnsubscribeSecret());
+    const verified = verifyUnsubscribeToken(token, loadOrCreateUnsubscribeSecret(), previousUnsubscribeSecrets());
     if (!verified) {
       return renderUnsubscribePage(res, 400, {
         title: 'Invalid link — Mailroom',
@@ -481,7 +509,8 @@ async function route(req, res) {
   }
 
   const publicPath = ['/login.html', '/login.css', '/login.js', '/favicon.svg'].includes(pathname);
-  if (AUTH_ON && !publicPath && !isAuthed(req)) {
+  const authenticated = AUTH_ON && !crossSite && sessions.has(sessionOf(req));
+  if (AUTH_ON && !publicPath && !webhookCredentials && !authenticated) {
     if (pathname.startsWith('/api/')) return fail(res, 401, 'Sign in required');
     res.statusCode = 302;
     res.setHeader('Location', '/login.html');
@@ -491,7 +520,7 @@ async function route(req, res) {
 
   if (req.method === 'GET' && serveStatic(res, pathname)) return;
 
-  if (await dispatchApi(req, res, url, serverState)) return;
+  if (await dispatchApi(req, res, url, serverState, authenticated)) return;
 
   if (pathname.startsWith('/api/')) return fail(res, 404, 'Unknown endpoint');
   fail(res, 404, 'Not found');
@@ -535,6 +564,33 @@ let server = null;
 /** @type {Promise<ListenAddress> | null} */
 let started = null;
 
+const configPaths = {
+  templatesDir: TEMPLATE_DIR,
+  writableDirs: [
+    { label: 'log folder', path: dirname(LOG_PATH) },
+    { label: 'schedule folder', path: dirname(SCHEDULE_PATH) },
+    { label: 'recipients folder', path: DATA_DIR },
+    { label: 'suppression folder', path: dirname(SUPPRESSION_PATH) },
+  ],
+};
+
+/** @param {string} host */
+function prepareServer(host) {
+  assertBindingIsSafe(host);
+  if (STATE_ROOT !== ROOT) {
+    mkdirSync(STATE_ROOT, { recursive: true, mode: 0o700 });
+    cpSync(join(ROOT, 'templates'), TEMPLATE_DIR, { recursive: true, force: false });
+  }
+  assertConfig(process.env, configPaths);
+}
+
+/** Check startup without listening, contacting SMTP, or generating signing keys. */
+export function checkServerSetup() {
+  prepareServer(HOST);
+  createServer();
+  return { stateRoot: STATE_ROOT, smtpConfigured: resolveSmtpConfig().configured };
+}
+
 /**
  * Starts the HTTPS/HTTP server once; safe to await more than once.
  * @param {{ port?: number, host?: string }} [options]
@@ -543,14 +599,7 @@ let started = null;
 export function startServer({ port = PORT, host = HOST } = {}) {
   if (started) return Promise.resolve(started);
   try {
-    assertConfig(process.env, {
-      templatesDir: TEMPLATE_DIR,
-      writableDirs: [
-        { label: 'log folder', path: dirname(LOG_PATH) },
-        { label: 'schedule folder', path: dirname(SCHEDULE_PATH) },
-      ],
-    });
-    assertBindingIsSafe(host);
+    prepareServer(host);
     loadOrCreateUnsubscribeSecret();
     server = createServer();
   } catch (err) {

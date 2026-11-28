@@ -7,6 +7,7 @@ import {
   plural,
   reconcile,
   setAttr,
+  setClass,
   setHidden,
   setText,
   state,
@@ -72,21 +73,39 @@ export function insertToken(token) {
 }
 
 // ── Preview ──────────────────────────────────────────────────────────
+export function renderPreviewMode() {
+  const plain = state.previewMode === 'text';
+  const hasData = Boolean(state.lastPreview);
+  setClass(ui.previewFrame, 'is-mobile', !plain && state.previewMobile);
+  setClass(ui.previewFrame, 'is-dark', !plain && state.previewDark);
+  setAttr(ui.previewMobileBtn, 'aria-pressed', String(state.previewMobile));
+  setAttr(ui.previewDarkBtn, 'aria-pressed', String(state.previewDark));
+  setAttr(ui.previewTextBtn, 'aria-pressed', String(plain));
+  ui.previewMobileBtn.disabled = plain;
+  ui.previewDarkBtn.disabled = plain;
+  setHidden(ui.preview, plain);
+  setHidden(ui.previewText, !hasData || !plain);
+}
+
 export function clearProof(title, text = '', kind = 'error') {
   state.previewSeq++;
   setHidden(ui.proofEmpty, false);
   setText(ui.proofEmptyTitle, title);
   setText(ui.proofEmptyText, text);
   if (ui.preview.srcdoc !== '') ui.preview.srcdoc = '';
+  setText(ui.previewText, '');
   setText(ui.proofTo, 'No recipient');
   setText(ui.proofSubject, '');
   setText(ui.proofIndex, '0 / 0');
   setText(ui.proofImages, '0 inline images');
+  setText(ui.proofWeight, '');
+  setClass(ui.proofWeight, 'is-bad', false);
   setText(ui.proofTotal, '');
   ui.prevBtn.disabled = true;
   ui.nextBtn.disabled = true;
   state.lastPreview = null;
   state.previewError = kind === 'subject' ? '' : text || title;
+  renderPreviewMode();
   renderPlaceholders([]);
   renderDraft();
 }
@@ -126,11 +145,16 @@ export function applyPreview(data) {
   // Assigning srcdoc reloads the frame even when the markup is identical,
   // which flashes white and resets its scroll position.
   if (ui.preview.srcdoc !== data.html) ui.preview.srcdoc = data.html;
+  setText(ui.previewText, data.text || '');
   setHidden(ui.proofEmpty, true);
   setText(ui.proofTo, data.to);
   setText(ui.proofSubject, data.subject);
   setText(ui.proofIndex, (data.index + 1) + ' / ' + data.total);
   setText(ui.proofImages, plural(data.inline, 'inline image'));
+  const bytes = Number(data.bytes) || 0;
+  const clipped = bytes > 102 * 1024;
+  setText(ui.proofWeight, bytes ? (bytes / 1024).toFixed(1) + ' KB' + (clipped ? ' · Gmail clips over 102 KB' : '') : '');
+  setClass(ui.proofWeight, 'is-bad', clipped);
   setText(ui.proofTotal, [
     data.willSend + ' to send',
     data.skipped + ' already sent',
@@ -141,6 +165,7 @@ export function applyPreview(data) {
   ui.prevBtn.disabled = data.index <= 0;
   ui.nextBtn.disabled = data.index >= data.total - 1;
 
+  renderPreviewMode();
   renderPlaceholders(data.placeholders || []);
   renderTokens();
   hooks.markRosterCurrent();
@@ -148,6 +173,7 @@ export function applyPreview(data) {
 }
 
 export function initCompose() {
+  renderPreviewMode();
   ui.template.addEventListener('change', () => {
     store.set('template', ui.template.value);
     state.studioDirty = false;
@@ -170,6 +196,9 @@ export function initCompose() {
     if (chip) insertToken('{{' + chip.dataset.field + '}}');
   });
   ui.previewBtn.addEventListener('click', () => refreshPreview({ resetIndex: true }));
+  ui.previewMobileBtn.addEventListener('click', () => { state.previewMobile = !state.previewMobile; renderPreviewMode(); });
+  ui.previewDarkBtn.addEventListener('click', () => { state.previewDark = !state.previewDark; renderPreviewMode(); });
+  ui.previewTextBtn.addEventListener('click', () => { state.previewMode = state.previewMode === 'text' ? 'html' : 'text'; renderPreviewMode(); });
   ui.prevBtn.addEventListener('click', () => { state.index--; refreshPreview(); });
   ui.nextBtn.addEventListener('click', () => { state.index++; refreshPreview(); });
   ui.composeForm.addEventListener('submit', (event) => event.preventDefault());

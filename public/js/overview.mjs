@@ -2,6 +2,7 @@ import {
   api,
   baseName,
   currentDelay,
+  debounce,
   formatDuration,
   formatWhen,
   h,
@@ -47,12 +48,33 @@ export async function loadHealth() {
     setText(ui.aboutHealth, 'Unreachable');
   }
   setHidden(ui.offlineBar, state.online);
+
+  try {
+    const res = await fetch('/api/ready');
+    const readyData = await res.json().catch(() => null);
+    if (readyData?.ready) {
+      setText(ui.aboutReady, 'Ready (templates, logs, scheduler)');
+    } else if (readyData?.checks) {
+      const failed = Object.entries(readyData.checks).filter(([, ok]) => !ok).map(([name]) => name);
+      setText(ui.aboutReady, 'Not ready' + (failed.length ? ' (' + failed.join(', ') + ')' : ''));
+    } else {
+      setText(ui.aboutReady, res.ok ? 'Ready' : 'Not ready (' + res.status + ')');
+    }
+  } catch {
+    setText(ui.aboutReady, 'Unreachable');
+  }
 }
 
 export async function loadCampaigns() {
   try {
-    const data = await api('/api/campaigns');
+    const { q, limit, offset } = state.campaignPage;
+    const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    if (q) params.set('q', q);
+    const data = await api('/api/campaigns?' + params.toString());
     state.campaigns = data.campaigns || [];
+    state.campaignPage.total = data.total ?? state.campaigns.length;
+    state.campaignPage.filtered = data.filtered ?? state.campaigns.length;
+    state.campaignPage.offset = data.offset ?? offset;
     renderCampaigns();
   } catch { /* fallback to /api/state recent list */ }
 }
@@ -65,12 +87,39 @@ function exportHref(campaignId, kind, csvPath = '') {
 
 export function initOverview() {
   ui.reportCsv.addEventListener('change', renderCampaigns);
+  ui.campaignSearch.addEventListener('input', debounce(() => {
+    state.campaignPage.q = ui.campaignSearch.value.trim();
+    state.campaignPage.offset = 0;
+    loadCampaigns();
+  }, 200));
+  ui.campaignPrevBtn.addEventListener('click', () => {
+    state.campaignPage.offset = Math.max(0, state.campaignPage.offset - state.campaignPage.limit);
+    loadCampaigns();
+  });
+  ui.campaignNextBtn.addEventListener('click', () => {
+    state.campaignPage.offset += state.campaignPage.limit;
+    loadCampaigns();
+  });
 }
 
 export function renderCampaigns() {
   const rows = state.campaigns || state.log.campaigns || [];
+  const { total, filtered, limit, offset, q } = state.campaignPage;
+  const knownTotal = state.campaigns ? total : rows.length;
+  const knownFiltered = state.campaigns ? filtered : rows.length;
+
   setHidden(ui.campaignsEmpty, rows.length > 0);
   setHidden(ui.campaignsWrap, rows.length === 0);
+  setHidden(ui.campaignsPager, knownFiltered <= limit || rows.length === 0);
+  setText(ui.campaignsEmptyTitle, knownTotal && q ? 'No matching campaigns' : 'No campaigns yet');
+  setText(ui.campaignsEmptyText, knownTotal && q
+    ? 'No campaign name matches “' + q + '”.'
+    : 'Sent campaigns show up here with their results.');
+  if (rows.length) {
+    ui.campaignPrevBtn.disabled = offset <= 0;
+    ui.campaignNextBtn.disabled = offset + rows.length >= knownFiltered;
+    setText(ui.campaignPageInfo, (offset + 1) + '–' + (offset + rows.length) + ' of ' + knownFiltered);
+  }
   const csvPath = ui.reportCsv.value || '';
 
   reconcile(ui.campaignsBody, rows, (c) => c.id,

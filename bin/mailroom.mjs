@@ -18,7 +18,7 @@ const root = resolve(here, '..');
 const version = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version;
 
 const args = process.argv.slice(2);
-const opts = { open: true };
+const opts = { open: true, doctor: false };
 
 for (let i = 0; i < args.length; i++) {
   const arg = args[i];
@@ -30,6 +30,7 @@ for (let i = 0; i < args.length; i++) {
     --host <addr>   interface to bind (default 127.0.0.1, or $GUI_HOST)
     --no-open       do not open a browser
     --open          open a browser (default when one is available)
+    --doctor        check configuration and storage without starting the server
     --version       print the version
     --help          this message
 
@@ -46,6 +47,7 @@ for (let i = 0; i < args.length; i++) {
     console.log(version);
     process.exit(0);
   }
+  if (arg === '--doctor') { opts.doctor = true; continue; }
   if (arg === '--no-open') { opts.open = false; continue; }
   if (arg === '--open') { opts.open = true; continue; }
   if (arg === '--port' || arg === '--host') {
@@ -62,9 +64,23 @@ for (let i = 0; i < args.length; i++) {
 }
 
 // Set before importing: the server reads these at module load.
-const { startServer, tlsEnabled } = await import('../src/gui.mjs');
+const { checkServerSetup, startServer, tlsEnabled } = await import('../src/gui.mjs');
 const { resolveConfigPath } = await import('../src/lib/config.mjs');
 const { errMsg } = await import('../src/lib/errors.mjs');
+
+if (opts.doctor) {
+  try {
+    const { stateRoot, smtpConfigured } = checkServerSetup();
+    console.log('Setup checks passed.');
+    console.log(`Config: ${resolveConfigPath()}`);
+    console.log(`State: ${stateRoot}`);
+    console.log(smtpConfigured ? 'SMTP settings are present.' : 'SMTP setup is pending. Open Settings to connect a mailbox.');
+  } catch (err) {
+    console.error(errMsg(err));
+    process.exitCode = 1;
+  }
+  process.exit(process.exitCode || 0);
+}
 
 /** @type {import('node:net').AddressInfo | string | null} */
 let address = null;

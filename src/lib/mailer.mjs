@@ -31,22 +31,31 @@ export function signUnsubscribeToken(email, secret) {
   return `${payload}.${sig}`;
 }
 
-/** Verifies an unsubscribe token and returns `{ email }`, or `null` if invalid/tampered.
+/** Verifies an unsubscribe token against the current secret and optional previous secrets, returning `{ email }` or `null`.
  * @param {unknown} token
  * @param {unknown} secret
+ * @param {string | string[]} [previousSecrets]
  * @returns {{ email: string } | null}
  */
-export function verifyUnsubscribeToken(token, secret) {
-  const key = String(secret ?? '').trim();
+export function verifyUnsubscribeToken(token, secret, previousSecrets = []) {
   const parts = String(token ?? '').split('.');
-  if (parts.length !== 2 || !parts[0] || !parts[1] || !key) return null;
+  if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
   const [payload, sig] = parts;
-  const expected = createHmac('sha256', key).update(payload).digest('base64url');
   const actualBuf = Buffer.from(sig);
-  const expectedBuf = Buffer.from(expected);
-  if (actualBuf.length !== expectedBuf.length || !timingSafeEqual(actualBuf, expectedBuf)) {
-    return null;
-  }
+  const extra = Array.isArray(previousSecrets) ? previousSecrets : [previousSecrets];
+  const keys = [secret, ...extra]
+    .flatMap((entry) => String(entry ?? '').split(/[\r\n,]+/))
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (!keys.length) return null;
+
+  const matched = keys.some((key) => {
+    const expected = createHmac('sha256', key).update(payload).digest('base64url');
+    const expectedBuf = Buffer.from(expected);
+    return actualBuf.length === expectedBuf.length && timingSafeEqual(actualBuf, expectedBuf);
+  });
+  if (!matched) return null;
+
   try {
     const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
     const email = String(data?.e || '').trim().toLowerCase();
@@ -74,6 +83,8 @@ export function verifyUnsubscribeToken(token, secret) {
  *   configured: boolean,
  *   socketTimeout?: number,
  *   maxPerHour?: string,
+ *   maxPerDomainPerHour?: string,
+ *   maxPerDay?: string,
  * }} SmtpConfig
  */
 
@@ -150,6 +161,18 @@ export function resolveSmtpConfig(env = process.env) {
     isLocal,
     configured: Boolean((user && pass) || isLocal),
   };
+}
+
+/**
+ * Splits MAILROOM_UNSUBSCRIBE_PREVIOUS_SECRET for key rotation grace windows.
+ * @param {Record<string, string | undefined>} [env]
+ * @returns {string[]}
+ */
+export function previousUnsubscribeSecrets(env = process.env) {
+  return String(env.MAILROOM_UNSUBSCRIBE_PREVIOUS_SECRET || '')
+    .split(/[\r\n,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 /**

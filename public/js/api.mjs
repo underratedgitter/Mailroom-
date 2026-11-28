@@ -113,6 +113,11 @@ export const state = {
   suppression: { path: '', count: 0 },
   queue: null,
   suppressed: null,
+  campaignPage: { q: '', offset: 0, limit: 25, total: 0, filtered: 0 },
+  suppressionPage: { q: '', reason: '', offset: 0, limit: 50, filtered: 0 },
+  rosterPage: { q: '', offset: 0, pageSize: 200 },
+  dns: null,
+  webhook: { configured: false },
 
   mode: 'saved', // which source the campaign really uses: saved | paste
   tab: 'saved', // which source tab is showing: saved | paste | upload
@@ -129,6 +134,9 @@ export const state = {
   total: 0,
   lastPreview: null,
   previewError: '',
+  previewMode: 'html',
+  previewMobile: false,
+  previewDark: false,
   composeTab: 'message',
   studioPath: '',
   studioDirty: false,

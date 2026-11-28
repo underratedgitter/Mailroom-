@@ -1,4 +1,5 @@
 import { httpError } from '../lib/errors.mjs';
+import { routes as bounceRoutes } from './bounces.mjs';
 import { routes as campaignRoutes } from './campaigns.mjs';
 import { routes as recipientRoutes } from './recipients.mjs';
 import { routes as scheduleRoutes } from './schedule.mjs';
@@ -36,6 +37,7 @@ import { routes as templateRoutes } from './templates.mjs';
  *   json: (code: number, body: unknown) => void,
  *   fail: (code: number, message: string) => void,
  *   state: ServerState,
+ *   authenticated: boolean,
  * }} RouteContext
  */
 /**
@@ -59,6 +61,35 @@ export function json(res, code, body) {
 
 /** @param {ServerResponse} res @param {number} code @param {string} message */
 export const fail = (res, code, message) => json(res, code, { error: message });
+
+/**
+ * Parses an optional non-negative whole-number query/body parameter, or `fallback`.
+ * @param {unknown} raw
+ * @param {number | null} fallback
+ * @param {{ min?: number, max?: number }} [bounds]
+ * @returns {number | null}
+ */
+export function intParam(raw, fallback, { min = 0, max = Infinity } = {}) {
+  if (raw === undefined || raw === null || raw === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+/**
+ * Filters and slices an array for list routes without duplicating offset/limit bounds.
+ * @template T
+ * @param {T[]} items
+ * @param {{ q?: string, limit?: number | null, offset?: number, match?: (item: T, q: string) => boolean }} [options]
+ * @returns {{ items: T[], total: number, filtered: number, limit: number | null, offset: number }}
+ */
+export function paginate(items, { q = '', limit = null, offset = 0, match } = {}) {
+  const needle = String(q || '').trim().toLowerCase();
+  const matching = needle && match ? items.filter((item) => match(item, needle)) : items;
+  const safeOffset = Math.max(0, Math.floor(offset || 0));
+  const paged = limit && limit > 0 ? matching.slice(safeOffset, safeOffset + limit) : matching.slice(safeOffset);
+  return { items: paged, total: items.length, filtered: matching.length, limit: limit && limit > 0 ? limit : null, offset: safeOffset };
+}
 
 /**
  * @param {IncomingMessage} req
@@ -98,6 +129,7 @@ export const apiRoutes = [
   ...templateRoutes,
   ...sendRoutes,
   ...suppressionRoutes,
+  ...bounceRoutes,
   ...campaignRoutes,
   ...scheduleRoutes,
 ];
@@ -108,9 +140,10 @@ export const apiRoutes = [
  * @param {ServerResponse} res
  * @param {URL} url
  * @param {ServerState} state
+ * @param {boolean} authenticated Verified same-origin admin session
  * @returns {Promise<boolean>}
  */
-export async function dispatchApi(req, res, url, state) {
+export async function dispatchApi(req, res, url, state, authenticated) {
   const pathname = url.pathname;
   for (const def of apiRoutes) {
     if (req.method !== def.method) continue;
@@ -134,6 +167,7 @@ export async function dispatchApi(req, res, url, state) {
       json: (code, body) => json(res, code, body),
       fail: (code, message) => fail(res, code, message),
       state,
+      authenticated,
     });
     return true;
   }

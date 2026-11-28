@@ -7,6 +7,7 @@ import {
   recipientsFromFile,
 } from '../lib/core.mjs';
 import { badRequest } from '../lib/errors.mjs';
+import { intParam, paginate } from './index.mjs';
 import { realRoot, safePath } from './templates.mjs';
 
 /** @typedef {import('./index.mjs').RouteDef} RouteDef */
@@ -17,7 +18,20 @@ export const routes = [
   {
     method: 'GET',
     path: '/api/campaigns',
-    handler: ({ json, state }) => json(200, { campaigns: campaignSummaries(readLog(state.logPath)) }),
+    handler: ({ url, json, state }) => {
+      const all = campaignSummaries(readLog(state.logPath));
+      const limit = intParam(url.searchParams.get('limit'), null, { min: 1, max: 500 });
+      const offset = intParam(url.searchParams.get('offset'), 0, { min: 0 }) ?? 0;
+      const q = url.searchParams.get('q') || '';
+      const page = paginate(all, { q, limit, offset, match: (c, needle) => c.id.toLowerCase().includes(needle) });
+      return json(200, {
+        campaigns: page.items,
+        total: page.total,
+        filtered: page.filtered,
+        limit: page.limit,
+        offset: page.offset,
+      });
+    },
   },
   {
     method: 'GET',
